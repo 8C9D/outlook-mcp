@@ -24,6 +24,7 @@ const SCOPES = [
   "Calendars.ReadWrite",
   "Contacts.ReadWrite",
   "MailboxSettings.ReadWrite",
+  "Tasks.ReadWrite",
 ];
 
 function requireClientId(): string {
