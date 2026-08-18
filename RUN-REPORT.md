@@ -233,6 +233,45 @@ Object would fix it at scale but was deliberately avoided in Batch 3.
   Batch 4. Orphan deletion was prepared but not executed (tool-permission
   gate); left for the user to run or to let them lapse.
 
+## v6.1b — Upkeep race fixed: Graph as source of truth — PASSED
+
+**Cleanup (user-approved).** The three orphan subscriptions from the Batch 4
+race were deleted live via `DELETE /subscriptions/{id}`, keeping
+`95f07422-d465-455d-b03f-14d098692d93` — the one whose clientState the
+`sub:mail` KV record holds.
+
+**Shipped.**
+- `ensureMailSubscription` reworked: whenever the KV record alone cannot
+  justify "keep", Graph is the source of truth and KV only a cache. Upkeep
+  lists the unexpired subscriptions for this notification URL + resource,
+  renews the one whose id the KV record names while sweeping every other,
+  and creates only when the record's subscription is not live in Graph —
+  after deleting whatever else is there. A stale KV read therefore converges
+  on exactly one subscription instead of minting duplicates. The
+  per-request fast path is unchanged (healthy record = one KV read, zero
+  Graph calls).
+- Constraint discovered live and honored: Graph returns `clientState: null`
+  when listing, so a racing peer's subscription can never be *reused* — its
+  deliveries could never be validated — and is replaced instead. "Reuse the
+  existing one" is implemented as "reuse iff KV holds its clientState".
+  Residual window: two upkeeps that both list before either creates (true
+  bootstrap only) make one each; the next renew-path upkeep sweeps the loser.
+- New harness test **v5f**: simulates the incident (second ensure runs on a
+  stale, empty KV view after the first created) and asserts exactly one
+  subscription survives and it is the one the last KV write describes; also
+  drives the simultaneous-bootstrap case via `Promise.all` and asserts the
+  follow-up renewal sweeps back down to one. v5d updated for the new
+  list-first traffic (create = GET,POST; renew = GET+PATCH; Graph-forgot =
+  GET,POST with no PATCH; list/PATCH race covered separately).
+
+**Gate review.**
+- `npm run typecheck` clean; local harness **29/29** (was 28) including v5f.
+- Deployed (version `4ba94b3c`); Graph re-listed after the deploy: exactly
+  **one** subscription — `95f07422…`, correct notification URL, expiry
+  2026-08-21T17:31:56Z; cron `17 */6 * * *` in the deploy trigger list.
+- Remote suite headless: **20/20** (10 live incl. r5/r13/r16, 10 SKIP
+  pending an interactive sign-in).
+
 ## Final state
 
 - **Version 0.6.0** — 23 tools, 2 prompts, 2 resources, two transports.

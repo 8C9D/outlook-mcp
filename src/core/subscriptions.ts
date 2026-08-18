@@ -40,6 +40,19 @@ export type SubscriptionRecord = {
 /** What ensureMailSubscription decided to do. */
 export type SubscriptionAction = "created" | "renewed" | "kept" | "recreated";
 
+/**
+ * What Graph reports when subscriptions are listed. The clientState secret is
+ * deliberately null in list/get responses (verified live), which is why a
+ * subscription this record does not describe can never be reused — its
+ * deliveries could never be validated.
+ */
+type ListedSubscription = {
+  id: string;
+  resource?: string;
+  notificationUrl?: string;
+  expirationDateTime?: string;
+};
+
 export type EnsureResult = {
   action: SubscriptionAction;
   record: SubscriptionRecord;
@@ -119,11 +132,45 @@ async function createSubscription(
   return record;
 }
 
+/** The unexpired subscriptions Graph holds for this endpoint and resource. */
+async function listLiveSubscriptions(
+  graph: GraphCall,
+  notificationUrl: string,
+  now: Date
+): Promise<ListedSubscription[]> {
+  const listed = await graph("/subscriptions");
+  return ((listed?.value ?? []) as ListedSubscription[]).filter(
+    (sub) =>
+      sub.notificationUrl === notificationUrl &&
+      sub.resource === SUBSCRIPTION_RESOURCE &&
+      minutesUntil(sub.expirationDateTime ?? "", now) > 0
+  );
+}
+
+/** Best-effort deletion: a stray that survives is swept on the next upkeep. */
+async function deleteSubscriptions(graph: GraphCall, ids: string[]): Promise<void> {
+  for (const id of ids) {
+    try {
+      await graph(`/subscriptions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    } catch {
+      // Nothing depends on this succeeding now; strays also expire on their own.
+    }
+  }
+}
+
 /**
  * Bring the inbox subscription to a healthy state: create it if there is none
  * (or it lapsed, or the endpoint moved), extend it when it is close to expiry,
  * and otherwise leave it alone. Safe to call as often as you like — the "keep"
  * path costs a single state read and no Graph call.
+ *
+ * Concurrency-safe by construction: whenever the KV record alone is not
+ * enough to say "keep", Graph is treated as the source of truth and KV as a
+ * cache. The live subscriptions for this endpoint are listed first, the one
+ * this record holds the clientState for is renewed, and duplicates a
+ * concurrent upkeep may have created are swept — so a stale KV read can no
+ * longer mint an ever-growing pile of subscriptions (which is exactly what
+ * a burst of racing upkeep calls once did).
  */
 export async function ensureMailSubscription(
   store: StateStore,
@@ -145,7 +192,17 @@ export async function ensureMailSubscription(
     };
   }
 
-  if (decision === "renew") {
+  const live = await listLiveSubscriptions(graph, notificationUrl, now);
+  const oursIsLive = existing != null && live.some((sub) => sub.id === existing.id);
+
+  if (oursIsLive) {
+    // The subscription whose clientState this record holds is alive in Graph
+    // (even if KV thought it had lapsed — Graph's view wins). Extend it and
+    // sweep everything else.
+    await deleteSubscriptions(
+      graph,
+      live.filter((sub) => sub.id !== existing!.id).map((sub) => sub.id)
+    );
     const expirationDateTime = expiryFrom(now);
     try {
       const patched = await graph(`/subscriptions/${encodeURIComponent(existing!.id)}`, {
@@ -162,7 +219,7 @@ export async function ensureMailSubscription(
       return { action: "renewed", record, detail: `extended to ${record.expirationDateTime}` };
     } catch (err) {
       // Graph drops subscriptions it could not deliver to; a PATCH against one
-      // that no longer exists means "start over", not "fail".
+      // that vanished between the list and now means "start over", not "fail".
       const record = await createSubscription(store, notificationUrl, now, graph);
       return {
         action: "recreated",
@@ -172,6 +229,16 @@ export async function ensureMailSubscription(
     }
   }
 
+  // Anything Graph holds for this endpoint is not ours to use — listed
+  // subscriptions come back with clientState null, so an adopted one could
+  // never validate a delivery. Replace the lot with one fresh subscription.
+  await deleteSubscriptions(graph, live.map((sub) => sub.id));
   const record = await createSubscription(store, notificationUrl, now, graph);
-  return { action: "created", record, detail: `subscription ${record.id}` };
+  return {
+    action: existing ? "recreated" : "created",
+    record,
+    detail: live.length
+      ? `replaced ${live.length} unusable live subscription(s) with ${record.id}`
+      : `subscription ${record.id}`,
+  };
 }

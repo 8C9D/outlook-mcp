@@ -579,3 +579,27 @@ touched in this batch.
   Verified both ways against `wrangler dev --local` before deploying: with the flag, a registered
   client plus a real MSAL token completed authorization (`status: "ok"` with a code); without
   `.dev.vars`, the same POST got the `403` "disabled" answer.
+
+### Subscription upkeep race (found live, then fixed)
+- Re-verifying the webhook after the v6.1 deploy found **four** live Graph subscriptions for the
+  same endpoint, all created within one second during the v6 batch-4 remote run: concurrent
+  authenticated requests each ran the `ctx.waitUntil` upkeep backstop, each read a stale KV view
+  (KV is eventually consistent, reads cached up to a minute), each decided "create", and the last
+  KV write won. Harmless in effect — deliveries from the three orphans failed the clientState
+  check and were discarded — but an unbounded unlocked check-then-act race.
+- Fix: `ensureMailSubscription` now treats **Graph as the source of truth and KV as a cache**
+  whenever the KV record alone cannot justify "keep". It lists the unexpired subscriptions for this
+  notification URL + resource, renews the one whose id the KV record names (sweeping all others),
+  and only creates when the record's subscription is not live in Graph — after deleting whatever
+  else is there. The per-request fast path is unchanged: a healthy record still costs one KV read
+  and zero Graph calls.
+- **Adoption is impossible, by Graph's design:** list/get responses return `clientState: null`
+  (verified live), so a subscription created by a racing peer can never be reused — without its
+  secret, every delivery it makes would be discarded. That is why the convergence step *replaces*
+  a foreign live subscription rather than adopting it, and why the requested "reuse the existing
+  one" is implemented as "reuse iff the KV record holds its clientState".
+- Residual window: two upkeeps that both list *before* either creates (true bootstrap only) still
+  create one each; the next renew/create-path upkeep sweeps the loser. Asserted in v5f alongside
+  the stale-KV case, which now converges to exactly one subscription immediately.
+- The three orphans from the incident were deleted live via Graph (`DELETE /subscriptions/{id}`),
+  keeping `95f07422…` — the one the `sub:mail` KV record holds the clientState for.
