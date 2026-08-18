@@ -2,8 +2,8 @@
 // transport) against the real account using the cached token, plus a stdio
 // protocol smoke test of the server itself. Every test cleans up after itself;
 // a final check verifies no "[MCP TEST]" artifacts remain in the account
-// (messages, drafts, folders, events, contacts, inbox rules, temp files) and
-// that mailbox settings (auto-reply) are restored exactly.
+// (messages, drafts, folders, events, contacts, inbox rules, categories, To Do
+// tasks, temp files) and that mailbox settings (auto-reply) are restored exactly.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -27,6 +27,10 @@ import { manageContactHandler } from "./tools/manage-contact.js";
 import { autoReplyHandler } from "./tools/auto-reply.js";
 import { addAttachmentHandler } from "./tools/add-attachment.js";
 import { manageRulesHandler } from "./tools/manage-rules.js";
+import { createFolderHandler } from "./tools/create-folder.js";
+import { manageCategoriesHandler } from "./tools/manage-categories.js";
+import { listTasksHandler, resolveTaskList } from "./tools/list-tasks.js";
+import { manageTaskHandler } from "./tools/manage-task.js";
 import type { ToolResult } from "./tools/common.js";
 
 const TEST_PREFIX = "[MCP TEST]";
@@ -125,6 +129,36 @@ async function purgeTestRules(): Promise<void> {
       await callGraphServer(`/me/mailFolders/inbox/messageRules/${encodeURIComponent(rule.id)}`, {
         method: "DELETE",
       });
+    }
+  }
+}
+
+/** TEST-ONLY: remove any [MCP TEST] master categories. */
+async function purgeTestCategories(): Promise<void> {
+  const data = await callGraphServer("/me/outlook/masterCategories?$top=100");
+  for (const category of data?.value ?? []) {
+    if (String(category.displayName ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/outlook/masterCategories/${encodeURIComponent(category.id)}`, {
+        method: "DELETE",
+      });
+    }
+  }
+}
+
+/** TEST-ONLY: remove any [MCP TEST] To Do tasks, across every list. */
+async function purgeTestTasks(): Promise<void> {
+  const lists = await callGraphServer("/me/todo/lists?$top=100");
+  for (const list of lists?.value ?? []) {
+    const tasks = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100`
+    );
+    for (const task of tasks?.value ?? []) {
+      if (String(task.title ?? "").startsWith(TEST_PREFIX)) {
+        await callGraphServer(
+          `/me/todo/lists/${encodeURIComponent(list.id)}/tasks/${encodeURIComponent(task.id)}`,
+          { method: "DELETE" }
+        );
+      }
     }
   }
 }
@@ -715,9 +749,432 @@ await test("v3f. manage_rules lifecycle (create → list shows summary → delet
   }
 });
 
+// ---- v4a. create_folder ---------------------------------------------------
+
+await test("v4a. create_folder (root folder → duplicate rejected → subfolder → bad parent)", async () => {
+  const name = `${TEST_PREFIX} v4 folder`;
+  const createText = toolText(await createFolderHandler({ name }), "create_folder");
+  const id = createText.match(/Folder id: (\S+)/)?.[1];
+  assert(id, `Could not extract folder id from output: ${createText}`);
+  state.testFolderId = id;
+  try {
+    const folder = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(id)}?$select=displayName,childFolderCount`
+    );
+    assert(folder.displayName === name, `Folder name is ${folder.displayName}, expected ${name}`);
+
+    // Same level, different case: rejected, and the error names the existing id.
+    const dupText = expectError(
+      await createFolderHandler({ name: name.toUpperCase() }),
+      "create_folder(duplicate)"
+    );
+    assert(/already exists/i.test(dupText), `Unexpected duplicate error: ${dupText}`);
+    assert(dupText.includes(id), `Duplicate error does not name the existing folder id: ${dupText}`);
+
+    // A subfolder of the new folder.
+    const childName = `${TEST_PREFIX} v4 child`;
+    const childText = toolText(
+      await createFolderHandler({ name: childName, parent_folder: id }),
+      "create_folder(subfolder)"
+    );
+    const childId = childText.match(/Folder id: (\S+)/)?.[1];
+    assert(childId, `Could not extract subfolder id from output: ${childText}`);
+    assert(childText.includes(name), `Subfolder output does not name its parent: ${childText}`);
+    const child = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(childId)}?$select=displayName,parentFolderId`
+    );
+    assert(
+      child.parentFolderId === id,
+      `Subfolder parent is ${child.parentFolderId}, expected ${id}`
+    );
+    // The same name is free again one level down.
+    const nestedText = toolText(
+      await createFolderHandler({ name, parent_folder: childId }),
+      "create_folder(same name, deeper level)"
+    );
+    assert(nestedText.includes("Folder created"), `Unexpected nested output: ${nestedText}`);
+
+    const badParent = expectError(
+      await createFolderHandler({ name: `${TEST_PREFIX} orphan`, parent_folder: "no-such-folder" }),
+      "create_folder(bad parent)"
+    );
+    assert(/does not exist/i.test(badParent), `Unexpected bad-parent error: ${badParent}`);
+  } finally {
+    // Removing the parent takes the whole test subtree with it (test-only purge).
+    await callGraphServer(`/me/mailFolders/${encodeURIComponent(id)}/permanentDelete`, {
+      method: "POST",
+    });
+    state.testFolderId = undefined;
+  }
+  await expect404(`/me/mailFolders/${encodeURIComponent(id)}?$select=id`, "Test folder");
+});
+
+// ---- v4b. manage_rules update in place ------------------------------------
+
+await test("v4b. manage_rules update (patch conditions + exceptions in place, same rule id)", async () => {
+  const folder = await callGraphServer("/me/mailFolders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: `${TEST_PREFIX} v4 rules folder` }),
+  });
+  state.testFolderId = folder.id;
+  let ruleId: string | undefined;
+  try {
+    const createText = toolText(
+      await manageRulesHandler({
+        action: "create",
+        display_name: `${TEST_PREFIX} v4 rule`,
+        conditions: { from_addresses: ["mcpv4@example.invalid"] },
+        actions: { move_to_folder: folder.id },
+      }),
+      "manage_rules create"
+    );
+    ruleId = createText.match(/Rule id: (\S+)/)?.[1];
+    assert(ruleId, `Could not extract rule id from output: ${createText}`);
+    const before = await callGraphServer(
+      `/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`
+    );
+
+    const updateText = toolText(
+      await manageRulesHandler({
+        action: "update",
+        rule_id: ruleId,
+        display_name: `${TEST_PREFIX} v4 rule updated`,
+        conditions: { subject_contains: ["mcpv4subject"] },
+        exceptions: { sender_contains: ["mcpv4exempt"] },
+      }),
+      "manage_rules update"
+    );
+    assert(/updated in place/i.test(updateText), `Unexpected update output: ${updateText}`);
+    assert(updateText.includes(ruleId), `Update output lost the rule id: ${updateText}`);
+
+    // Patched in place: same id and position; conditions replaced, exceptions
+    // added, and the action left alone because the call did not mention it.
+    const after = await callGraphServer(
+      `/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`
+    );
+    assert(after.id === ruleId, `Rule id changed: ${before.id} → ${after.id}`);
+    assert(
+      after.sequence === before.sequence,
+      `Rule sequence changed: ${before.sequence} → ${after.sequence}`
+    );
+    assert(
+      after.displayName === `${TEST_PREFIX} v4 rule updated`,
+      `Rule not renamed: ${after.displayName}`
+    );
+    assert(
+      !after.conditions?.fromAddresses?.length,
+      `Old condition survived the replace: ${JSON.stringify(after.conditions)}`
+    );
+    assert(
+      after.conditions?.subjectContains?.length === 1,
+      `New condition missing: ${JSON.stringify(after.conditions)}`
+    );
+    assert(
+      after.exceptions?.senderContains?.length === 1,
+      `Exception missing: ${JSON.stringify(after.exceptions)}`
+    );
+    assert(
+      after.actions?.moveToFolder === folder.id,
+      `Untouched action was clobbered: ${JSON.stringify(after.actions)}`
+    );
+
+    // list surfaces the exceptions in the human-readable summary.
+    const listText = toolText(await manageRulesHandler({ action: "list" }), "manage_rules list");
+    assert(
+      listText.includes(`${TEST_PREFIX} v4 rule updated`),
+      `List missing the renamed rule: ${listText}`
+    );
+    assert(/EXCEPT sender contains mcpv4exempt/i.test(listText), `List missing the exception: ${listText}`);
+    assert(/subject contains mcpv4subject/i.test(listText), `List missing the condition: ${listText}`);
+
+    // An update may also clear the exceptions and toggle the rule off.
+    const clearText = toolText(
+      await manageRulesHandler({ action: "update", rule_id: ruleId, exceptions: {}, enabled: false }),
+      "manage_rules update(clear exceptions)"
+    );
+    assert(clearText.includes("DISABLED"), `Rule not reported disabled: ${clearText}`);
+    const cleared = await callGraphServer(
+      `/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`
+    );
+    assert(
+      !cleared.exceptions?.senderContains?.length,
+      `Exceptions not cleared: ${JSON.stringify(cleared.exceptions)}`
+    );
+    assert(cleared.isEnabled === false, "Rule not disabled");
+
+    // Guards: no rule_id, nothing to change, conditions emptied.
+    const noId = expectError(
+      await manageRulesHandler({ action: "update", display_name: "x" }),
+      "manage_rules update(no rule_id)"
+    );
+    assert(/requires rule_id/i.test(noId), `Unexpected error: ${noId}`);
+    const noFields = expectError(
+      await manageRulesHandler({ action: "update", rule_id: ruleId }),
+      "manage_rules update(no fields)"
+    );
+    assert(/at least one of/i.test(noFields), `Unexpected error: ${noFields}`);
+    const emptyConditions = expectError(
+      await manageRulesHandler({ action: "update", rule_id: ruleId, conditions: {} }),
+      "manage_rules update(empty conditions)"
+    );
+    assert(/at least one condition/i.test(emptyConditions), `Unexpected error: ${emptyConditions}`);
+
+    const deleteText = toolText(
+      await manageRulesHandler({ action: "delete", rule_id: ruleId }),
+      "manage_rules delete"
+    );
+    assert(deleteText.includes("deleted"), `Unexpected delete output: ${deleteText}`);
+    ruleId = undefined;
+  } finally {
+    if (ruleId) {
+      await callGraphServer(`/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`, {
+        method: "DELETE",
+      }).catch(() => {});
+    }
+    await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/permanentDelete`, {
+      method: "POST",
+    });
+    state.testFolderId = undefined;
+  }
+});
+
+// ---- v4c. categories + manage_message categorize --------------------------
+
+await test("v4c. category lifecycle (create → categorize a message → verify → clear → delete)", async () => {
+  const categoryName = `${TEST_PREFIX} category`;
+  const createText = toolText(
+    await manageCategoriesHandler({
+      action: "create",
+      display_name: categoryName,
+      color: "preset5",
+    }),
+    "manage_categories create"
+  );
+  const categoryId = createText.match(/Category id: (\S+)/)?.[1];
+  assert(categoryId, `Could not extract category id from output: ${createText}`);
+  assert(createText.includes("teal"), `Colour not reported: ${createText}`);
+
+  let draftId: string | undefined;
+  try {
+    const listText = toolText(
+      await manageCategoriesHandler({ action: "list" }),
+      "manage_categories list"
+    );
+    assert(listText.includes(categoryName), `List missing the category: ${listText}`);
+    assert(listText.includes(categoryId), `List missing the category id: ${listText}`);
+
+    const dupText = expectError(
+      await manageCategoriesHandler({
+        action: "create",
+        display_name: categoryName.toUpperCase(),
+        color: "preset6",
+      }),
+      "manage_categories create(duplicate)"
+    );
+    assert(dupText.includes(categoryId), `Duplicate error does not name the existing id: ${dupText}`);
+
+    // Categorize a throwaway draft: names are matched case-insensitively but
+    // written back with the master list's exact spelling.
+    draftId = extractDraftId(
+      toolText(
+        await createDraftHandler({
+          to: [ownAddress],
+          subject: `${TEST_PREFIX} categorize`,
+          body: "Category test draft. Safe to delete.",
+        }),
+        "create_draft categorize"
+      )
+    );
+
+    const setText = toolText(
+      await manageMessageHandler({
+        message_ids: [draftId],
+        action: "categorize",
+        categories: [categoryName.toLowerCase()],
+      }),
+      "manage_message categorize"
+    );
+    assert(setText.includes("1/1"), `Expected 1/1 to succeed: ${setText}`);
+    assert(setText.includes("categories set to"), `Unexpected categorize output: ${setText}`);
+    let msg = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}?$select=categories`
+    );
+    assert(
+      JSON.stringify(msg.categories) === JSON.stringify([categoryName]),
+      `Message categories are ${JSON.stringify(msg.categories)}, expected ["${categoryName}"]`
+    );
+
+    const unknown = expectError(
+      await manageMessageHandler({
+        message_ids: [draftId],
+        action: "categorize",
+        categories: [`${TEST_PREFIX} nonexistent category`],
+      }),
+      "manage_message categorize(unknown category)"
+    );
+    assert(/Unknown categor/i.test(unknown), `Unexpected error: ${unknown}`);
+    const missing = expectError(
+      await manageMessageHandler({ message_ids: [draftId], action: "categorize" }),
+      "manage_message categorize(no categories)"
+    );
+    assert(/requires categories/i.test(missing), `Unexpected error: ${missing}`);
+
+    // Uncategorize is a replace with the empty list.
+    const clearText = toolText(
+      await manageMessageHandler({
+        message_ids: [draftId],
+        action: "categorize",
+        categories: [],
+      }),
+      "manage_message categorize(clear)"
+    );
+    assert(clearText.includes("categories cleared"), `Unexpected clear output: ${clearText}`);
+    msg = await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}?$select=categories`);
+    assert(
+      (msg.categories ?? []).length === 0,
+      `Categories not cleared: ${JSON.stringify(msg.categories)}`
+    );
+
+    const deleteText = toolText(
+      await manageCategoriesHandler({ action: "delete", category_id: categoryId }),
+      "manage_categories delete"
+    );
+    assert(deleteText.includes(categoryName), `Delete output does not name the category: ${deleteText}`);
+    const afterText = toolText(
+      await manageCategoriesHandler({ action: "list" }),
+      "manage_categories list after delete"
+    );
+    assert(!afterText.includes(categoryName), `Deleted category still listed: ${afterText}`);
+    const goneText = expectError(
+      await manageCategoriesHandler({ action: "delete", category_id: categoryId }),
+      "manage_categories delete(gone)"
+    );
+    assert(/No category with id/i.test(goneText), `Unexpected error: ${goneText}`);
+  } finally {
+    if (draftId) {
+      await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, {
+        method: "DELETE",
+      }).catch(() => {});
+    }
+    await purgeTestCategories();
+  }
+});
+
+// ---- v4d. To Do task lifecycle -------------------------------------------
+
+await test("v4d. task lifecycle (create from a message → complete → reopen → update → delete)", async () => {
+  assert(latestMessage, "Inbox is empty; no message to turn into a task");
+  const title = `${TEST_PREFIX} task`;
+  const today = torontoToday();
+  const dueDate = addDays(today, 2);
+  const reminder = `${addDays(today, 1)}T09:00`;
+  const taskList = await resolveTaskList(undefined);
+
+  const createText = toolText(
+    await manageTaskHandler({
+      action: "create",
+      title,
+      due_date: dueDate,
+      body: "Created by the v4 test harness.",
+      reminder,
+      linked_message_id: latestMessage.id,
+    }),
+    "manage_task create"
+  );
+  let taskId = createText.match(/Task id: (\S+)/)?.[1];
+  assert(taskId, `Could not extract task id from output: ${createText}`);
+  const taskPath = `/me/todo/lists/${encodeURIComponent(taskList.id)}/tasks/${encodeURIComponent(taskId)}`;
+  try {
+    assert(
+      createText.includes("Linked email details"),
+      `Create output does not mention the linked email: ${createText}`
+    );
+
+    // The linked mail really made it into the task notes, alongside the user's own.
+    const raw = await callGraphServer(taskPath);
+    const notes = String(raw.body?.content ?? "");
+    assert(notes.includes("Created by the v4 test harness."), `Task notes lost the body: ${notes}`);
+    assert(
+      notes.includes(String(latestMessage.subject ?? "")),
+      `Task notes missing the linked subject: ${notes}`
+    );
+    assert(
+      /Open in Outlook: https:\/\//.test(notes),
+      `Task notes missing the message web link: ${notes}`
+    );
+
+    const listText = toolText(await listTasksHandler({}), "list_tasks");
+    assert(listText.includes(title), `list_tasks missing the task: ${listText}`);
+    assert(listText.includes(taskId), `list_tasks missing the task id: ${listText}`);
+    assert(listText.includes("Upcoming"), `Task not grouped as upcoming: ${listText}`);
+    assert(listText.includes(`due ${dueDate}`), `Due date not shown: ${listText}`);
+    assert(listText.includes(`reminder ${reminder.replace("T", " ")}`), `Reminder not shown: ${listText}`);
+
+    // due_within_days narrower than the due date drops it.
+    const narrowText = toolText(
+      await listTasksHandler({ due_within_days: 0 }),
+      "list_tasks due_within_days 0"
+    );
+    assert(
+      !narrowText.includes(taskId),
+      `due_within_days 0 should exclude a task due ${dueDate}: ${narrowText}`
+    );
+
+    const completeText = toolText(
+      await manageTaskHandler({ action: "complete", task_id: taskId }),
+      "manage_task complete"
+    );
+    assert(/Status: completed/.test(completeText), `Unexpected complete output: ${completeText}`);
+    const openText = toolText(await listTasksHandler({}), "list_tasks after complete");
+    assert(!openText.includes(taskId), `Completed task still listed as open: ${openText}`);
+    const allText = toolText(
+      await listTasksHandler({ include_completed: true }),
+      "list_tasks include_completed"
+    );
+    assert(allText.includes(taskId), `include_completed did not surface the task: ${allText}`);
+
+    const reopenText = toolText(
+      await manageTaskHandler({ action: "reopen", task_id: taskId }),
+      "manage_task reopen"
+    );
+    assert(/Status: notStarted/.test(reopenText), `Unexpected reopen output: ${reopenText}`);
+    const reopened = toolText(await listTasksHandler({}), "list_tasks after reopen");
+    assert(reopened.includes(taskId), `Reopened task is not listed as open: ${reopened}`);
+
+    const updateText = toolText(
+      await manageTaskHandler({ action: "update", task_id: taskId, title: `${title} updated` }),
+      "manage_task update"
+    );
+    assert(updateText.includes(`${title} updated`), `Title not updated: ${updateText}`);
+
+    const noId = expectError(
+      await manageTaskHandler({ action: "complete" }),
+      "manage_task complete(no task_id)"
+    );
+    assert(/requires task_id/i.test(noId), `Unexpected error: ${noId}`);
+
+    // Delete is permanent — the output has to say so, and the task is really gone.
+    const deleteText = toolText(
+      await manageTaskHandler({ action: "delete", task_id: taskId }),
+      "manage_task delete"
+    );
+    assert(/permanent/i.test(deleteText), `Delete output does not flag permanence: ${deleteText}`);
+    assert(deleteText.includes(`${title} updated`), `Delete output does not name the task: ${deleteText}`);
+    const goneText = expectError(
+      await manageTaskHandler({ action: "complete", task_id: taskId }),
+      "manage_task complete(deleted task)"
+    );
+    assert(/No task/i.test(goneText), `Unexpected error for a deleted task: ${goneText}`);
+    taskId = undefined;
+  } finally {
+    if (taskId) await callGraphServer(taskPath, { method: "DELETE" }).catch(() => {});
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
-await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", async () => {
+await test("h. stdio smoke test (initialize + tools/list + prompts/list, clean stdout)", async () => {
   const tsxBin = path.join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
   const child = spawn(tsxBin, ["src/server.ts"], {
     cwd: PROJECT_ROOT,
@@ -777,13 +1234,17 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
       "auto_reply",
       "create_draft",
       "create_event",
+      "create_folder",
       "get_attachment",
       "list_events",
       "list_folders",
+      "list_tasks",
+      "manage_categories",
       "manage_contact",
       "manage_event",
       "manage_message",
       "manage_rules",
+      "manage_task",
       "read_message",
       "read_thread",
       "search_contacts",
@@ -791,7 +1252,7 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 17, `Expected 17 tools, got ${tools.length}`);
+    assert(tools.length === 21, `Expected 21 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -803,6 +1264,40 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
           Object.keys(tool.inputSchema.properties ?? {}).length > 0,
         `Tool ${tool.name} lacks a valid object input schema`
       );
+    }
+
+    // Prompts must be advertised over the same connection.
+    send({ jsonrpc: "2.0", id: 3, method: "prompts/list", params: {} });
+    const promptsResponse = await waitForResponse(3);
+    const prompts = promptsResponse.result?.prompts ?? [];
+    const promptNames = prompts.map((p: any) => p.name).sort();
+    assert(
+      JSON.stringify(promptNames) === JSON.stringify(["morning_brief", "triage_inbox"]),
+      `Expected prompts morning_brief, triage_inbox; got ${promptNames.join(", ") || "(none)"}`
+    );
+    for (const prompt of prompts) {
+      assert(
+        prompt.description?.length > 20,
+        `Prompt ${prompt.name} lacks a description`
+      );
+    }
+
+    // Each prompt renders to a non-trivial user message naming the tools to use.
+    const promptChecks: [string, string[]][] = [
+      ["triage_inbox", ["list_folders", "manage_rules", "search_mail"]],
+      ["morning_brief", ["search_mail", "list_events", "list_tasks"]],
+    ];
+    for (const [index, [name, mustMention]] of promptChecks.entries()) {
+      const requestId = 10 + index;
+      send({ jsonrpc: "2.0", id: requestId, method: "prompts/get", params: { name } });
+      const got = await waitForResponse(requestId);
+      const messages = got.result?.messages ?? [];
+      assert(messages.length >= 1, `Prompt ${name} returned no messages`);
+      const text = messages.map((m: any) => m.content?.text ?? "").join("\n");
+      assert(text.length > 200, `Prompt ${name} text is suspiciously short: ${text}`);
+      for (const tool of mustMention) {
+        assert(text.includes(tool), `Prompt ${name} does not mention ${tool}`);
+      }
     }
 
     // stdout must contain nothing but protocol JSON.
@@ -828,6 +1323,8 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   await purgeTestMessages();
   await purgeTestFolders();
   await purgeTestRules();
+  await purgeTestCategories();
+  await purgeTestTasks();
 
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject,parentFolderId`
@@ -853,7 +1350,7 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
     `Leftover test contacts: ${JSON.stringify(contacts.value)}`
   );
 
-  const folders = await callGraphServer("/me/mailFolders?$top=100&$select=displayName");
+  const folders = await callGraphServer("/me/mailFolders?$top=100&$select=id,displayName");
   const testFolders = (folders?.value ?? []).filter((f: any) =>
     String(f.displayName ?? "").startsWith(TEST_PREFIX)
   );
@@ -864,6 +1361,45 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
     String(r.displayName ?? "").startsWith(TEST_PREFIX)
   );
   assert(testRules.length === 0, `Leftover test rules: ${JSON.stringify(testRules)}`);
+
+  // Subfolders too: create_folder can nest, so check one level below every
+  // top-level folder as well as the root listing above.
+  for (const parent of folders?.value ?? []) {
+    if (!parent.id) continue;
+    const children = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(parent.id)}/childFolders?$top=100&$select=id,displayName`
+    );
+    const testChildren = (children?.value ?? []).filter((f: any) =>
+      String(f.displayName ?? "").startsWith(TEST_PREFIX)
+    );
+    assert(
+      testChildren.length === 0,
+      `Leftover test subfolders under ${parent.displayName}: ${JSON.stringify(testChildren)}`
+    );
+  }
+
+  const categories = await callGraphServer("/me/outlook/masterCategories?$top=100");
+  const testCategories = (categories?.value ?? []).filter((c: any) =>
+    String(c.displayName ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(
+    testCategories.length === 0,
+    `Leftover test categories: ${JSON.stringify(testCategories)}`
+  );
+
+  const taskLists = await callGraphServer("/me/todo/lists?$top=100");
+  for (const list of taskLists?.value ?? []) {
+    const tasks = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100`
+    );
+    const testTasks = (tasks?.value ?? []).filter((t: any) =>
+      String(t.title ?? "").startsWith(TEST_PREFIX)
+    );
+    assert(
+      testTasks.length === 0,
+      `Leftover test tasks in "${list.displayName}": ${JSON.stringify(testTasks.map((t: any) => t.title))}`
+    );
+  }
 
   // Temp files: remove the run's temp dir and verify it is gone.
   if (state.tempDir) {
