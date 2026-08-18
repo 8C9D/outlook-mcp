@@ -345,3 +345,54 @@ exactly as the suite prescribes; rotation confirmed on the next run.
   refused) and r19 (download link round-trip, bearer-gated, dies at expiry).
 - TTL route: r3 extended headless-runnable — anonymous and bogus bearers
   get 401, never bytes. 25 MB and draft-only guards regression-checked (v3e).
+
+## Batch B — Surface depth (v0.8.0) — PASSED
+
+**Shipped (27 tools).**
+- To Do depth: subtasks (add/complete/remove over checklistItems, named by id
+  or exact text), task recurrence on create (reusing Batch A's recurrence
+  vocabulary) + clear_recurrence, list create/rename. Deleting lists is
+  deliberately absent — one call would destroy the list's tasks irrecoverably,
+  violating the soft-delete convention (recorded in the description, README,
+  ASSUMPTIONS).
+- manage_senders: block_sender/unblock_sender via beta markAsJunk/markAsNotJunk
+  (202). **Consumer-API absence confirmed by live probes**: the blocked/safe
+  sender lists cannot be read through Graph at all, and safe senders cannot be
+  managed (five endpoints probed, each 400/404/401 — recorded verbatim in
+  ASSUMPTIONS and the tool description). list/safe_sender/unsafe_sender are
+  not in the enum: an action that can only fail invites the model to call it.
+- mailbox_settings: get, set_working_hours (Graph silently normalises the
+  time-zone name, so the existing timeZone is carried through untouched),
+  focused-inbox overrides (fully supported on v1.0, contrary to the brief's
+  doubt). auto_reply stays its own tool — its vocabulary and test g are
+  untouched and passing; mailbox_settings reports auto-reply read-only and
+  points at auto_reply.
+- Forensics: read_message include_headers (SPF/DKIM/DMARC verdicts, Received
+  chain, Reply-To vs From mismatch flag); export_message as its own tool (a
+  read that writes a megabyte on a boolean flag would be a hidden side
+  effect) — local saves .eml, remote serves the MIME via the Batch A
+  download-link mechanism. New callGraphServerBytes inherits 429 handling.
+- Platform quirk recorded: task recurrence is create-only on consumer To Do —
+  every PATCH carrying a recurrence fails with an OData date-conversion error
+  regardless of shape; recurrence: null (clear) works.
+
+**Gate review (orchestrator, all re-run).**
+- typecheck clean; tree clean; 9 commits (9115a7a…9dbf25f) + orchestrator's
+  58f9374 (r6 sign-in deadline overridable via MCP_REMOTE_SIGNIN_TIMEOUT_MS,
+  default unchanged — see below).
+- Local harness: first gate run 37/40 — test b's send-to-self did not arrive
+  within 60 s; b2/c are cascades of b. No message in Junk/Deleted/Sent;
+  v5a (a later send-to-self in the same run) passed. Attributed to delivery
+  delay in the async (202) block/unblock-self propagation window from the
+  subagent's v8b run minutes earlier. Immediate re-run: **40/40**, sweep
+  green (now also covers To Do lists, focus overrides, download dir,
+  working-hours restoration), auto-reply and working hours restored.
+- Remote suite **23/23** with a real sign-in — including the first
+  authenticated runs of r18/r19 against 0.8.0 and the new r23 (export_message
+  MIME served byte-identically through a bearer-gated link).
+- Gate friction worth recording: Microsoft throttled the account's single-use
+  verification codes for ~85 minutes (no passkey enrolled, password not at
+  hand, so email codes were the only sign-in factor). Two runs died on r6's
+  10-minute deadline; the fix was a 45-minute quiet period plus the
+  orchestrator's env-overridable deadline (30 min for gate runs). The flow
+  under test was not modified.
