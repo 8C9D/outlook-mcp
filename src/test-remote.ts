@@ -4,9 +4,10 @@
 // endpoint and the real Microsoft tenant: discovery metadata, refusal of
 // anonymous callers, a full OAuth authorization-code exchange, an MCP
 // round-trip over Streamable HTTP, proof that the mailbox refresh token in KV
-// actually rotates, and the three things only the hosted server can do —
-// KV-backed delta positions, MCP resources, and a Graph change notification
-// travelling from a real send all the way into get_mailbox_activity.
+// actually rotates, and the things only the hosted server can do — KV-backed
+// delta positions, MCP resources, a Graph change notification travelling from a
+// real send all the way into get_mailbox_activity, and attachments moving in
+// and out of a mailbox on a server with no filesystem.
 //
 // Like the local harness it cleans up after itself — the OAuth client it
 // registers and every grant and token derived from it are deleted from KV, the
@@ -41,6 +42,7 @@ import {
   STATE_SUBSCRIPTION,
   deltaKey,
 } from "./core/kv-keys.js";
+import { DOWNLOAD_ROUTE_PREFIX } from "./core/downloads.js";
 import type { ActivityEntry } from "./core/notifications.js";
 import { TOOLS } from "./core/registry.js";
 import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
@@ -221,15 +223,26 @@ function resultOf(
   return response.body.result;
 }
 
-/** Call a tool over the remote endpoint and return its text, refusing isError. */
-async function callTool(name: string, args: Record<string, unknown> = {}): Promise<string> {
+/** Call a tool over the remote endpoint, keeping whatever it answered. */
+async function callToolRaw(
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<{ text: string; isError: boolean }> {
   assert(bearer, `no bearer token (r6 must pass first) — cannot call ${name}`);
   const result = resultOf(
     await mcpCall(bearer!, "tools/call", { name, arguments: args }),
     `tools/call ${name}`
   );
-  const text = (result.content as { text: string }[]).map((part) => part.text).join("\n");
-  assert(result.isError !== true, `${name} returned isError: ${text}`);
+  return {
+    text: (result.content as { text: string }[]).map((part) => part.text).join("\n"),
+    isError: result.isError === true,
+  };
+}
+
+/** Call a tool over the remote endpoint and return its text, refusing isError. */
+async function callTool(name: string, args: Record<string, unknown> = {}): Promise<string> {
+  const { text, isError } = await callToolRaw(name, args);
+  assert(!isError, `${name} returned isError: ${text}`);
   return text;
 }
 
@@ -313,7 +326,7 @@ await test("r2. authorization server metadata offers DCR and S256 PKCE", async (
   );
 });
 
-await test("r3. anonymous and bogus-bearer requests to /mcp are refused", async () => {
+await test("r3. anonymous and bogus-bearer requests to the protected routes are refused", async () => {
   const anonymous = await mcpCall(null, "tools/list");
   assert(anonymous.status === 401, `anonymous POST returned ${anonymous.status}, expected 401`);
   const challenge = anonymous.headers.get("www-authenticate") ?? "";
@@ -331,6 +344,21 @@ await test("r3. anonymous and bogus-bearer requests to /mcp are refused", async 
     assert(
       response.status === 401,
       `anonymous ${method} /mcp returned ${response.status}, expected 401`
+    );
+  }
+
+  // The attachment download route is gated by the same bearer check. A
+  // well-formed but unissued id must be refused for want of a token, not
+  // answered with 404 — that ordering is what keeps the links private.
+  const madeUpId = randomBytes(32).toString("hex");
+  for (const bearerValue of [null, "not-a-real-token"]) {
+    const response = await fetch(`${BASE_URL}${DOWNLOAD_ROUTE_PREFIX}${madeUpId}`, {
+      headers: bearerValue ? { authorization: `Bearer ${bearerValue}` } : {},
+    });
+    assert(
+      response.status === 401,
+      `${bearerValue ? "bogus-bearer" : "anonymous"} GET of a download link returned ` +
+        `${response.status}, expected 401`
     );
   }
 });
@@ -773,7 +801,144 @@ await testAuthed("r17. end-to-end: a message sent to this mailbox shows up in ge
   );
 });
 
-await test("r18. cleanup: the probe message, its notifications and the delta position are gone", async () => {
+// ------------------------------------------- v7: attachments without a filesystem
+
+// A stable, public https resource for the url source. The Worker fetches it
+// itself, which is the whole point: the bytes never touch this machine.
+const ATTACH_URL = "https://example.com/";
+
+await testAuthed("r18. add_attachment fetches an https URL from the Worker; file_path is refused", async () => {
+  const subject = `${TEST_PREFIX} v7 url attach ${randomBytes(4).toString("hex")}`;
+  const createText = await callTool("create_draft", {
+    to: [ownAddress],
+    subject,
+    body: "URL-attachment probe from the remote harness. Safe to delete.",
+  });
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `could not extract a draft id from: ${createText}`);
+
+  const attachText = await callTool("add_attachment", {
+    draft_id: draftId,
+    url: ATTACH_URL,
+    attachment_name: "probe.html",
+  });
+  assert(/Name: probe\.html/.test(attachText), `unexpected add_attachment output: ${attachText}`);
+  assert(
+    /Type: text\/html/.test(attachText),
+    `the content type did not come from the response: ${attachText}`
+  );
+
+  // Graph's own view, read with this machine's token rather than the connector's.
+  const listed = await callGraphServer(
+    `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name,size,contentType`
+  );
+  const attachment = (listed?.value ?? []).find((a: any) => a.name === "probe.html");
+  assert(attachment, `the attachment is not in the inventory: ${JSON.stringify(listed?.value)}`);
+  assert(attachment.size > 500, `the attachment is suspiciously small: ${attachment.size} bytes`);
+  const full = await callGraphServer(
+    `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(attachment.id)}`
+  );
+  assert(
+    Buffer.from(full.contentBytes ?? "", "base64").toString("utf8").includes("Example Domain"),
+    "the attached bytes are not what the URL serves"
+  );
+
+  // The local-only source has to fail honestly rather than half-work.
+  const refused = await callToolRaw("add_attachment", {
+    draft_id: draftId,
+    file_path: "/etc/hosts",
+  });
+  assert(refused.isError, `file_path was accepted by the hosted server: ${refused.text}`);
+  assert(
+    /no access to your filesystem|only on the local/i.test(refused.text),
+    `unexpected file_path refusal: ${refused.text}`
+  );
+
+  await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}/permanentDelete`, {
+    method: "POST",
+  });
+});
+
+await testAuthed("r19. get_attachment hands out a bearer-gated download link that expires", async () => {
+  const payload = Buffer.alloc(2048);
+  for (let i = 0; i < payload.length; i++) payload[i] = (i * 31) % 256;
+
+  const subject = `${TEST_PREFIX} v7 download ${randomBytes(4).toString("hex")}`;
+  const createText = await callTool("create_draft", {
+    to: [ownAddress],
+    subject,
+    body: "Download-link probe from the remote harness. Safe to delete.",
+  });
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `could not extract a draft id from: ${createText}`);
+
+  try {
+    await callTool("add_attachment", {
+      draft_id: draftId,
+      content_base64: payload.toString("base64"),
+      attachment_name: "blob.bin",
+    });
+    const listed = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name`
+    );
+    const attachment = (listed?.value ?? []).find((a: any) => a.name === "blob.bin");
+    assert(attachment, `the attachment is not in the inventory: ${JSON.stringify(listed?.value)}`);
+
+    // One minute is the shortest link this server will issue, and the shortest
+    // the expiry assertion below can wait for.
+    const text = await callTool("get_attachment", {
+      message_id: draftId,
+      attachment_id: attachment.id,
+      link_ttl_minutes: 1,
+    });
+    const link = text.match(/Download: (\S+)/)?.[1];
+    assert(link, `no download link in the output: ${text}`);
+    assert(
+      link.startsWith(`${BASE_URL}${DOWNLOAD_ROUTE_PREFIX}`) &&
+        /\/[0-9a-f]{64}$/.test(link),
+      `the link is not an unguessable id on this Worker: ${link}`
+    );
+    assert(!/Saved to:/.test(text), `the hosted server claimed to save a file: ${text}`);
+
+    // Anonymous first: the bytes must never be reachable without the bearer.
+    const anonymous = await fetch(link);
+    assert(anonymous.status === 401, `anonymous download returned ${anonymous.status}, expected 401`);
+
+    const authed = await fetch(link, { headers: { authorization: `Bearer ${bearer}` } });
+    assert(authed.status === 200, `authenticated download returned ${authed.status}`);
+    assert(
+      (authed.headers.get("content-disposition") ?? "").includes("blob.bin"),
+      `content-disposition does not name the file: ${authed.headers.get("content-disposition")}`
+    );
+    const downloaded = Buffer.from(await authed.arrayBuffer());
+    assert(
+      downloaded.equals(payload),
+      `the download is ${downloaded.length} bytes, expected the ${payload.length} that went in`
+    );
+
+    // A well-formed id that was never issued is a 404, not somebody's file.
+    const unissued = await fetch(
+      `${BASE_URL}${DOWNLOAD_ROUTE_PREFIX}${randomBytes(32).toString("hex")}`,
+      { headers: { authorization: `Bearer ${bearer}` } }
+    );
+    assert(unissued.status === 404, `an unissued id returned ${unissued.status}, expected 404`);
+
+    // And the link really dies: the record carries its own deadline, so this is
+    // exact rather than dependent on KV getting round to the expiry.
+    console.log("      waiting for the 1-minute download link to expire...");
+    const expiredStatus = await poll("the download link to expire", 180_000, 10_000, async () => {
+      const response = await fetch(link, { headers: { authorization: `Bearer ${bearer}` } });
+      return response.status === 200 ? undefined : response.status;
+    });
+    assert(expiredStatus === 404, `the expired link returned ${expiredStatus}, expected 404`);
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}/permanentDelete`, {
+      method: "POST",
+    }).catch(() => {});
+  }
+});
+
+await test("r20. cleanup: the probe message, its notifications and the delta position are gone", async () => {
   // The mail itself: both copies, permanently (the tools only soft-delete).
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject`
@@ -822,7 +987,7 @@ await test("r18. cleanup: the probe message, its notifications and the delta pos
 
 // ------------------------------------------------------------------- teardown
 
-await test("r19. cleanup: every OAuth record this run created is deleted", async () => {
+await test("r21. cleanup: every OAuth record this run created is deleted", async () => {
   const keys = await kvListKeys(oauthNs);
   const created = keys.filter((key) => !baselineOauthKeys.has(key));
   for (const key of created) await kvDelete(oauthNs, key);
@@ -834,7 +999,7 @@ await test("r19. cleanup: every OAuth record this run created is deleted", async
   );
 });
 
-await testAuthed("r20. final sweep: the revoked bearer no longer opens /mcp", async () => {
+await testAuthed("r22. final sweep: the revoked bearer no longer opens /mcp", async () => {
   assert(bearer, "no bearer token");
   // KV caches reads at the edge for up to a minute, so a just-deleted token can
   // still validate briefly. Poll rather than accept that as a pass.
