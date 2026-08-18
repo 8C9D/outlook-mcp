@@ -1,11 +1,15 @@
 // Test harness: exercises the tool handlers directly (bypassing the MCP
 // transport) against the real account using the cached token, plus a stdio
 // protocol smoke test of the server itself. Every test cleans up after itself;
-// a final check verifies no "[MCP TEST]" artifacts remain in the account and
+// a final check verifies no "[MCP TEST]" artifacts remain in the account
+// (messages, drafts, folders, events, contacts, inbox rules, temp files) and
 // that mailbox settings (auto-reply) are restored exactly.
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { GraphError, callGraphServer } from "./graph.js";
+import { GraphError, callGraphServer, graphRequestLog } from "./graph.js";
 import { PROJECT_ROOT } from "./project-root.js";
 import { searchMailHandler } from "./tools/search-mail.js";
 import { readThreadHandler } from "./tools/read-thread.js";
@@ -21,6 +25,8 @@ import { manageEventHandler } from "./tools/manage-event.js";
 import { searchContactsHandler } from "./tools/search-contacts.js";
 import { manageContactHandler } from "./tools/manage-contact.js";
 import { autoReplyHandler } from "./tools/auto-reply.js";
+import { addAttachmentHandler } from "./tools/add-attachment.js";
+import { manageRulesHandler } from "./tools/manage-rules.js";
 import type { ToolResult } from "./tools/common.js";
 
 const TEST_PREFIX = "[MCP TEST]";
@@ -111,6 +117,18 @@ async function purgeTestFolders(): Promise<void> {
   }
 }
 
+/** TEST-ONLY: remove any [MCP TEST] inbox rules. */
+async function purgeTestRules(): Promise<void> {
+  const data = await callGraphServer("/me/mailFolders/inbox/messageRules");
+  for (const rule of data?.value ?? []) {
+    if (String(rule.displayName ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/mailFolders/inbox/messageRules/${encodeURIComponent(rule.id)}`, {
+        method: "DELETE",
+      });
+    }
+  }
+}
+
 // ---- shared fixtures ----------------------------------------------------
 
 const me = await callGraphServer("/me?$select=mail,userPrincipalName");
@@ -122,13 +140,27 @@ const latestInbox = await callGraphServer(
 );
 const latestMessage = latestInbox?.value?.[0];
 
-// Cross-test state for the v2 lifecycle tests.
+// Cross-test state for the v2/v3 lifecycle tests.
 const state: {
   receivedId?: string;
   sentId?: string;
   testFolderId?: string;
   savedAutoReply?: any;
+  tempDir?: string;
 } = {};
+
+/** Create the run's temp dir on first use; every temp file for tests lives here. */
+async function tempDir(): Promise<string> {
+  if (!state.tempDir) state.tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-test-"));
+  return state.tempDir;
+}
+
+/** Extract "Draft id: …" from a create_draft output. */
+function extractDraftId(createText: string): string {
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `Could not extract draft id from output: ${createText}`);
+  return draftId;
+}
 
 // ---- v1: search_mail ----------------------------------------------------
 
@@ -426,6 +458,263 @@ await test("g. auto_reply (save state → set test message → restore exactly)"
   );
 });
 
+// ---- v3a. search_mail get_latest mode ------------------------------------
+
+await test("v3a. search_mail get_latest (no query → newest-first, matches direct $orderby)", async () => {
+  assert(latestMessage, "Inbox is empty; nothing to list");
+  const text = toolText(await searchMailHandler({ max_results: 5 }), "search_mail no-query");
+  assert(text.includes("(newest first)"), `Output not labeled newest-first: ${text.slice(0, 200)}`);
+  const ids = [...text.matchAll(/Message id: (\S+)/g)].map((m) => m[1]!);
+  assert(ids.length >= 1, `No message ids in output: ${text.slice(0, 300)}`);
+
+  // The first result must match a direct $orderby=receivedDateTime desc&$top=1 call.
+  const direct = await callGraphServer(
+    `/me/mailFolders/inbox/messages?$orderby=${encodeURIComponent("receivedDateTime desc")}&$top=1&$select=id,receivedDateTime`
+  );
+  assert(direct?.value?.[0]?.id === ids[0], "First result does not match direct $orderby call");
+
+  if (ids.length >= 2) {
+    const [first, second] = await Promise.all(
+      ids.slice(0, 2).map((id) =>
+        callGraphServer(`/me/messages/${encodeURIComponent(id)}?$select=receivedDateTime`)
+      )
+    );
+    assert(
+      new Date(first.receivedDateTime).getTime() >= new Date(second.receivedDateTime).getTime(),
+      `Results not newest-first: ${first.receivedDateTime} < ${second.receivedDateTime}`
+    );
+  }
+});
+
+// ---- v3b. manage_message via $batch --------------------------------------
+
+await test("v3b. manage_message $batch (3 drafts mark_read in ONE batch request)", async () => {
+  const draftIds: string[] = [];
+  for (let i = 1; i <= 3; i++) {
+    const createText = toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} batch ${i}`,
+        body: "Batch test draft. Safe to delete.",
+      }),
+      `create_draft batch ${i}`
+    );
+    draftIds.push(extractDraftId(createText));
+  }
+
+  const logStart = graphRequestLog.length;
+  const text = toolText(
+    await manageMessageHandler({ message_ids: draftIds, action: "mark_read" }),
+    "manage_message batch mark_read"
+  );
+  const issued = graphRequestLog.slice(logStart);
+  const batchCalls = issued.filter((r) => r.path === "/$batch");
+  assert(
+    batchCalls.length === 1,
+    `Expected exactly one /$batch request, saw ${batchCalls.length} (all requests: ${JSON.stringify(issued)})`
+  );
+  assert(
+    issued.length === batchCalls.length,
+    `manage_message issued non-batch requests: ${JSON.stringify(issued)}`
+  );
+  assert(text.includes("3/3"), `Expected 3/3 succeeded: ${text}`);
+  for (const id of draftIds) {
+    assert(text.includes(`OK      ${id}`), `Missing OK line for ${id}: ${text}`);
+  }
+
+  const delText = toolText(
+    await manageMessageHandler({ message_ids: draftIds, action: "delete" }),
+    "manage_message batch delete"
+  );
+  assert(delText.includes("3/3"), `Expected all three deletions to succeed: ${delText}`);
+});
+
+// ---- v3c. add_attachment small file --------------------------------------
+
+await test("v3c. add_attachment small (~100 KB, single POST, visible in read_message)", async () => {
+  const dir = await tempDir();
+  const filePath = path.join(dir, "mcp-test-small.txt");
+  await fs.writeFile(filePath, "The quick brown fox jumps over the lazy dog. ".repeat(2300)); // ~101 KB
+
+  const createText = toolText(
+    await createDraftHandler({
+      to: [ownAddress],
+      subject: `${TEST_PREFIX} attach`,
+      body: "Attachment test draft. Safe to delete.",
+    }),
+    "create_draft attach"
+  );
+  const draftId = extractDraftId(createText);
+  try {
+    const attachText = toolText(
+      await addAttachmentHandler({ draft_id: draftId, file_path: filePath }),
+      "add_attachment small"
+    );
+    assert(attachText.includes("mcp-test-small.txt"), `Missing name: ${attachText}`);
+    assert(attachText.includes(`${TEST_PREFIX} attach`), `Missing draft subject: ${attachText}`);
+
+    const readText = toolText(await readMessageHandler({ message_id: draftId }), "read_message");
+    assert(/Attachments \(1\):/.test(readText), `Inventory missing: ${readText.slice(-500)}`);
+    assert(readText.includes("mcp-test-small.txt"), `Attachment name missing: ${readText.slice(-500)}`);
+    assert(/1\d{2}\.\d KB/.test(readText), `Expected ~100 KB size in inventory: ${readText.slice(-500)}`);
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+    await fs.rm(filePath, { force: true });
+  }
+});
+
+// ---- v3d. add_attachment large file (upload session) ----------------------
+
+await test("v3d. add_attachment large (~4 MB via upload session, bytes verified)", async () => {
+  const dir = await tempDir();
+  const filePath = path.join(dir, "mcp-test-large.bin");
+  // ~4.5 MB of deterministic bytes: exercises the session path (>3 MB) with two chunks (>4 MB).
+  const size = Math.round(4.5 * 1024 * 1024);
+  const buffer = Buffer.alloc(size);
+  for (let i = 0; i < size; i++) buffer[i] = i % 251;
+  await fs.writeFile(filePath, buffer);
+  const localHash = createHash("sha256").update(buffer).digest("hex");
+
+  const createText = toolText(
+    await createDraftHandler({
+      to: [ownAddress],
+      subject: `${TEST_PREFIX} attach large`,
+      body: "Large-attachment test draft. Safe to delete.",
+    }),
+    "create_draft attach large"
+  );
+  const draftId = extractDraftId(createText);
+  try {
+    const attachText = toolText(
+      await addAttachmentHandler({ draft_id: draftId, file_path: filePath }),
+      "add_attachment large"
+    );
+    assert(attachText.includes("mcp-test-large.bin"), `Missing name: ${attachText}`);
+    assert(attachText.includes("4.5 MB"), `Missing size: ${attachText}`);
+
+    // Verify the uploaded bytes really match the file: fetch and hash them.
+    const listed = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name,size`
+    );
+    const att = (listed?.value ?? []).find((a: any) => a.name === "mcp-test-large.bin");
+    assert(att, `Uploaded attachment not listed: ${JSON.stringify(listed?.value)}`);
+    const full = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
+    );
+    const uploaded = Buffer.from(full.contentBytes ?? "", "base64");
+    assert(
+      uploaded.length === size,
+      `Uploaded size ${uploaded.length} does not match file size ${size}`
+    );
+    const uploadedHash = createHash("sha256").update(uploaded).digest("hex");
+    assert(uploadedHash === localHash, "Uploaded bytes differ from the local file (sha256 mismatch)");
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+    await fs.rm(filePath, { force: true });
+  }
+});
+
+// ---- v3e. add_attachment guards ------------------------------------------
+
+await test("v3e. add_attachment guards (non-draft, missing file, oversize)", async () => {
+  const dir = await tempDir();
+
+  // Non-draft target: any received inbox message.
+  const tinyPath = path.join(dir, "mcp-test-tiny.txt");
+  await fs.writeFile(tinyPath, "tiny");
+  assert(latestMessage, "Inbox is empty; no non-draft id available");
+  const nonDraft = expectError(
+    await addAttachmentHandler({ draft_id: latestMessage.id, file_path: tinyPath }),
+    "add_attachment(non-draft)"
+  );
+  assert(/not a draft/i.test(nonDraft), `Unexpected error text: ${nonDraft}`);
+
+  // Missing file.
+  const missing = expectError(
+    await addAttachmentHandler({
+      draft_id: latestMessage.id,
+      file_path: path.join(dir, "does-not-exist.txt"),
+    }),
+    "add_attachment(missing file)"
+  );
+  assert(/not found|unreadable/i.test(missing), `Unexpected error text: ${missing}`);
+
+  // Oversize: a sparse 26 MB file — truthful stat.size without writing 26 MB of data.
+  const bigPath = path.join(dir, "mcp-test-oversize.bin");
+  await fs.writeFile(bigPath, "");
+  await fs.truncate(bigPath, 26 * 1024 * 1024);
+  try {
+    const oversize = expectError(
+      await addAttachmentHandler({ draft_id: latestMessage.id, file_path: bigPath }),
+      "add_attachment(oversize)"
+    );
+    assert(/25 MB/.test(oversize), `Unexpected error text: ${oversize}`);
+  } finally {
+    await fs.rm(bigPath, { force: true });
+    await fs.rm(tinyPath, { force: true });
+  }
+});
+
+// ---- v3f. manage_rules lifecycle -----------------------------------------
+
+await test("v3f. manage_rules lifecycle (create → list shows summary → delete → gone)", async () => {
+  const folder = await callGraphServer("/me/mailFolders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: `${TEST_PREFIX} rules folder` }),
+  });
+  state.testFolderId = folder.id;
+  let ruleId: string | undefined;
+  try {
+    const createText = toolText(
+      await manageRulesHandler({
+        action: "create",
+        display_name: `${TEST_PREFIX} rule`,
+        conditions: { from_addresses: ["mcptest@example.invalid"] },
+        actions: { move_to_folder: folder.id },
+      }),
+      "manage_rules create"
+    );
+    ruleId = createText.match(/Rule id: (\S+)/)?.[1];
+    assert(ruleId, `Could not extract rule id from output: ${createText}`);
+
+    const listText = toolText(await manageRulesHandler({ action: "list" }), "manage_rules list");
+    assert(listText.includes(`${TEST_PREFIX} rule`), `List missing the rule: ${listText}`);
+    assert(listText.includes(ruleId), `List missing the rule id: ${listText}`);
+    assert(
+      listText.includes("from mcptest@example.invalid"),
+      `Summary missing the condition: ${listText}`
+    );
+    assert(
+      listText.includes(`move to "${TEST_PREFIX} rules folder"`),
+      `Summary missing the action: ${listText}`
+    );
+
+    const deleteText = toolText(
+      await manageRulesHandler({ action: "delete", rule_id: ruleId }),
+      "manage_rules delete"
+    );
+    assert(deleteText.includes("deleted"), `Unexpected delete output: ${deleteText}`);
+    ruleId = undefined;
+
+    const afterText = toolText(await manageRulesHandler({ action: "list" }), "manage_rules list after");
+    assert(
+      !afterText.includes(`${TEST_PREFIX} rule`),
+      `Deleted rule still listed: ${afterText}`
+    );
+  } finally {
+    if (ruleId) {
+      await callGraphServer(`/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`, {
+        method: "DELETE",
+      }).catch(() => {});
+    }
+    await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/permanentDelete`, {
+      method: "POST",
+    });
+    state.testFolderId = undefined;
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", async () => {
@@ -484,6 +773,7 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
     const tools = listResponse.result?.tools ?? [];
     const names = tools.map((t: any) => t.name).sort();
     const expected = [
+      "add_attachment",
       "auto_reply",
       "create_draft",
       "create_event",
@@ -493,6 +783,7 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
       "manage_contact",
       "manage_event",
       "manage_message",
+      "manage_rules",
       "read_message",
       "read_thread",
       "search_contacts",
@@ -500,6 +791,7 @@ await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", a
       "send_draft",
       "update_draft",
     ];
+    assert(tools.length === 17, `Expected 17 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -535,6 +827,7 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   // Purge soft-deleted test artifacts (test-only), then verify nothing remains.
   await purgeTestMessages();
   await purgeTestFolders();
+  await purgeTestRules();
 
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject,parentFolderId`
@@ -565,6 +858,23 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
     String(f.displayName ?? "").startsWith(TEST_PREFIX)
   );
   assert(testFolders.length === 0, `Leftover test folders: ${JSON.stringify(testFolders)}`);
+
+  const rules = await callGraphServer("/me/mailFolders/inbox/messageRules");
+  const testRules = (rules?.value ?? []).filter((r: any) =>
+    String(r.displayName ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(testRules.length === 0, `Leftover test rules: ${JSON.stringify(testRules)}`);
+
+  // Temp files: remove the run's temp dir and verify it is gone.
+  if (state.tempDir) {
+    await fs.rm(state.tempDir, { recursive: true, force: true });
+    const gone = await fs
+      .access(state.tempDir)
+      .then(() => false)
+      .catch(() => true);
+    assert(gone, `Temp dir still exists: ${state.tempDir}`);
+    state.tempDir = undefined;
+  }
 
   const settings = await callGraphServer("/me/mailboxSettings?$select=automaticRepliesSetting");
   const current = settings?.automaticRepliesSetting;
