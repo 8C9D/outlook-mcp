@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { TIMEZONE, TZ_PREFER, ToolResult, fetchPaged, runTool, textResult } from "./common.js";
+import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
 
 export const listEventsSchema = {
   start_date: z
@@ -14,12 +15,24 @@ export const listEventsSchema = {
     .max(31)
     .default(7)
     .describe("Number of days to list, starting at start_date (default 7, max 31)."),
+  calendar: z
+    .string()
+    .optional()
+    .describe(
+      "Which calendar to read: its name or id (see list_calendars). Omit for the account's default calendar."
+    ),
+  include_ids: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Also print each event's id and, for repeating events, whether the line is one occurrence of a series (default false). Needed before manage_event can act on a specific event or on a single occurrence."
+    ),
 };
 
 const listEventsArgs = z.object(listEventsSchema);
 
 export const listEventsDescription =
-  "List the user's Outlook calendar events for a date window, grouped by day in America/Toronto local time. Shows each event as start–end time, subject, and location; all-day events are listed first within each day. Defaults to the next 7 days starting today.";
+  "List the user's Outlook calendar events for a date window, grouped by day in America/Toronto local time. Shows each event as start–end time, subject, and location; all-day events are listed first within each day, and repeating events appear once per occurrence. Defaults to the next 7 days of the default calendar starting today; set calendar to read another one and include_ids to get the ids manage_event needs.";
 
 /** Today's date in America/Toronto as YYYY-MM-DD. */
 export function torontoToday(): string {
@@ -46,16 +59,18 @@ export async function listEventsHandler(
     const parsed = listEventsArgs.parse(input);
     const startDate = parsed.start_date ?? torontoToday();
     const endDate = addDays(startDate, parsed.days);
+    const target = await resolveCalendar(parsed.calendar);
+    const where = target ? ` in ${target.name}` : "";
     // Naive datetime bounds are interpreted in the Prefer: outlook.timezone zone.
     const path =
-      `/me/calendarView?startDateTime=${encodeURIComponent(`${startDate}T00:00:00`)}` +
+      `${calendarBasePath(target)}/calendarView?startDateTime=${encodeURIComponent(`${startDate}T00:00:00`)}` +
       `&endDateTime=${encodeURIComponent(`${endDate}T00:00:00`)}` +
-      `&$select=subject,start,end,location,isAllDay,organizer&$orderby=start/dateTime&$top=50`;
+      `&$select=id,subject,start,end,location,isAllDay,organizer,type&$orderby=start/dateTime&$top=50`;
     const events = await fetchPaged(path, EVENT_CAP, { Prefer: TZ_PREFER });
 
     const lastDay = addDays(startDate, parsed.days - 1);
     if (events.length === 0) {
-      return textResult(`No events in this window (${startDate} to ${lastDay}).`);
+      return textResult(`No events in this window (${startDate} to ${lastDay})${where}.`);
     }
 
     const byDay = new Map<string, { allDay: any[]; timed: any[] }>();
@@ -69,13 +84,15 @@ export async function listEventsHandler(
     for (const day of [...byDay.keys()].sort()) {
       const { allDay, timed } = byDay.get(day)!;
       const lines = [
-        ...allDay.map((ev) => `  all day     ${describe(ev)}`),
-        ...timed.map((ev) => `  ${hhmm(ev.start)}–${hhmm(ev.end)} ${describe(ev)}`),
+        ...allDay.map((ev) => `  all day     ${describe(ev)}${identify(ev, parsed.include_ids)}`),
+        ...timed.map(
+          (ev) => `  ${hhmm(ev.start)}–${hhmm(ev.end)} ${describe(ev)}${identify(ev, parsed.include_ids)}`
+        ),
       ];
       sections.push(`${day}\n${lines.join("\n")}`);
     }
     return textResult(
-      `Events ${startDate} to ${lastDay} (${TIMEZONE}):\n\n${sections.join("\n\n")}`
+      `Events ${startDate} to ${lastDay}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`
     );
   });
 }
@@ -87,4 +104,11 @@ function hhmm(when: any): string {
 function describe(ev: any): string {
   const location = ev.location?.displayName;
   return `${ev.subject || "(no subject)"}${location ? ` (${location})` : ""}`;
+}
+
+/** The id line, when asked for. Occurrences say so, since editing one differs from editing the series. */
+function identify(ev: any, includeIds: boolean): string {
+  if (!includeIds) return "";
+  const repeating = ev.type === "occurrence" || ev.type === "exception";
+  return `\n      id: ${ev.id}${repeating ? " (one occurrence of a repeating event)" : ""}`;
 }

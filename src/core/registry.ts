@@ -41,6 +41,11 @@ import {
   listEventsSchema,
 } from "../tools/list-events.js";
 import {
+  listCalendarsDescription,
+  listCalendarsHandler,
+  listCalendarsSchema,
+} from "../tools/list-calendars.js";
+import {
   createEventDescription,
   createEventHandler,
   createEventSchema,
@@ -166,6 +171,12 @@ export const TOOLS: ToolDefinition[] = [
     description: listEventsDescription,
     inputSchema: listEventsSchema,
     handler: listEventsHandler,
+  },
+  {
+    name: "list_calendars",
+    description: listCalendarsDescription,
+    inputSchema: listCalendarsSchema,
+    handler: listCalendarsHandler,
   },
   {
     name: "create_event",
