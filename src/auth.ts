@@ -16,7 +16,15 @@ dotenv.config({ path: path.join(PROJECT_ROOT, ".env"), quiet: true });
 const CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
 
 // offline_access is added by MSAL automatically; openid/profile must not be listed.
-const SCOPES = ["User.Read", "Mail.Read", "Mail.ReadWrite", "Calendars.ReadWrite"];
+const SCOPES = [
+  "User.Read",
+  "Mail.Read",
+  "Mail.ReadWrite",
+  "Mail.Send",
+  "Calendars.ReadWrite",
+  "Contacts.ReadWrite",
+  "MailboxSettings.ReadWrite",
+];
 
 function requireClientId(): string {
   const clientId = process.env.AZURE_CLIENT_ID;
