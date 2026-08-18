@@ -31,12 +31,40 @@ import { createFolderHandler } from "./tools/create-folder.js";
 import { manageCategoriesHandler } from "./tools/manage-categories.js";
 import { listTasksHandler, resolveTaskList } from "./tools/list-tasks.js";
 import { manageTaskHandler } from "./tools/manage-task.js";
+import { checkNewMailHandler } from "./tools/check-new-mail.js";
+import { getMailboxActivityHandler } from "./tools/get-mailbox-activity.js";
+import {
+  ACTIVITY_CAP,
+  appendActivity,
+  handleNotificationRequest,
+  readActivity,
+} from "./core/notifications.js";
+import {
+  ensureMailSubscription,
+  renewalDecision,
+  SUBSCRIPTION_RESOURCE,
+  type SubscriptionRecord,
+} from "./core/subscriptions.js";
+import { STATE_ACTIVITY, STATE_SUBSCRIPTION, deltaKey } from "./core/kv-keys.js";
+import { createMemoryStateStore, runWithStateStore, writeJson } from "./core/state.js";
+import { installFileStateStore } from "./state-file.js";
+import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
 import type { ToolResult } from "./tools/common.js";
 import { installMsalTokenProvider } from "./auth.js";
 
 // Tool handlers reach Graph through core/token.js; in Node the token comes from
 // MSAL and the disk cache, exactly as under the stdio server.
 installMsalTokenProvider();
+
+// check_new_mail remembers its delta position in the state store. The harness
+// installs the real file-backed store, but pointed at a throwaway file so a run
+// never disturbs (or is disturbed by) the server's own position; the final
+// sweep deletes it.
+const TEST_STATE_FILE = path.join(
+  os.tmpdir(),
+  `mcp-test-state-${createHash("sha256").update(String(process.pid)).digest("hex").slice(0, 8)}.json`
+);
+installFileStateStore(TEST_STATE_FILE);
 
 const TEST_PREFIX = "[MCP TEST]";
 
@@ -1177,9 +1205,351 @@ await test("v4d. task lifecycle (create from a message → complete → reopen �
   }
 });
 
+// ---- v5a. check_new_mail delta lifecycle ---------------------------------
+
+await test("v5a. check_new_mail delta (baseline → send-to-self → sees exactly it → advances)", async () => {
+  const subject = `${TEST_PREFIX} v5 delta`;
+
+  const baseline = toolText(
+    await checkNewMailHandler({ folder: "inbox", reset: true }),
+    "check_new_mail baseline"
+  );
+  assert(
+    /Starting position recorded for inbox/.test(baseline),
+    `Unexpected baseline output: ${baseline}`
+  );
+  assert(
+    !baseline.includes(TEST_PREFIX),
+    `Baseline call should list nothing, but named a test artifact: ${baseline}`
+  );
+
+  // Immediately after a baseline there is nothing of ours to report. Real mail
+  // may legitimately arrive mid-run, so only our own artifacts are asserted on.
+  const quiet = toolText(await checkNewMailHandler({}), "check_new_mail quiet");
+  assert(!quiet.includes(TEST_PREFIX), `Unexpected test artifact before sending: ${quiet}`);
+
+  const draftId = extractDraftId(
+    toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject,
+        body: "Delta-query probe from the v5 test harness. Safe to delete.",
+      }),
+      "create_draft (delta probe)"
+    )
+  );
+  toolText(await sendDraftHandler({ draft_id: draftId }), "send_draft (delta probe)");
+
+  const arrived = await poll("the delta probe message to reach the inbox", 90000, async () => {
+    const found = await callGraphServer(
+      `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,subject`
+    );
+    return found?.value?.[0];
+  });
+
+  // Delta lags the folder listing slightly; poll it rather than assume.
+  const changes = await poll("the delta query to report the probe message", 90000, async () => {
+    const text = toolText(await checkNewMailHandler({}), "check_new_mail after send");
+    return text.includes(subject) ? text : undefined;
+  });
+  const ourLines = changes.split("\n").filter((line) => line.includes(TEST_PREFIX));
+  assert(
+    ourLines.length === 1,
+    `Expected exactly one test message in the delta, got ${ourLines.length}:\n${changes}`
+  );
+  assert(
+    changes.includes(arrived.id),
+    `Delta output does not carry the arrived message id:\n${changes}`
+  );
+
+  // The position must have advanced: the same change is never reported twice.
+  const after = toolText(await checkNewMailHandler({}), "check_new_mail after reporting");
+  assert(
+    !after.includes(subject),
+    `The probe message was reported a second time — the delta position did not advance:\n${after}`
+  );
+
+  // reset discards the stored position and says so.
+  const reset = toolText(
+    await checkNewMailHandler({ reset: true }),
+    "check_new_mail reset"
+  );
+  assert(
+    /Previous position discarded/.test(reset),
+    `reset did not report discarding the stored position: ${reset}`
+  );
+
+  // Housekeeping for the sweep: the sent copy and the received copy both carry
+  // the test prefix, so purgeTestMessages removes them.
+});
+
+// ---- v5b. change-notification validation handshake -----------------------
+
+await test("v5b. webhook handshake (validationToken echoed verbatim, wrong method refused)", async () => {
+  const store = createMemoryStateStore("remote");
+  const token = "Validation: Testing unicode ✅ and spaces";
+  const response = await handleNotificationRequest(
+    new Request(`https://example.invalid/notifications?validationToken=${encodeURIComponent(token)}`, {
+      method: "POST",
+      body: "",
+    }),
+    { store }
+  );
+  assert(response.status === 200, `handshake answered HTTP ${response.status}, expected 200`);
+  const contentType = response.headers.get("content-type") ?? "";
+  assert(
+    contentType.startsWith("text/plain"),
+    `handshake content-type is ${contentType}, Graph requires text/plain`
+  );
+  const body = await response.text();
+  assert(body === token, `handshake echoed ${JSON.stringify(body)}, expected ${JSON.stringify(token)}`);
+
+  // The handshake must not need any stored state — a brand-new store is enough,
+  // which is what makes creating the very first subscription possible.
+  assert(
+    (await store.get(STATE_SUBSCRIPTION)) === null,
+    "the handshake wrote state it should not need"
+  );
+
+  const wrongMethod = await handleNotificationRequest(
+    new Request("https://example.invalid/notifications", { method: "GET" }),
+    { store }
+  );
+  assert(wrongMethod.status === 405, `GET without a token returned ${wrongMethod.status}, expected 405`);
+});
+
+// ---- v5c. notification ingest, clientState, ring buffer ------------------
+
+await test("v5c. notification ingest (clientState enforced, enriched, ring capped at 50)", async () => {
+  const store = createMemoryStateStore("remote");
+  const clientState = "secret-client-state-for-the-test";
+  await writeJson(store, STATE_SUBSCRIPTION, {
+    id: "sub-1",
+    clientState,
+    expirationDateTime: new Date(Date.now() + 3600_000).toISOString(),
+    notificationUrl: "https://example.invalid/notifications",
+    resource: SUBSCRIPTION_RESOURCE,
+    createdAt: new Date().toISOString(),
+  } satisfies SubscriptionRecord);
+
+  const deliver = (items: unknown[]) =>
+    handleNotificationRequest(
+      new Request("https://example.invalid/notifications", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value: items }),
+      }),
+      {
+        store,
+        enrich: async (id) => ({
+          subject: `${TEST_PREFIX} notified ${id}`,
+          from: "someone@example.invalid",
+          receivedDateTime: "2026-08-18T12:00:00Z",
+        }),
+      }
+    );
+
+  const forged = await deliver([
+    { subscriptionId: "sub-1", clientState: "not-the-secret", changeType: "created", resourceData: { id: "forged" } },
+  ]);
+  assert(forged.status === 202, `forged delivery answered ${forged.status}, expected 202`);
+  assert(
+    JSON.stringify(await forged.json()) === JSON.stringify({ accepted: 0, discarded: 1 }),
+    "a delivery with the wrong clientState was not discarded"
+  );
+  assert(
+    (await readActivity(store)).length === 0,
+    "a delivery with the wrong clientState reached the ring buffer"
+  );
+
+  const genuine = await deliver([
+    { subscriptionId: "sub-1", clientState, changeType: "created", resourceData: { id: "msg-1" } },
+  ]);
+  assert(genuine.status === 202, `genuine delivery answered ${genuine.status}`);
+  const entries = await readActivity(store);
+  assert(entries.length === 1, `expected 1 buffered entry, got ${entries.length}`);
+  assert(entries[0]!.messageId === "msg-1", `wrong message id: ${entries[0]!.messageId}`);
+  assert(
+    entries[0]!.subject === `${TEST_PREFIX} notified msg-1`,
+    `entry was not enriched: ${JSON.stringify(entries[0])}`
+  );
+  assert(Date.parse(entries[0]!.at) > 0, `entry has no usable timestamp: ${entries[0]!.at}`);
+
+  // get_mailbox_activity reads that buffer through the installed store.
+  const activity = toolText(
+    await runWithStateStore(store, () => getMailboxActivityHandler({ since_hours: 1 })),
+    "get_mailbox_activity"
+  );
+  assert(activity.includes("msg-1"), `activity output missing the entry: ${activity}`);
+  assert(
+    activity.includes(`${TEST_PREFIX} notified msg-1`),
+    `activity output missing the subject: ${activity}`
+  );
+
+  // Anything older than the window is filtered out rather than shown.
+  await writeJson(store, STATE_ACTIVITY, [
+    { at: new Date(Date.now() - 48 * 3600_000).toISOString(), changeType: "created", messageId: "old" },
+  ]);
+  const stale = toolText(
+    await runWithStateStore(store, () => getMailboxActivityHandler({ since_hours: 6 })),
+    "get_mailbox_activity (stale)"
+  );
+  assert(/No mail notifications/.test(stale), `stale entry was reported as recent: ${stale}`);
+
+  // The ring buffer is capped and newest-first.
+  await writeJson(store, STATE_ACTIVITY, []);
+  for (let i = 0; i < ACTIVITY_CAP + 10; i++) {
+    await appendActivity(store, [
+      { at: new Date(Date.now() + i).toISOString(), changeType: "created", messageId: `m${i}` },
+    ]);
+  }
+  const ring = await readActivity(store);
+  assert(ring.length === ACTIVITY_CAP, `ring buffer holds ${ring.length}, expected ${ACTIVITY_CAP}`);
+  assert(
+    ring[0]!.messageId === `m${ACTIVITY_CAP + 9}`,
+    `newest entry is ${ring[0]!.messageId}, expected the last appended`
+  );
+  assert(
+    !ring.some((entry) => entry.messageId === "m0"),
+    "the oldest entry was not dropped when the buffer filled"
+  );
+});
+
+// ---- v5d. subscription renewal (the cron handler's logic) ----------------
+
+await test("v5d. cron renewal (create → keep → renew → recreate when Graph forgot it)", async () => {
+  const store = createMemoryStateStore("remote");
+  const url = "https://example.invalid/notifications";
+  const calls: { method: string; path: string; body: any }[] = [];
+  let nextId = 1;
+  let patchFails = false;
+
+  const graph = async (path: string, init?: RequestInit) => {
+    const method = (init?.method ?? "GET").toUpperCase();
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ method, path, body });
+    if (method === "POST") {
+      return { id: `sub-${nextId++}`, expirationDateTime: body.expirationDateTime };
+    }
+    if (method === "PATCH") {
+      if (patchFails) throw new Error("ErrorItemNotFound: subscription no longer exists");
+      return { id: path.split("/").pop(), expirationDateTime: body.expirationDateTime };
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+
+  const start = new Date("2026-08-18T00:00:00Z");
+  const created = await ensureMailSubscription(store, url, { now: start, graph });
+  assert(created.action === "created", `first run did ${created.action}, expected created`);
+  assert(calls.length === 1 && calls[0]!.method === "POST", "creation did not POST /subscriptions");
+  const posted = calls[0]!.body;
+  assert(posted.resource === SUBSCRIPTION_RESOURCE, `wrong resource: ${posted.resource}`);
+  assert(posted.notificationUrl === url, `wrong notificationUrl: ${posted.notificationUrl}`);
+  assert(posted.changeType === "created", `wrong changeType: ${posted.changeType}`);
+  assert(
+    typeof posted.clientState === "string" && posted.clientState.length >= 32,
+    `clientState is not a long random secret: ${posted.clientState}`
+  );
+  assert(
+    Date.parse(posted.expirationDateTime) - start.getTime() <= 4230 * 60_000,
+    `requested expiry exceeds the Graph maximum: ${posted.expirationDateTime}`
+  );
+  const firstClientState: string = posted.clientState;
+
+  // Healthy: no Graph traffic at all.
+  calls.length = 0;
+  const kept = await ensureMailSubscription(store, url, {
+    now: new Date(start.getTime() + 3600_000),
+    graph,
+  });
+  assert(kept.action === "kept", `healthy subscription was ${kept.action}, expected kept`);
+  assert(calls.length === 0, `keeping the subscription made ${calls.length} Graph call(s)`);
+
+  // Inside the renewal window: PATCH, same subscription id and clientState.
+  const nearExpiry = new Date(Date.parse(created.record.expirationDateTime) - 6 * 3600_000);
+  const renewed = await ensureMailSubscription(store, url, { now: nearExpiry, graph });
+  assert(renewed.action === "renewed", `near-expiry run did ${renewed.action}, expected renewed`);
+  const patchCall = calls.find((call) => call.method === "PATCH");
+  assert(patchCall, `renewal made no PATCH: ${JSON.stringify(calls.map((c) => c.method))}`);
+  const strayCalls = calls.filter((call) => call.method !== "PATCH");
+  assert(
+    strayCalls.length === 0,
+    `renewal made unexpected Graph calls: ${JSON.stringify(strayCalls.map((c) => c.method))}`
+  );
+  assert(
+    patchCall.path.endsWith(created.record.id),
+    `renewal patched ${patchCall.path}, expected ${created.record.id}`
+  );
+  assert(
+    renewed.record.clientState === firstClientState,
+    "renewal changed the clientState, which would silently break every delivery"
+  );
+  assert(
+    Date.parse(renewed.record.expirationDateTime) > Date.parse(created.record.expirationDateTime),
+    "renewal did not push the expiry out"
+  );
+
+  // Graph forgot the subscription: renewal falls back to creating a new one,
+  // with a fresh secret.
+  calls.length = 0;
+  patchFails = true;
+  const stillNear = new Date(Date.parse(renewed.record.expirationDateTime) - 6 * 3600_000);
+  const recreated = await ensureMailSubscription(store, url, { now: stillNear, graph });
+  assert(recreated.action === "recreated", `expected recreated, got ${recreated.action}`);
+  assert(
+    calls.some((call) => call.method === "PATCH") && calls.some((call) => call.method === "POST"),
+    "recreation did not try PATCH first and then POST"
+  );
+  assert(recreated.record.id !== created.record.id, "recreation reused the dead subscription id");
+  assert(
+    recreated.record.clientState !== firstClientState,
+    "recreation reused the old clientState"
+  );
+
+  // A lapsed record, or one pointing at a different endpoint, must be rebuilt.
+  const lapsed: SubscriptionRecord = {
+    ...recreated.record,
+    expirationDateTime: new Date(stillNear.getTime() - 60_000).toISOString(),
+  };
+  assert(
+    renewalDecision(lapsed, url, stillNear) === "create",
+    "a lapsed subscription was not scheduled for re-creation"
+  );
+  assert(
+    renewalDecision(recreated.record, "https://elsewhere.invalid/notifications", stillNear) ===
+      "create",
+    "a moved notification URL did not force re-creation"
+  );
+  assert(renewalDecision(null, url, stillNear) === "create", "an absent record was not created");
+});
+
+// ---- v5e. get_mailbox_activity is remote-only ----------------------------
+
+await test("v5e. get_mailbox_activity refuses to pretend on the local stdio server", async () => {
+  // The harness has the file-backed (local) store installed, exactly as the
+  // stdio server does.
+  const text = expectError(
+    await getMailboxActivityHandler({}),
+    "get_mailbox_activity (local mode)"
+  );
+  assert(/remote/i.test(text), `Error does not explain the remote-only limitation: ${text}`);
+  assert(/check_new_mail/.test(text), `Error does not point at the local alternative: ${text}`);
+
+  // With a remote-mode store but no subscription yet, it says so rather than
+  // reporting an empty mailbox.
+  const noSubscription = expectError(
+    await runWithStateStore(createMemoryStateStore("remote"), () => getMailboxActivityHandler({})),
+    "get_mailbox_activity (no subscription)"
+  );
+  assert(
+    /no change-notification subscription/i.test(noSubscription),
+    `Unexpected error with no subscription: ${noSubscription}`
+  );
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
-await test("h. stdio smoke test (initialize + tools/list + prompts/list, clean stdout)", async () => {
+await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
   const tsxBin = path.join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
   const child = spawn(tsxBin, ["src/server.ts"], {
     cwd: PROJECT_ROOT,
@@ -1237,10 +1607,12 @@ await test("h. stdio smoke test (initialize + tools/list + prompts/list, clean s
     const expected = [
       "add_attachment",
       "auto_reply",
+      "check_new_mail",
       "create_draft",
       "create_event",
       "create_folder",
       "get_attachment",
+      "get_mailbox_activity",
       "list_events",
       "list_folders",
       "list_tasks",
@@ -1257,7 +1629,7 @@ await test("h. stdio smoke test (initialize + tools/list + prompts/list, clean s
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 21, `Expected 21 tools, got ${tools.length}`);
+    assert(tools.length === 23, `Expected 23 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -1304,6 +1676,41 @@ await test("h. stdio smoke test (initialize + tools/list + prompts/list, clean s
         assert(text.includes(tool), `Prompt ${name} does not mention ${tool}`);
       }
     }
+
+    // Resources are advertised over the same connection and readable.
+    send({ jsonrpc: "2.0", id: 20, method: "resources/list", params: {} });
+    const resourcesResponse = await waitForResponse(20);
+    const resources = resourcesResponse.result?.resources ?? [];
+    const uris = resources.map((r: any) => r.uri).sort();
+    assert(
+      JSON.stringify(uris) === JSON.stringify([FOLDERS_URI, RECENT_INBOX_URI].sort()),
+      `Expected resources ${FOLDERS_URI}, ${RECENT_INBOX_URI}; got ${uris.join(", ") || "(none)"}`
+    );
+    for (const resource of resources) {
+      assert(
+        resource.description?.length > 20,
+        `Resource ${resource.uri} lacks a description`
+      );
+      assert(resource.mimeType === "text/plain", `Resource ${resource.uri} has no mime type`);
+    }
+
+    send({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "resources/read",
+      params: { uri: FOLDERS_URI },
+    });
+    const readResponse = await waitForResponse(21);
+    const contents = readResponse.result?.contents ?? [];
+    assert(contents.length === 1, `resources/read returned ${contents.length} contents`);
+    assert(
+      contents[0].uri === FOLDERS_URI && typeof contents[0].text === "string",
+      `Unexpected resource content: ${JSON.stringify(contents[0]).slice(0, 200)}`
+    );
+    assert(
+      /Mail folders \(\d+ top-level\)/.test(contents[0].text),
+      `Folder resource does not carry the folder tree: ${contents[0].text.slice(0, 200)}`
+    );
 
     // stdout must contain nothing but protocol JSON.
     for (const line of stdout.split("\n")) {
@@ -1405,6 +1812,20 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
       `Leftover test tasks in "${list.displayName}": ${JSON.stringify(testTasks.map((t: any) => t.title))}`
     );
   }
+
+  // Delta state: the position really was written to the run's throwaway file
+  // (and so nowhere else), and that file is now gone.
+  const stateContents = await fs.readFile(TEST_STATE_FILE, "utf8").catch(() => "");
+  assert(
+    stateContents.includes(deltaKey("inbox")),
+    `check_new_mail did not persist its position to ${TEST_STATE_FILE}`
+  );
+  await fs.rm(TEST_STATE_FILE, { force: true });
+  const stateGone = await fs
+    .access(TEST_STATE_FILE)
+    .then(() => false)
+    .catch(() => true);
+  assert(stateGone, `Test state file still exists: ${TEST_STATE_FILE}`);
 
   // Temp files: remove the run's temp dir and verify it is gone.
   if (state.tempDir) {
