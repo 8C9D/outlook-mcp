@@ -1,16 +1,26 @@
-// Test harness: exercises the five tool handlers directly (bypassing the MCP
+// Test harness: exercises the tool handlers directly (bypassing the MCP
 // transport) against the real account using the cached token, plus a stdio
 // protocol smoke test of the server itself. Every test cleans up after itself;
-// a final check verifies no "[MCP TEST]" artifacts remain in the account.
+// a final check verifies no "[MCP TEST]" artifacts remain in the account and
+// that mailbox settings (auto-reply) are restored exactly.
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { GraphError, callGraphServer } from "./graph.js";
 import { PROJECT_ROOT } from "./project-root.js";
 import { searchMailHandler } from "./tools/search-mail.js";
 import { readThreadHandler } from "./tools/read-thread.js";
+import { readMessageHandler } from "./tools/read-message.js";
 import { createDraftHandler } from "./tools/create-draft.js";
+import { updateDraftHandler } from "./tools/update-draft.js";
+import { sendDraftHandler } from "./tools/send-draft.js";
+import { manageMessageHandler } from "./tools/manage-message.js";
+import { listFoldersHandler } from "./tools/list-folders.js";
 import { listEventsHandler, torontoToday, addDays } from "./tools/list-events.js";
 import { createEventHandler } from "./tools/create-event.js";
+import { manageEventHandler } from "./tools/manage-event.js";
+import { searchContactsHandler } from "./tools/search-contacts.js";
+import { manageContactHandler } from "./tools/manage-contact.js";
+import { autoReplyHandler } from "./tools/auto-reply.js";
 import type { ToolResult } from "./tools/common.js";
 
 const TEST_PREFIX = "[MCP TEST]";
@@ -40,6 +50,12 @@ function toolText(result: ToolResult, context: string): string {
   return text;
 }
 
+function expectError(result: ToolResult, context: string): string {
+  const text = result.content.map((c) => c.text).join("\n");
+  assert(result.isError, `${context} should have returned isError but succeeded: ${text}`);
+  return text;
+}
+
 async function expect404(pathToGet: string, what: string): Promise<void> {
   try {
     await callGraphServer(pathToGet);
@@ -50,7 +66,22 @@ async function expect404(pathToGet: string, what: string): Promise<void> {
   }
 }
 
-/** Permanently remove any [MCP TEST] messages (including soft-deleted ones in Deleted Items). */
+async function poll<T>(
+  what: string,
+  timeoutMs: number,
+  fn: () => Promise<T | undefined>
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await fn();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
+/** TEST-ONLY: permanently remove [MCP TEST] messages (incl. soft-deleted copies).
+ * The tools themselves never purge — deletes in the tool surface are always soft. */
 async function purgeTestMessages(): Promise<void> {
   const data = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject`
@@ -59,6 +90,24 @@ async function purgeTestMessages(): Promise<void> {
     await callGraphServer(`/me/messages/${encodeURIComponent(msg.id)}/permanentDelete`, {
       method: "POST",
     });
+  }
+}
+
+/** TEST-ONLY: permanently remove any [MCP TEST] mail folders (top level and in Deleted Items). */
+async function purgeTestFolders(): Promise<void> {
+  const candidates: any[] = [];
+  const top = await callGraphServer("/me/mailFolders?$top=100&$select=id,displayName");
+  candidates.push(...(top?.value ?? []));
+  const deleted = await callGraphServer(
+    "/me/mailFolders/deleteditems/childFolders?$top=100&$select=id,displayName"
+  );
+  candidates.push(...(deleted?.value ?? []));
+  for (const folder of candidates) {
+    if (String(folder.displayName ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/permanentDelete`, {
+        method: "POST",
+      });
+    }
   }
 }
 
@@ -73,9 +122,17 @@ const latestInbox = await callGraphServer(
 );
 const latestMessage = latestInbox?.value?.[0];
 
-// ---- a. search_mail -----------------------------------------------------
+// Cross-test state for the v2 lifecycle tests.
+const state: {
+  receivedId?: string;
+  sentId?: string;
+  testFolderId?: string;
+  savedAutoReply?: any;
+} = {};
 
-await test("a. search_mail (term from latest inbox subject)", async () => {
+// ---- v1: search_mail ----------------------------------------------------
+
+await test("v1a. search_mail (term from latest inbox subject)", async () => {
   assert(latestMessage, "Inbox is empty; cannot derive a guaranteed search term");
   const subject: string = latestMessage.subject ?? "";
   const tokens = subject.match(/[A-Za-z0-9]{3,}/g) ?? [];
@@ -86,9 +143,9 @@ await test("a. search_mail (term from latest inbox subject)", async () => {
   assert(text.includes("Conversation id:"), "Output missing conversation ids");
 });
 
-// ---- b. read_thread -----------------------------------------------------
+// ---- v1: read_thread ----------------------------------------------------
 
-await test("b. read_thread (latest inbox conversation)", async () => {
+await test("v1b. read_thread (latest inbox conversation)", async () => {
   assert(latestMessage?.conversationId, "No conversationId available from the latest inbox message");
   const text = toolText(
     await readThreadHandler({ conversation_id: latestMessage.conversationId }),
@@ -98,36 +155,9 @@ await test("b. read_thread (latest inbox conversation)", async () => {
   assert(text.includes("From:") && text.includes("Date:"), "Output missing sender/date lines");
 });
 
-// ---- c. create_draft: create, verify in Drafts, delete, confirm ---------
+// ---- v1: list_events ----------------------------------------------------
 
-await test("c. create_draft (new message → verify in Drafts → delete)", async () => {
-  const subject = `${TEST_PREFIX} harness draft`;
-  const text = toolText(
-    await createDraftHandler({
-      to: [ownAddress],
-      subject,
-      body: "Automated test draft created by the outlook-mcp test harness. Safe to delete.",
-    }),
-    "create_draft"
-  );
-  const id = text.match(/Message id: (\S+)/)?.[1];
-  assert(id, `Could not extract message id from output: ${text}`);
-  try {
-    const draftsFolder = await callGraphServer("/me/mailFolders/drafts?$select=id");
-    const msg = await callGraphServer(
-      `/me/messages/${encodeURIComponent(id)}?$select=parentFolderId,subject`
-    );
-    assert(msg.parentFolderId === draftsFolder.id, "Draft is not in the Drafts folder");
-    assert(msg.subject === subject, `Draft subject mismatch: ${msg.subject}`);
-  } finally {
-    await callGraphServer(`/me/messages/${encodeURIComponent(id)}`, { method: "DELETE" });
-  }
-  await expect404(`/me/messages/${encodeURIComponent(id)}?$select=id`, "Draft");
-});
-
-// ---- d. list_events -----------------------------------------------------
-
-await test("d. list_events (next 7 days)", async () => {
+await test("v1d. list_events (next 7 days)", async () => {
   const text = toolText(await listEventsHandler({}), "list_events");
   assert(
     text.startsWith("Events ") || text.startsWith("No events in this window"),
@@ -135,39 +165,270 @@ await test("d. list_events (next 7 days)", async () => {
   );
 });
 
-// ---- e. create_event: create, verify, delete, confirm -------------------
+// ---- a. read_message + attachment inventory ------------------------------
 
-await test("e. create_event (tomorrow 09:00–09:30 → verify → delete)", async () => {
-  const tomorrow = addDays(torontoToday(), 1);
+await test("a. read_message (latest inbox message, attachment inventory)", async () => {
+  assert(latestMessage, "Inbox is empty; nothing to read");
   const text = toolText(
+    await readMessageHandler({ message_id: latestMessage.id }),
+    "read_message"
+  );
+  assert(text.includes("Subject:"), "Output missing Subject header");
+  assert(text.includes("From:") && text.includes("To:"), "Output missing From/To headers");
+  assert(text.includes("Date:"), "Output missing Date header");
+  assert(text.includes("Message id:"), "Output missing message id");
+  // Attachment shape assertion: either an inventory with ids or an explicit "none".
+  assert(
+    /Attachments \(\d+\):/.test(text) || text.includes("Attachments: none"),
+    "Output missing attachment inventory section"
+  );
+  if (/Attachments \(\d+\):/.test(text)) {
+    assert(text.includes("Attachment id:"), "Attachment inventory missing attachment ids");
+  }
+});
+
+// ---- b. draft lifecycle: create → update → send → arrive -----------------
+
+await test("b. draft lifecycle (create → update_draft → send_draft → arrives in inbox)", async () => {
+  const subject = `${TEST_PREFIX} v2`;
+  const createText = toolText(
+    await createDraftHandler({
+      to: [ownAddress],
+      subject,
+      body: "Original body from the v2 test harness.",
+    }),
+    "create_draft"
+  );
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `Could not extract draft id from output: ${createText}`);
+
+  const updatedBody = "Updated body from the v2 test harness. Safe to delete.";
+  const updateText = toolText(
+    await updateDraftHandler({ draft_id: draftId, body: updatedBody }),
+    "update_draft"
+  );
+  assert(updateText.includes("Draft updated"), `Unexpected update output: ${updateText}`);
+
+  const sendText = toolText(await sendDraftHandler({ draft_id: draftId }), "send_draft");
+  assert(sendText.includes("Draft sent"), `Unexpected send output: ${sendText}`);
+  assert(sendText.includes(ownAddress), "Send confirmation missing recipient");
+
+  // Poll the inbox (up to 60s) for the arrived copy and verify the updated body made it.
+  const arrived = await poll("test message to arrive in inbox", 60000, async () => {
+    const found = await callGraphServer(
+      `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,subject,bodyPreview,isRead`
+    );
+    return found?.value?.[0];
+  });
+  assert(
+    String(arrived.bodyPreview ?? "").includes("Updated body"),
+    `Arrived message does not carry the updated body: ${arrived.bodyPreview}`
+  );
+  state.receivedId = arrived.id;
+
+  const sent = await callGraphServer(
+    `/me/mailFolders/sentitems/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id`
+  );
+  assert(sent?.value?.length, "Sent copy not found in Sent Items");
+  state.sentId = sent.value[0].id;
+});
+
+// ---- b2. send_draft refuses non-drafts -----------------------------------
+
+await test("b2. send_draft rejects a non-draft id", async () => {
+  assert(state.receivedId, "No received test message from test b");
+  const text = expectError(
+    await sendDraftHandler({ draft_id: state.receivedId }),
+    "send_draft(non-draft)"
+  );
+  assert(/not a draft/i.test(text), `Unexpected error text: ${text}`);
+});
+
+// ---- c. manage_message on the received test message ----------------------
+
+await test("c. manage_message (mark_unread, flag, move to test folder, cleanup)", async () => {
+  assert(state.receivedId, "No received test message from test b");
+  let id = state.receivedId;
+
+  toolText(
+    await manageMessageHandler({ message_ids: [id], action: "mark_unread" }),
+    "manage_message mark_unread"
+  );
+  let msg = await callGraphServer(`/me/messages/${encodeURIComponent(id)}?$select=isRead`);
+  assert(msg.isRead === false, "Message is still marked read");
+
+  toolText(await manageMessageHandler({ message_ids: [id], action: "flag" }), "manage_message flag");
+  msg = await callGraphServer(`/me/messages/${encodeURIComponent(id)}?$select=flag`);
+  assert(msg.flag?.flagStatus === "flagged", `Flag not set: ${JSON.stringify(msg.flag)}`);
+
+  const folder = await callGraphServer("/me/mailFolders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: `${TEST_PREFIX} folder` }),
+  });
+  state.testFolderId = folder.id;
+
+  const moveText = toolText(
+    await manageMessageHandler({
+      message_ids: [id],
+      action: "move",
+      destination_folder: folder.id,
+    }),
+    "manage_message move"
+  );
+  const newId = moveText.match(/new id: (\S+?)\)/)?.[1];
+  assert(newId, `Move output missing the new message id: ${moveText}`);
+  id = newId;
+  msg = await callGraphServer(`/me/messages/${encodeURIComponent(id)}?$select=parentFolderId`);
+  assert(msg.parentFolderId === folder.id, "Message is not in the test folder after move");
+
+  // Cleanup: soft-delete the received copy and the sent copy via the tool, then
+  // remove the test folder (permanent, test-only).
+  const delText = toolText(
+    await manageMessageHandler({ message_ids: [id, state.sentId!], action: "delete" }),
+    "manage_message delete"
+  );
+  assert(delText.includes("2/2"), `Expected both deletions to succeed: ${delText}`);
+  await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/permanentDelete`, {
+    method: "POST",
+  });
+  state.testFolderId = undefined;
+});
+
+// ---- d. list_folders -----------------------------------------------------
+
+await test("d. list_folders (inbox/drafts/sent items with counts)", async () => {
+  const text = toolText(await listFoldersHandler({}), "list_folders");
+  for (const name of ["Inbox", "Drafts", "Sent Items"]) {
+    assert(text.includes(name), `Folder list missing ${name}`);
+  }
+  assert(/\d+ unread \/ \d+ total/.test(text), "Folder list missing unread/total counts");
+  assert(text.includes("id: "), "Folder list missing folder ids");
+});
+
+// ---- e. event lifecycle: create → update → cancel ------------------------
+
+await test("e. event lifecycle (create → shift 30 min → cancel → gone)", async () => {
+  const tomorrow = addDays(torontoToday(), 1);
+  const createText = toolText(
     await createEventHandler({
-      subject: `${TEST_PREFIX} harness event`,
+      subject: `${TEST_PREFIX} v2 event`,
       start: `${tomorrow}T09:00`,
       end: `${tomorrow}T09:30`,
     }),
     "create_event"
   );
-  const id = text.match(/Event id: (\S+)/)?.[1];
-  assert(id, `Could not extract event id from output: ${text}`);
-  try {
-    const event = await callGraphServer(
-      `/me/events/${encodeURIComponent(id)}?$select=subject,start,end`
-    );
-    assert(event.subject === `${TEST_PREFIX} harness event`, "Event subject mismatch");
-    assert(
-      String(event.start?.dateTime).startsWith(`${tomorrow}T09:00`) ||
-        event.start?.timeZone !== "America/Toronto",
-      `Unexpected event start: ${JSON.stringify(event.start)}`
-    );
-  } finally {
-    await callGraphServer(`/me/events/${encodeURIComponent(id)}`, { method: "DELETE" });
-  }
+  const id = createText.match(/Event id: (\S+)/)?.[1];
+  assert(id, `Could not extract event id from output: ${createText}`);
+
+  const updateText = toolText(
+    await manageEventHandler({
+      event_id: id,
+      action: "update",
+      start: `${tomorrow}T09:30`,
+      end: `${tomorrow}T10:00`,
+    }),
+    "manage_event update"
+  );
+  assert(updateText.includes("Event updated"), `Unexpected update output: ${updateText}`);
+  const event = await callGraphServer(`/me/events/${encodeURIComponent(id)}?$select=start`, {
+    headers: { Prefer: 'outlook.timezone="America/Toronto"' },
+  });
+  assert(
+    String(event.start?.dateTime ?? "").startsWith(`${tomorrow}T09:30`),
+    `Event start not shifted: ${JSON.stringify(event.start)}`
+  );
+
+  const cancelText = toolText(
+    await manageEventHandler({ event_id: id, action: "cancel" }),
+    "manage_event cancel"
+  );
+  assert(/removed|cancelled/i.test(cancelText), `Unexpected cancel output: ${cancelText}`);
   await expect404(`/me/events/${encodeURIComponent(id)}?$select=id`, "Event");
 });
 
-// ---- f. stdio protocol smoke test ---------------------------------------
+// ---- f. contact lifecycle ------------------------------------------------
 
-await test("f. stdio smoke test (initialize + tools/list, clean stdout)", async () => {
+await test("f. contact lifecycle (create → search → update phone → delete → gone)", async () => {
+  const createText = toolText(
+    await manageContactHandler({
+      action: "create",
+      given_name: TEST_PREFIX,
+      surname: "Contact",
+      emails: ["mcp-test@example.invalid"],
+    }),
+    "manage_contact create"
+  );
+  const id = createText.match(/Contact id: (\S+)/)?.[1];
+  assert(id, `Could not extract contact id from output: ${createText}`);
+
+  const searchText = toolText(
+    await searchContactsHandler({ query: TEST_PREFIX }),
+    "search_contacts"
+  );
+  assert(searchText.includes(id), `Search did not find the new contact: ${searchText}`);
+
+  const updateText = toolText(
+    await manageContactHandler({ action: "update", contact_id: id, phones: ["555-0100"] }),
+    "manage_contact update"
+  );
+  assert(updateText.includes("555-0100"), `Phone not updated: ${updateText}`);
+
+  toolText(
+    await manageContactHandler({ action: "delete", contact_id: id }),
+    "manage_contact delete"
+  );
+  const afterText = toolText(
+    await searchContactsHandler({ query: TEST_PREFIX }),
+    "search_contacts after delete"
+  );
+  assert(
+    afterText.startsWith("No contacts matching"),
+    `Deleted contact still found: ${afterText}`
+  );
+});
+
+// ---- g. auto_reply save → set → verify → restore → verify ----------------
+
+await test("g. auto_reply (save state → set test message → restore exactly)", async () => {
+  const before = await callGraphServer("/me/mailboxSettings?$select=automaticRepliesSetting");
+  state.savedAutoReply = before?.automaticRepliesSetting;
+  assert(state.savedAutoReply, "Could not read current automaticRepliesSetting");
+
+  const setText = toolText(
+    await autoReplyHandler({ action: "set", message: `${TEST_PREFIX} auto-reply test` }),
+    "auto_reply set"
+  );
+  assert(setText.includes("Auto-reply enabled"), `Unexpected set output: ${setText}`);
+
+  const getText = toolText(await autoReplyHandler({ action: "get" }), "auto_reply get");
+  assert(
+    getText.includes(`${TEST_PREFIX} auto-reply test`),
+    `Set message not visible in get: ${getText}`
+  );
+
+  // Restore the exact saved object (not just "clear"), then verify.
+  await callGraphServer("/me/mailboxSettings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ automaticRepliesSetting: state.savedAutoReply }),
+  });
+  const after = await callGraphServer("/me/mailboxSettings?$select=automaticRepliesSetting");
+  const restored = after?.automaticRepliesSetting;
+  assert(restored?.status === state.savedAutoReply.status, "Auto-reply status not restored");
+  assert(
+    (restored?.internalReplyMessage ?? "") === (state.savedAutoReply.internalReplyMessage ?? ""),
+    "Internal reply message not restored"
+  );
+  assert(
+    (restored?.externalReplyMessage ?? "") === (state.savedAutoReply.externalReplyMessage ?? ""),
+    "External reply message not restored"
+  );
+});
+
+// ---- h. stdio protocol smoke test ---------------------------------------
+
+await test("h. stdio smoke test (initialize + full tools/list, clean stdout)", async () => {
   const tsxBin = path.join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
   const child = spawn(tsxBin, ["src/server.ts"], {
     cwd: PROJECT_ROOT,
@@ -202,7 +463,7 @@ await test("f. stdio smoke test (initialize + tools/list, clean stdout)", async 
               const msg = JSON.parse(line);
               if (msg.id === id) {
                 clearTimeout(timer);
-                clearInterval(poll);
+                clearInterval(poller);
                 resolve(msg);
                 return;
               }
@@ -211,7 +472,7 @@ await test("f. stdio smoke test (initialize + tools/list, clean stdout)", async 
             }
           }
         };
-        const poll = setInterval(check, 100);
+        const poller = setInterval(check, 100);
       });
 
     const initResponse = await waitForResponse(1);
@@ -222,7 +483,23 @@ await test("f. stdio smoke test (initialize + tools/list, clean stdout)", async 
 
     const tools = listResponse.result?.tools ?? [];
     const names = tools.map((t: any) => t.name).sort();
-    const expected = ["create_draft", "create_event", "list_events", "read_thread", "search_mail"];
+    const expected = [
+      "auto_reply",
+      "create_draft",
+      "create_event",
+      "get_attachment",
+      "list_events",
+      "list_folders",
+      "manage_contact",
+      "manage_event",
+      "manage_message",
+      "read_message",
+      "read_thread",
+      "search_contacts",
+      "search_mail",
+      "send_draft",
+      "update_draft",
+    ];
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -252,12 +529,13 @@ await test("f. stdio smoke test (initialize + tools/list, clean stdout)", async 
   }
 });
 
-// ---- final: no leftover [MCP TEST] artifacts ----------------------------
+// ---- i. final artifact sweep --------------------------------------------
 
-await test("final. no leftover [MCP TEST] artifacts in the account", async () => {
-  // Soft-deleted test messages land in Deleted Items; purge them so the
-  // account is genuinely clean, then verify nothing remains anywhere.
+await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restored", async () => {
+  // Purge soft-deleted test artifacts (test-only), then verify nothing remains.
   await purgeTestMessages();
+  await purgeTestFolders();
+
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject,parentFolderId`
   );
@@ -265,6 +543,7 @@ await test("final. no leftover [MCP TEST] artifacts in the account", async () =>
     (messages?.value ?? []).length === 0,
     `Leftover test messages: ${JSON.stringify(messages.value)}`
   );
+
   const events = await callGraphServer(
     `/me/events?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject`
   );
@@ -272,6 +551,30 @@ await test("final. no leftover [MCP TEST] artifacts in the account", async () =>
     (events?.value ?? []).length === 0,
     `Leftover test events: ${JSON.stringify(events.value)}`
   );
+
+  const contacts = await callGraphServer(
+    `/me/contacts?$filter=${encodeURIComponent(`startswith(displayName,'${TEST_PREFIX}')`)}&$select=id,displayName`
+  );
+  assert(
+    (contacts?.value ?? []).length === 0,
+    `Leftover test contacts: ${JSON.stringify(contacts.value)}`
+  );
+
+  const folders = await callGraphServer("/me/mailFolders?$top=100&$select=displayName");
+  const testFolders = (folders?.value ?? []).filter((f: any) =>
+    String(f.displayName ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(testFolders.length === 0, `Leftover test folders: ${JSON.stringify(testFolders)}`);
+
+  const settings = await callGraphServer("/me/mailboxSettings?$select=automaticRepliesSetting");
+  const current = settings?.automaticRepliesSetting;
+  assert(
+    !String(current?.internalReplyMessage ?? "").includes(TEST_PREFIX),
+    "Auto-reply still carries the test message"
+  );
+  if (state.savedAutoReply) {
+    assert(current?.status === state.savedAutoReply.status, "Auto-reply status differs from saved state");
+  }
 });
 
 // ---- summary ------------------------------------------------------------
