@@ -423,3 +423,116 @@ touched in this batch.
   from-scratch setup, the exact claude.ai connector steps, and rotation/revocation procedures), five
   new script entries, and a security-model bullet for the remote endpoint.
 - Deployed URL: `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`.
+
+## v6 batch 4 — delta queries, change notifications, resources
+
+### Live Graph behaviour verified before writing code
+- `$deltatoken=latest` (the cheap "baseline without enumerating" trick) is **OneDrive-only**. Graph
+  ignored it on `/me/mailFolders/inbox/messages/delta` and returned an ordinary first page with no
+  `@odata.deltaLink`. So a first call really does have to walk the folder.
+- `Prefer: odata.maxpagesize=N` **is** honoured on the initial delta request, but the resulting
+  `@odata.nextLink` does not carry the preference — follow it without the header and pages revert to
+  10 items. Sending the header on every request took baselining the real 1006-message inbox from 92
+  requests / 10.8 s to 3 requests / 0.85 s. This is why `drainDelta` passes `headers` on each hop
+  rather than only the first.
+- A delta entry for an *edited* message carries only `@odata.type`, `id` and the changed properties
+  (e.g. just `isRead`), not the `$select`ed set. `check_new_mail` therefore re-reads entries that come
+  back without a subject, capped at the result limit, and marks them `[changed]`.
+- Change notifications on `/me/mailFolders('inbox')/messages` **are** supported for this personal
+  (consumer) Microsoft account — confirmed by creating a real subscription against the deployed
+  endpoint and deleting it again before wiring anything. Graph granted `expirationDateTime` ~2.9 days
+  out, matching the documented 4230-minute ceiling.
+- Subscriptions are visible to `GET /subscriptions` from the local MSAL session because the Worker and
+  the CLI use the same Entra app registration and the same user — which is what lets remote test `r16`
+  cross-check Graph's view against the KV record.
+
+### State storage (`src/core/state.ts`)
+- Delta positions and the notification ring buffer need somewhere to live, and the tool layer must not
+  know where. Mirrored the existing token-provider pattern exactly: a `StateStore` interface, an
+  `AsyncLocalStorage` scope for the Worker (KV binding is per-request), a process-wide default for
+  stdio and the harness.
+- The store carries a `mode` (`"local" | "remote"`). That is what `get_mailbox_activity` checks to
+  refuse on stdio — better than sniffing for a KV binding, and it lets the harness exercise the remote
+  path locally with an in-memory store.
+- Local file: `.mcp-state.json`, `0600`, gitignored, next to `.token-cache.json`. Writes go through a
+  single promise chain because the whole document is rewritten on each put and MCP tool calls overlap.
+- KV keys are namespaced (`delta:`, `sub:`, `activity:`) so they can share `OUTLOOK_KV` with the token
+  entries without any chance of collision.
+
+### check_new_mail
+- The first call (and `reset`) deliberately reports **nothing**. Dumping a thousand messages on a tool
+  whose whole point is "only what's new" would be the wrong answer, and the position is what the caller
+  actually wanted.
+- The position advances on every successful call, so a change is reported exactly once. Test v5a
+  asserts precisely that (the probe message appears once, then never again).
+- `MAX_PAGES = 200` bounds a first enumeration; hitting it fails with a readable message rather than
+  looping. At 500 items per page that is 100 000 messages.
+
+### Change notifications
+- The validation handshake is answered **before** any state is read. It has to be: at the moment Graph
+  validates a brand-new subscription there is no subscription record to consult, so a handler that
+  looked one up first could never create the first subscription. Test v5b asserts the handler writes
+  and needs no state.
+- `clientState` is generated in the Worker (two `crypto.randomUUID()`s, hyphens stripped) at creation
+  time and stored only in KV. It is deliberately **not** a wrangler secret: it must rotate with the
+  subscription, and a secret would have to be re-put by hand every time the subscription is rebuilt.
+  It never appears in the repo, in `wrangler.jsonc`, or in any log line.
+- Deliveries always get `202`, valid or not. A `4xx` for a bad `clientState` would turn the endpoint
+  into an oracle for guessing it, and a non-2xx makes Graph retry the delivery for hours.
+- Ring buffer: 50 entries, newest first, read-modify-write. For one mailbox at human mail volume the
+  lost-update window is not worth a Durable Object; the alternative would have reintroduced exactly
+  the DO dependency batch 3 avoided.
+- Enrichment (subject/sender lookup) is capped at 5 messages per delivery and is best-effort — Graph
+  wants a response within 10 seconds, and a failed lookup must cost detail, not the notification.
+
+### Subscription upkeep and the cron
+- `renewalDecision` is a pure function of (record, notification URL, now) and is unit-tested for every
+  branch: absent, lapsed, moved endpoint, near expiry, healthy. `ensureMailSubscription` wraps it and
+  takes an injectable Graph transport and clock, so v5d exercises the **real** renewal handler
+  (create → keep → renew → recreate-after-404) with no live side effects.
+- Cron `17 */6 * * *` with a 24-hour renewal window: four chances a day against a ~70-hour lifetime, so
+  a single failed run is harmless. Asks for 4200 minutes rather than the 4230 maximum so clock skew can
+  never make Graph reject the request.
+- Added a backstop the spec did not ask for: every authenticated MCP request calls the same upkeep
+  function in `ctx.waitUntil`. Rationale — a lapsed subscription is invisible until someone asks for
+  activity, and the cron cannot be triggered on demand in production, so this is also what bootstraps
+  the very first subscription after a deploy. When nothing is due it is one KV read and zero Graph
+  calls, which is why it is cheap enough to run on every request.
+- `OAuthProvider` exports only `fetch`, so `src/worker/index.ts` now wraps it in an object that also
+  exports `scheduled`.
+
+### Resources
+- The SDK supports resources identically on both transports (`registerResource` on the shared
+  `McpServer`), so no limitation had to be recorded — both stdio and the Worker serve
+  `outlook://mail/folders` and `outlook://mail/inbox/recent`. Asserted on stdio (test h) and over
+  Streamable HTTP (r14).
+- The read callbacks reuse the `list_folders` and `search_mail` handlers rather than duplicating
+  formatting, and **throw** on failure: `resources/read` has no `isError` channel, and attaching an
+  error string as if it were mailbox content would be worse than failing.
+
+### Harness (v6 tests)
+- Local: 28/28 (was 23/23). New: v5a delta lifecycle against real mail, v5b handshake, v5c ingest +
+  clientState + ring cap + the activity tool's window filter, v5d the renewal handler, v5e the
+  remote-only refusal. The harness installs the real file-backed store but pointed at a throwaway file
+  in `os.tmpdir()`, so a run can never disturb the server's own delta position; the sweep asserts the
+  position was written there and then deletes it.
+- Remote: 20/20 (was 14/14). New: r13 live handshake + forged-delivery rejection (unauthenticated),
+  r14 resources, r15 the delta position surviving between requests (which on a stateless Worker can
+  only mean KV), r16 the subscription's health cross-checked against Graph plus the cron declaration,
+  r17 the full end-to-end (send through the connector → Graph → `/notifications` → ring buffer →
+  `get_mailbox_activity`) on a bounded 4-minute poll, r18 cleanup.
+- r17's failure path was written before its success path: on timeout it re-checks whether the message
+  reached the inbox at all and says whether the gap is in sending or in Graph's delivery, and prints
+  the last activity output.
+- Cleanup boundary, per the spec: the **production** subscription survives a test run (it is the
+  feature, not an artifact). Everything else the run caused does not — the probe mail is
+  permanently deleted, only the ring-buffer entries whose subject carries `[MCP TEST]` are removed
+  (entries that predate the run are preserved, and the count is asserted), and the delta position is
+  restored to exactly what it was, or deleted if there was none.
+
+### Docs/versioning
+- Version 0.6.0. README: two new tool rows, a "Resources" section, a "Knowing what is new" section
+  contrasting the two mechanisms, a "Change notifications" section under Remote deployment (handshake,
+  `clientState`, renewal, `PUBLIC_BASE_URL`), and a security-model bullet for the one public route.
+- `PUBLIC_BASE_URL` is a `vars` entry rather than a secret: it is a hostname, it must match the
+  deployment, and having it in the committed config is what makes the notification URL reviewable.

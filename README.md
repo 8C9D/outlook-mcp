@@ -1,13 +1,15 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v5 keeps v4's twenty-one tools and two prompts and serves them over **two transports** — the local
+v6 serves **twenty-three tools, two prompts and two resources** over **two transports** — the local
 stdio server and a remote Cloudflare Worker (see [Remote deployment](#remote-deployment)) — covering mail (search, read, compose, send,
 manage, categorize), attachments (read and add), folders (list and create), inbox rules, categories,
-calendar (list, create, update, cancel, respond), contacts, Microsoft To Do tasks, and auto-reply
-settings. All datetimes are handled in America/Toronto unless a caller supplies an explicit UTC offset.
+calendar (list, create, update, cancel, respond), contacts, Microsoft To Do tasks, auto-reply
+settings, and — new in v6 — **incremental "what changed" checks** and **push notifications** for
+arriving mail (see [Knowing what is new](#knowing-what-is-new)). All datetimes are handled in
+America/Toronto unless a caller supplies an explicit UTC offset.
 
-## Tools (v4)
+## Tools (v6)
 
 | Tool | What it does |
 | --- | --- |
@@ -32,6 +34,8 @@ settings. All datetimes are handled in America/Toronto unless a caller supplies 
 | `manage_categories` | List / create / delete the mailbox's Outlook categories (Graph's fixed `preset0`–`preset24` palette). Applying them to mail is `manage_message`'s `categorize`. |
 | `list_tasks` | Microsoft To Do tasks grouped overdue / today / upcoming / no due date (America/Toronto). Open tasks by default; `include_completed` and `due_within_days` narrow or widen it. |
 | `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
+| `check_new_mail` | What changed in a folder **since the last call**, via a Graph delta query. The first call (or one with `reset`) only records a starting position and lists nothing; every later call returns just the added/changed/removed messages. Works on both transports. |
+| `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
 
 ## Inbox rules (`manage_rules`)
 
@@ -90,6 +94,57 @@ normal tool call with whatever approval the client enforces. `search_mail`'s lis
 read/unread state, so `morning_brief` tells the model to call `read_message` rather than guess when that
 distinction matters.
 
+## Resources
+
+Two MCP resources are registered on both transports (`resources/list`, `resources/read`), so a client
+can attach mailbox context without the model deciding to call a tool:
+
+| URI | Contents |
+| --- | --- |
+| `outlook://mail/folders` | The folder tree with unread/total counts and folder ids — the same text `list_folders` produces. |
+| `outlook://mail/inbox/recent` | The 20 newest inbox messages, newest first, with ids and body previews. |
+
+Both are plain text and read live from Graph on every read; there is no cache to go stale. A read that
+fails **rejects** rather than returning an error string, so a client never attaches an error message as
+if it were mailbox content.
+
+## Knowing what is new
+
+Two different mechanisms answer "has anything arrived?", and they are deliberately not the same tool.
+
+### `check_new_mail` — delta queries (both transports)
+
+Graph delta queries give a folder a *position*: ask once to establish it, and every later request
+returns only what has changed since. The first call (or one with `reset: true`) walks the folder to
+record that position and reports nothing; after that each call returns just the new, changed and
+removed messages and advances the position, so **a change is reported exactly once**.
+
+The position is a `deltaLink` URL kept in a small state store: Workers KV in remote mode, and a
+gitignored `0600` file (`.mcp-state.json`) next to the token cache locally. Deleting it costs nothing
+but a re-baseline. Each folder keeps its own position.
+
+Baselining a folder means paging through it, so `Prefer: odata.maxpagesize=500` rides *every* request,
+including the `@odata.nextLink` follow-ups (Graph does not carry the preference into the next-link
+itself, and at the default page size of 10 a thousand-message inbox would cost ninety round trips
+instead of three).
+
+Delta entries for an *edited* message carry only the properties that changed, so entries with no
+subject are looked up individually to keep the output readable.
+
+### `get_mailbox_activity` — Graph change notifications (remote only)
+
+The Worker subscribes to `created` notifications on the inbox, and Graph POSTs to
+`https://outlook-mcp.arthur-yuhao-zhang.workers.dev/notifications` as mail arrives. Each notification
+is enriched with the message's subject and sender and appended to a **50-entry ring buffer** in KV,
+which `get_mailbox_activity` reads. Nothing polls Graph, so "what came in since this morning" costs one
+KV read.
+
+This cannot work on stdio: Microsoft has to be able to reach the server. The tool says so explicitly
+and points at `check_new_mail` instead of pretending the mailbox is quiet.
+
+See [Change notifications](#change-notifications) for the endpoint, the `clientState` secret and the
+cron trigger that keeps the subscription alive.
+
 ## Two-step send by design
 
 The server can send email, but **no tool composes and sends in one call**, and `/me/sendMail` is never
@@ -131,6 +186,13 @@ can contain text that tries to instruct the model into sending, deleting, or for
   description flags this and points the model at `complete` for the non-destructive case, but the
   approval prompt is the real backstop — keep it on.
 - Sending is structurally two-step (above) and mailbox deletes are soft (above).
+- **`/notifications` is the one public route, and it is write-only and content-free.** Microsoft
+  presents no credential, so the endpoint cannot require one; instead every delivered item must carry
+  the random `clientState` generated when the subscription was created (KV only, never in the repo),
+  and anything else is discarded. A forged delivery cannot make the server *read* anything or reveal
+  mailbox content — the worst it could do with a stolen secret is add a bogus line to
+  `get_mailbox_activity`. The route never echoes stored state and answers `202` either way, so it
+  cannot be used to guess the secret.
 - **The remote endpoint is single-user.** Nothing anonymous can reach `/mcp` or any route that
   touches Graph, and only one Microsoft identity — matched on the Graph `/me` id or UPN captured at
   setup — can complete an authorization. A remote connector runs the same tools with the same
@@ -162,40 +224,49 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 
 - `npm run login` — interactive device-code sign-in; caches tokens and exits.
 - `npm run serve` — run the MCP server (stdio; stdout is protocol-only, logs go to stderr).
-- `npm run test:tools` — live test harness: exercises the tools against the real account plus a stdio
-  protocol smoke test, and verifies it leaves no `[MCP TEST]` artifacts behind and restores auto-reply.
+- `npm run test:tools` — live test harness: exercises the tools against the real account (including a
+  full delta-query lifecycle) plus unit tests of the webhook handshake, notification ingest and
+  subscription renewal, and a stdio protocol smoke test covering tools, prompts and resources. Verifies
+  it leaves no `[MCP TEST]` artifacts behind and restores auto-reply.
 - `npm run verify` — the original auth/Graph foundation check.
 - `npm run typecheck` / `npm run build` — type-check (both the Node and Worker configs) / compile to `dist/`.
 - `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
 - `npm run seed:kv` — push the current Microsoft refresh token from `.token-cache.json` into Workers KV.
 - `npm run deploy` — deploy the Worker to Cloudflare.
 - `npm run test:remote` — live tests against the deployed endpoint (discovery, anonymous rejection, a
-  full OAuth exchange, an MCP round-trip, refresh-token rotation); cleans up every KV record it creates.
+  full OAuth exchange, an MCP round-trip, refresh-token rotation, resources, the KV-backed delta
+  position, the subscription's health, and a full change-notification round trip); cleans up every KV
+  record, ring-buffer entry and probe message it creates, leaving the production subscription alone.
 
 ## Remote deployment
 
-The same 21 tools and 2 prompts are also served over MCP Streamable HTTP from a Cloudflare Worker, so
-claude.ai can reach the mailbox as a custom connector without this laptop being on.
+The same 23 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
+on. The Worker additionally does the one thing a laptop cannot: receive Graph change notifications.
 
 **Deployed endpoint:** `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
 
 ### Architecture
 
-Everything transport-independent lives under `src/core/`: `registry.ts` (the tool and prompt table),
-`graph.ts` (the Graph transport), `prompts.ts`, and `token.ts`. Both entry points build the *same*
-`McpServer` from `createMcpServer()`, so the two hosts cannot drift apart — `src/test-remote.ts`
-asserts the deployed tool list equals the local registry.
+Everything transport-independent lives under `src/core/`: `registry.ts` (the tool, prompt and
+resource table), `graph.ts` (the Graph transport), `prompts.ts`, `resources.ts`, `token.ts`,
+`state.ts`, `notifications.ts` and `subscriptions.ts`. Both entry points build the *same* `McpServer`
+from `createMcpServer()`, so the two hosts cannot drift apart — `src/test-remote.ts` asserts the
+deployed tool list equals the local registry.
 
 ```
-src/core/*            transport-agnostic: registry, Graph calls, prompts, token indirection
-src/tools/*           the 21 tool handlers (unchanged by transport)
-src/server.ts         stdio entry  -> MSAL + .token-cache.json      (Claude Desktop)
-src/worker/index.ts   Worker entry -> OAuth + refresh token in KV   (claude.ai)
+src/core/*            transport-agnostic: registry, Graph calls, prompts, resources,
+                      token + state indirection, notification and subscription logic
+src/tools/*           the 23 tool handlers (unchanged by transport)
+src/server.ts         stdio entry  -> MSAL + .token-cache.json, state in .mcp-state.json
+src/worker/index.ts   Worker entry -> OAuth + tokens and state in KV, /notifications, cron
 ```
 
 The tool layer never knows where its Graph token comes from. `core/token.ts` holds a *token provider*
 that each host installs: the stdio server installs MSAL silent acquisition; the Worker installs a
-KV-backed provider, scoped per request with `AsyncLocalStorage`.
+KV-backed provider, scoped per request with `AsyncLocalStorage`. `core/state.ts` is the same pattern
+for the small amount of state the server has to remember (delta positions, the subscription record,
+the notification ring buffer): a file on stdio, KV on the Worker.
 
 The Worker is **stateless** — no Durable Objects. Each POST builds a fresh `McpServer` and a
 `WebStandardStreamableHTTPServerTransport` with `sessionIdGenerator: undefined`, and discards them
@@ -234,6 +305,39 @@ Local stdio mode is untouched by all of this: it still uses MSAL and `.token-cac
 credential chains are independent (Microsoft does not revoke an old refresh token when it issues a
 new one), so the Worker rotating its copy does not disturb the local one.
 
+### Change notifications
+
+```
+Graph  --POST /notifications-->  Worker  --clientState ok?-->  KV ring buffer (50)
+                                                                     |
+cron "17 */6 * * *"  --> create / renew the subscription       get_mailbox_activity
+```
+
+- **Subscription.** One subscription on `/me/mailFolders('inbox')/messages`, `changeType: created`,
+  created by the Worker itself. Its id, expiry and `clientState` live in `OUTLOOK_KV` under
+  `sub:mail`. Graph caps mail subscriptions at **4230 minutes (~2.9 days)** and this asks for 4200.
+- **Validation handshake.** On creation Graph POSTs to the notification URL with a `validationToken`
+  query parameter and expects that exact string back as `text/plain` within 10 seconds. The handler
+  answers it before touching any state, which is what makes creating the *first* subscription
+  possible.
+- **`clientState`.** The endpoint is necessarily unauthenticated — Graph presents no credential — so
+  every delivered item must echo the random secret generated when the subscription was created. Items
+  that do not are discarded. It is generated in the Worker and stored only in KV: it is never in the
+  repo, never in `wrangler.jsonc`, and never printed. Deliveries always get `202` whether or not the
+  secret matched, so the endpoint is not an oracle for guessing it (and a non-2xx would make Graph
+  retry forever).
+- **Renewal.** The cron trigger declared in `wrangler.jsonc` (`triggers.crons`) runs every six hours
+  and renews once less than a day of life is left, re-creating the subscription outright if Graph has
+  forgotten it or the notification URL has moved. As a backstop, every authenticated MCP request also
+  re-checks it in the background (`ctx.waitUntil`), so a lapse heals the moment the connector is used
+  rather than at the next scheduled run. When nothing is due, the check is a single KV read and makes
+  no Graph call at all.
+- **`PUBLIC_BASE_URL`.** A `vars` entry in `wrangler.jsonc` (not a secret): the notification URL is
+  `PUBLIC_BASE_URL + /notifications`, so it must match the deployed hostname exactly or Graph will
+  validate against the wrong origin.
+- Because `OAuthProvider` exposes only a `fetch` handler, `src/worker/index.ts` wraps it in an object
+  that adds `scheduled` for the cron.
+
 ### Setting it up from scratch
 
 ```bash
@@ -248,7 +352,7 @@ printf '%s' "<Graph /me id>"                    | npx wrangler secret put ALLOWE
 printf '%s' "<userPrincipalName / mail>"        | npx wrangler secret put ALLOWED_MS_UPN
 
 npm run seed:kv        # pushes the refresh token into KV; prints the two allowlist values
-npm run test:remote    # 14 live checks against the deployed endpoint
+npm run test:remote    # 20 live checks against the deployed endpoint
 ```
 
 `npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local cache is
@@ -271,7 +375,7 @@ the client (path included), RFC 9728 discovery fails; update it if the Worker is
    device code.
 6. In another tab open the link shown on that page (`microsoft.com/devicelogin`), enter the code, and
    sign in **as arthur.yuhao.zhang@outlook.com**. Any other account is rejected.
-7. The `/authorize` page polls, then returns to claude.ai. The connector's 21 tools are now available.
+7. The `/authorize` page polls, then returns to claude.ai. The connector's 23 tools, 2 prompts and 2 resources are now available.
 
 ### Rotating and revoking access
 
@@ -312,7 +416,7 @@ runtime. The server resolves its own project root from its module location, so i
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.
 - **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether
-  it started; in a chat, the tools icon lists its twenty-one tools when connected, and the prompt
+  it started; in a chat, the tools icon lists its twenty-three tools when connected, and the prompt
   picker offers `triage_inbox` and `morning_brief`.
 - **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and
   `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.
