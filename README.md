@@ -44,6 +44,23 @@ The MCP server runs headless and **never prompts for sign-in** — it only uses 
 - `npm run verify` — the original auth/Graph foundation check.
 - `npm run typecheck` / `npm run build` — type-check / compile to `dist/`.
 
-## Next step
+## Claude Desktop
 
-Wiring this server into Claude Desktop is the next task — no Claude Desktop configuration is included yet.
+The server is registered in `~/Library/Application Support/Claude/claude_desktop_config.json` under `mcpServers` (installed 2026-08-18):
+
+```json
+"outlook": {
+  "command": "/Users/arthurzhang/.nvm/versions/node/v24.15.0/bin/node",
+  "args": ["/Users/arthurzhang/dev/outlook-mcp/dist/server.js"]
+}
+```
+
+It runs the compiled build (`npm run build` → `dist/server.js`) under a plain `node` — no `tsx` needed at runtime. The server resolves its own project root from its module location, so it finds `.env` and `.token-cache.json` regardless of the working directory Claude Desktop launches it with.
+
+> **Node path caveat:** the `command` is the absolute path to the node binary (resolved via `which node` at install time) because Claude Desktop does not inherit the shell `PATH`. This machine uses nvm, so **upgrading or switching the default node version changes this path** — if the server stops launching after a node upgrade, re-run `which node` and update `command` accordingly.
+
+- **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q — closing the window is not enough) and reopen.
+- **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether it started; in a chat, the tools icon lists its five tools when connected.
+- **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.
+- **Auth expired?** Tool calls will return *"Authentication expired. Run `npm run login` …"* — see [Login and re-authentication](#login-and-re-authentication) above. No Claude Desktop restart is needed after re-login; the next tool call picks up the refreshed cache.
+- **After changing the code:** run `npm run build` — Claude Desktop runs `dist/`, not `src/`.
