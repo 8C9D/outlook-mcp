@@ -776,3 +776,163 @@ No consumer-account gap was found, so nothing had to ship as "graceful absence" 
 - README: v7 header, 24-tool table with the new inputs, and three new sections — attachments on both
   transports (including why the download route sits under `/mcp/`), repeating events (with the
   occurrence/series scope table), and calendars/reminders.
+
+## v8 batch B — To Do depth, junk senders, mailbox settings, message forensics
+
+### Live Graph behaviour verified before writing code
+Every doubtful capability was probed against the real **consumer** mailbox with a throwaway script
+before anything was designed on top of it. Two of the four features came back different from what the
+brief assumed, and the code follows what Graph actually does.
+
+**Microsoft To Do**
+- Checklist items work exactly as documented: `POST/GET/PATCH/DELETE
+  /me/todo/lists/{list}/tasks/{task}/checklistItems` all succeeded (201/200/200/204), and
+  `?$expand=checklistItems` returns them with the task.
+- Lists: `POST /me/todo/lists` → 201, `PATCH` (rename) → 200, `DELETE` → 204. All supported; the
+  delete is the one this server refuses to expose (below).
+- **Task recurrence is create-only.** `POST` with `recurrence` + `dueDateTime` → 201 and the rule
+  reads back. Without a due date: `400 "The property 'dueDateTime' is required when creating
+  recurrence in the task entity"`. And **every** `PATCH` carrying a recurrence is refused:
+  `400 invalidRequest — Invalid JSON, Error converting value "2026-08-20" to type
+  'Microsoft.OData.Edm.Date'. Path 'recurrence.range.startDate'` — with or without
+  `recurrenceTimeZone`, with `startDate` as a date or a full datetime, with `@odata.type`
+  annotations, with `dueDateTime` in the same body, and on **beta** as well as v1.0. (`"2026-08-20"`
+  is a perfectly valid `Edm.Date`; the error is the API's, not the caller's.) The one PATCH Graph
+  accepts is `recurrence: null` → 200, which really does stop the repeat.
+  Consequence: `recurrence` is accepted only on `create`; `update` with `recurrence` fails fast with
+  the reason and tells the caller to recreate the task; `clear_recurrence` maps to `recurrence: null`.
+- `$select=recurrence` on a task is refused (`400 RequestBroker--ParseUri`), so reads that need the
+  rule fetch the whole task.
+
+**Junk / safe senders — the consumer gap of this run.** Nine probes, all recorded in
+`src/tools/manage-senders.ts` and in the README table:
+`GET /beta/me/blockedSenders` → `404 UnknownError`; `GET /beta/me/safeSenders` → `404`;
+`GET /beta/me/outlook/blockedSenders` → `400 "Resource not found for the segment 'blockedSenders'"`;
+`GET /beta/me/mailboxSettings?$select=blockedSenders,safeSenders` → `400 "Could not find a property
+named 'blockedSenders' on type 'microsoft.graph.mailboxSettings'"`;
+`GET /beta/me/mailboxSettings/junkMailRule` → `400 "Resource not found for the segment
+'junkMailRule'"`; `GET https://outlook.office.com/api/beta/me/blockedsenders` → `401` (a different
+resource audience — an outlook.office.com token would need consent this connector does not have, and
+adding scopes was out of scope for this run).
+What **does** work is beta-only and message-scoped: `POST /beta/me/messages/{id}/markAsJunk` → `202
+Accepted` and `POST /beta/me/messages/{id}/markAsNotJunk` → `202`. The v1.0 endpoint rejects the
+`moveToJunk` parameter outright (`400 RequestBodyRead`), so the tool calls beta explicitly by full
+URL.
+**Decision: ship the tool, shrunk to what the platform actually does.** `manage_senders` offers
+`block_sender` and `unblock_sender` only. `list`, `safe_sender` and `unsafe_sender` are **not** in the
+enum — an action that can only ever fail is worse than an honest absence, because a model will call
+it and then report a failure to the user as if the mailbox were broken. The description states all
+three limits (no readable lists, no safe-sender management, per-message rather than per-address) and
+the output repeats that the result cannot be verified through Graph and points at Outlook web.
+- `move_message` (default true) maps to `moveToJunk` / `moveToInbox`. With it false the probe
+  confirmed the message stays in its folder, which is what makes the round-trip test safe to run
+  against a real correspondent.
+- A draft has no sender: the tool refuses before calling Graph rather than sending a request that
+  cannot mean anything.
+
+**Focused Inbox — fully supported**, contrary to the doubt in the brief.
+`GET/POST/DELETE /me/inferenceClassification/overrides` all worked on v1.0 (200/201/204) on this
+consumer account, so no beta and no fallback is needed. Graph refuses a second override for the same
+address, so `set_focus_override` PATCHes an existing one instead of colliding.
+
+**Working hours — supported, with one silent normalisation.** `PATCH /me/mailboxSettings` with
+`workingHours` → 200 and `daysOfWeek` / `startTime` / `endTime` take effect. The **time zone does
+not**: `{"name": "America/Toronto"}` went in and `Eastern Standard Time` came back. So the tool never
+changes the zone — it carries the existing `timeZone` object through — and the README says why.
+
+**MIME export.** `GET /me/messages/{id}/$value` → 200 `text/plain` with the full RFC 822 source
+(31 KB for a typical newsletter). `internetMessageHeaders` and `replyTo` are both selectable in the
+same `$select` as the rest of `read_message`'s fields, so headers cost no extra request.
+
+### manage_task — why there is no delete-list action
+The soft-delete policy already carves out a single exception for To Do tasks, because Graph has no
+undelete for them. Deleting a *list* is that same irreversibility multiplied: one call destroys every
+task in the list, with no recoverable copy anywhere in the account and no way for the model to have
+enumerated (let alone shown the user) what it was about to take. A tool surface that can permanently
+destroy work in bulk on one call is exactly what the rest of this server is built to avoid, so
+`create_list` and `rename_list` ship and delete does not. The tool description says so and names the
+To Do app as the place to do it deliberately. The **test harness** deletes its own lists with a raw
+Graph `DELETE` — the same test-only escape hatch used to purge soft-deleted mail — and the test
+comments say so, so the exclusion cannot be quietly re-introduced through the harness.
+
+### auto_reply stays a separate tool; mailbox_settings is new
+The brief allowed either "extend `auto_reply` into `mailbox_settings`" or "keep it separate", and
+separate won:
+- `auto_reply`'s vocabulary is `get` / `set` / `clear` **of one thing**. In a settings-wide tool,
+  `set` would have to mean "set what?" — working hours, an override, or the out-of-office — and the
+  disambiguation would live in the parameters rather than the action, which is exactly the shape that
+  makes a model pick wrongly.
+- Its description carries an outward-facing caution (every future sender sees the reply) that applies
+  to none of the other settings. Diluting it into a general tool description weakens the warning where
+  it matters most.
+- Backward compatibility becomes structural rather than asserted: the tool, its schema and its tests
+  are untouched by this batch, so "the existing tests still pass" is a fact about the diff, not a
+  claim about an alias shim.
+`mailbox_settings get` therefore reports auto-reply status read-only and names `auto_reply` as the
+way to change it, so a model reading only one of the two descriptions still finds the other.
+
+### export_message is a tool, not a flag on read_message
+`read_message(export_eml: true)` was the alternative. A read tool that writes a megabyte to
+`~/Downloads` (or burns a KV write) because a boolean was set is a side effect hiding inside a read,
+and the two things are wanted at different moments: `include_headers` answers "is this spoofed?"
+in-conversation, while an export exists to hand the message to someone else. A separate tool also
+gets its own description, which is where the phishing-sample / evidential-copy framing belongs. It
+reuses Batch A's machinery exactly: `saveToDownloads` locally (extracted from `get_attachment` into
+`src/tools/save-local.ts` so both tools share one implementation) and `storeDownload` +
+`/mcp/download/<id>` on the Worker, with the same 18 MB cap and ≤ 15 minute TTL.
+`core/graph.ts` grew `callGraphServerBytes` for this: the request/retry half of `callGraphWithToken`
+was split into `graphFetch`, so the byte path inherits the 429 handling and the request log rather
+than fetching Graph on its own.
+
+### read_message include_headers — what gets rendered and why
+Sixty raw headers would drown the answer, so the section is a verdict, not a dump: the
+`Authentication-Results` value reduced to `SPF/DKIM/DMARC/COMPAUTH` verdicts (raw kept, truncated at
+300 chars), the `Received` chain **reversed** to oldest-first (Graph returns it newest-first, the
+order hops are prepended) as one `from … by … — date` line per hop capped at 12, and an explicit
+`** MISMATCH **` line when `Reply-To` — or the `Return-Path` domain — differs from `From`.
+Two absences are reported rather than passed over in silence, because in a phishing check the absence
+*is* the finding: no `Authentication-Results` header at all ("nothing vouched for this message"), and
+a message with no internet headers whatsoever (a draft, or an item created in Outlook).
+Off by default: it costs two extra fields on every read and most reads are not investigations.
+
+### Harness (v8 tests)
+- Local: 34 → **40 tests**, all self-cleaning.
+  - `v8a` walks the whole To Do surface: create list → duplicate refused → repeating task (verified in
+    Graph's own view) → the two recurrence guards (no due date, no change after creation) → two
+    subtasks added, one completed **by text** and one removed **by id**, with the checklist re-rendered
+    and cross-checked against Graph → `list_tasks include_subtasks` shows the repeat, the tally and the
+    ids → `clear_recurrence` really clears it → rename keeps the list id → task deleted. The list
+    itself is removed in a `finally` with a raw Graph `DELETE`.
+  - `v8b` blocks and unblocks the sender of the newest inbox message with `move_message: false`, so a
+    real correspondent's mail never moves, asserts the message did not change folder, unblocks in a
+    `finally` so a mid-test failure cannot leave anyone blocked, and checks the draft (no sender) case.
+    It cannot assert list membership — Graph exposes no read path, which is the finding itself — so it
+    asserts the contract and the honesty of the output instead.
+  - `v8c` sets a Focused-Inbox override for `mcp-test-focus@example.com`, finds it in
+    `mailbox_settings get`, re-sets it to prove the update-not-duplicate path (one record, new value),
+    clears it, and checks the second clear fails cleanly.
+  - `v8d` saves `workingHours`, sets days/times, verifies Graph's own copy, checks the
+    end-before-start and nothing-to-change guards, restores in a `finally` and asserts the restored
+    object is **byte-identical** to the saved one — the same pattern as the auto-reply test.
+  - `v8e` asserts the header section on real inbox mail (an `Authentication-Results` verdict, a
+    compact hop-per-line chain, a reply-to verdict), that it is **absent** without the flag, and that a
+    draft's empty header set is explained.
+  - `v8f` exports a real message, parses the `.eml` back as RFC 822 (header block, `\r\n\r\n`
+    separator, the five headers that must be there, a non-empty body), matches its `Message-ID`
+    against Graph's, checks the bad-id error, and deletes the file.
+  - Sweep: now also purges and asserts on `[MCP TEST]` **To Do lists** and `mcp-test-*`
+    **Focused-Inbox overrides**, checks the local download directory holds no test file, and asserts
+    **working hours** are restored exactly alongside auto-reply.
+  - `auto_reply`'s own test (`g`) is untouched and still passes — the backward-compatibility proof.
+  - The stdio smoke test now expects **27 tools** and the three new names.
+- Remote: 22 → **23 tests**. `r23` (`testAuthed`) exports a real message through the Worker: no
+  "Saved to", a `…/mcp/download/<64 hex>` link, anonymous → 401, bearer → 200 with
+  `content-type: message/rfc822` and a `.eml` `Content-Disposition`, and the served bytes compared
+  **byte-for-byte** against Graph's own `$value` fetched with this machine's token. It drops the KV
+  record in a `finally` rather than waiting out the TTL. Headless: 23/23 with 13 skips.
+
+### Docs/versioning
+- `package.json` and `src/core/version.ts` → **0.8.0** (the harness asserts they match).
+- README: v8 header, 27-tool table, three new sections (mailbox settings; junk senders, with the probe
+  table above; message forensics), the To Do notes extended with subtasks, repeating tasks and the
+  no-delete-list rule, and the soft-delete section extended with the same rule.

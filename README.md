@@ -1,24 +1,30 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v7 serves **twenty-four tools, two prompts and two resources** over **two transports** — the local
+v8 serves **twenty-seven tools, two prompts and two resources** over **two transports** — the local
 stdio server and a remote Cloudflare Worker (see [Remote deployment](#remote-deployment)) — covering mail (search, read, compose, send,
 manage, categorize), attachments (read and add), folders (list and create), inbox rules, categories,
 calendar (list calendars and events, create, update, cancel, respond), contacts, Microsoft To Do
 tasks, auto-reply settings, **incremental "what changed" checks** and **push notifications** for
-arriving mail (see [Knowing what is new](#knowing-what-is-new)), and — new in v7 — attachments that
-work on both transports plus **repeating events, reminders and multiple calendars** (see
+arriving mail (see [Knowing what is new](#knowing-what-is-new)), attachments that work on both
+transports plus **repeating events, reminders and multiple calendars** (see
 [Attachments on both transports](#attachments-on-both-transports) and
-[Repeating events](#repeating-events)). All datetimes are handled in America/Toronto unless a caller
+[Repeating events](#repeating-events)), and — new in v8 — **subtasks and repeating tasks**,
+**working hours and Focused-Inbox overrides**, **blocking a junk sender**, and **message forensics**:
+internet headers rendered for a phishing check plus a `.eml` export of the raw MIME (see
+[Microsoft To Do notes](#microsoft-to-do-notes), [Mailbox settings](#mailbox-settings),
+[Junk senders](#junk-senders-what-graph-will-and-will-not-do) and
+[Message forensics](#message-forensics)). All datetimes are handled in America/Toronto unless a caller
 supplies an explicit UTC offset.
 
-## Tools (v7)
+## Tools (v8)
 
 | Tool | What it does |
 | --- | --- |
 | `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview. |
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
-| `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). |
+| `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). `include_headers` adds the forensic view — SPF/DKIM/DMARC verdict, the Received chain oldest-first, and a flag when Reply-To or Return-Path disagrees with From. |
+| `export_message` | The message's raw MIME as a `.eml` — a phishing sample to forward to a security team, or an evidential copy. **stdio**: saved to `~/Downloads/outlook-mcp-attachments/`. **Hosted**: the same expiring, sign-in-required download link `get_attachment` uses. |
 | `get_attachment` | Small text/JSON attachments come back inline on both transports. Otherwise the **stdio** server saves the file to `~/Downloads/outlook-mcp-attachments/` (collision-safe names) and the **hosted** server, having no filesystem, returns a sign-in-required download link that expires within 15 minutes (`link_ttl_minutes`). |
 | `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`). Never sends. |
 | `update_draft` | Edits a draft's body/subject/to/cc (recipient arrays replace, not append). Rejects non-drafts. |
@@ -33,11 +39,13 @@ supplies an explicit UTC offset.
 | `manage_event` | Update / cancel / respond (accept, decline, tentative), on a single event, **one occurrence** of a repeating event, or the **entire series** (`scope`). Also sets `reminder_minutes` (`-1` turns the reminder off) and replaces the `recurrence` rule. Updates and cancellations on events with attendees notify them — series-wide edits notify about every occurrence. |
 | `search_contacts` | Search saved contacts by name prefix; returns name, emails, phones, contact id. |
 | `manage_contact` | Create / update / delete (soft) a saved contact. |
-| `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). |
+| `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). Unchanged in v8 — `mailbox_settings` covers the *other* settings rather than absorbing this one. |
+| `mailbox_settings` | Get the mailbox's time zone, working hours, Focused-Inbox overrides and auto-reply status; set working hours (`days`, `start_time`, `end_time`); pin a sender to the Focused or Other tab, or clear that override. |
+| `manage_senders` | Block / unblock the sender of a given message (Graph `markAsJunk` / `markAsNotJunk`). Message-scoped, and the blocked/safe lists **cannot be read back** — see [Junk senders](#junk-senders-what-graph-will-and-will-not-do). |
 | `manage_rules` | List / create / **update (in place)** / delete inbox rules (conditions and **exceptions**: from/sender/subject/body; actions: move, mark read, soft delete). **Rules act automatically on all future incoming mail** — see below. |
 | `manage_categories` | List / create / delete the mailbox's Outlook categories (Graph's fixed `preset0`–`preset24` palette). Applying them to mail is `manage_message`'s `categorize`. |
-| `list_tasks` | Microsoft To Do tasks grouped overdue / today / upcoming / no due date (America/Toronto). Open tasks by default; `include_completed` and `due_within_days` narrow or widen it. |
-| `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
+| `list_tasks` | Microsoft To Do tasks grouped overdue / today / upcoming / no due date (America/Toronto). Shows the repeat rule and subtask tally; `include_subtasks` lists each checklist item with its id. Open tasks by default; `include_completed` and `due_within_days` narrow or widen it. |
+| `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task; add, complete and remove **subtasks** (checklist items); create and rename a **task list** (deleting a list is deliberately not offered). `recurrence` on create makes the task repeat (`due_date` required); `clear_recurrence` on update stops it. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
 | `check_new_mail` | What changed in a folder **since the last call**, via a Graph delta query. The first call (or one with `reset`) only records a starting position and lists nothing; every later call returns just the added/changed/removed messages. Works on both transports. |
 | `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
 
@@ -80,9 +88,89 @@ Tasks live in Microsoft To Do (Graph `/me/todo`), reached with the `Tasks.ReadWr
   An unknown name fails with the available list names rather than a bare 404. For `complete`, `reopen`,
   `update`, and `delete`, `task_list` must be the list the task actually lives in — task ids are scoped
   to their list.
+- **Subtasks (v8).** `manage_task` `add_subtask` / `complete_subtask` / `remove_subtask` drive Graph's
+  `checklistItems`. An item can be named by `subtask_id` or by its exact text; every subtask call
+  answers with the whole checklist, ticked boxes and ids, so the next call needs no lookup.
+  `list_tasks` shows a `1/3 subtasks done` tally, and `include_subtasks` prints the items themselves.
+  Removing a subtask is permanent, like deleting a task.
+- **Repeating tasks (v8).** `recurrence` on `create` takes the same vocabulary as `create_event`
+  (`frequency`, `interval`, `weekdays`, `day_of_month`, `month`, `until`/`count`). Two Graph
+  behaviours shape the tool: a repeating task **must** have a `due_date` (Graph refuses otherwise),
+  and Microsoft To Do **rejects every recurrence change after creation** — a PATCH carrying a
+  `recurrence` fails with a nonsensical `Edm.Date` parse error whatever shape it takes, on v1.0 and
+  beta alike. So `recurrence` is create-only and says so, `clear_recurrence` (the one PATCH Graph
+  does accept, `recurrence: null`) stops a task repeating, and changing *how* a task repeats means
+  deleting and recreating it.
+- **Lists can be created and renamed — not deleted.** `create_list` refuses a duplicate name, naming
+  the existing list; `rename_list` keeps the list id and its tasks. There is deliberately **no
+  delete-list action**: deleting a list takes every task in it with no recoverable copy anywhere,
+  which is exactly the outcome the soft-delete policy exists to prevent, and unlike a single task
+  it destroys work in bulk. Someone who really wants that can do it in the To Do app. (The test
+  harness cleans up its own lists with a raw Graph `DELETE`, outside the tool surface — the same
+  test-only escape hatch it uses to purge soft-deleted mail.)
+
 - **Email → task.** `manage_task(action: "create", linked_message_id: …)` appends the mail's subject,
   sender, received time, and `webLink` to the task notes. It copies a reference, not the message body,
   and never modifies the message.
+
+## Mailbox settings
+
+`mailbox_settings` covers the mailbox settings that are not the out-of-office message; `auto_reply`
+keeps its own `get`/`set`/`clear` vocabulary and its own outward-facing caution, and
+`mailbox_settings get` reports the auto-reply status read-only and points at it. (Folding auto-reply
+in would have made one `set` action mean four different things and broken every existing caller for
+no gain — the reasoning is in ASSUMPTIONS.md.)
+
+- **Working hours** (`workingHours` on `/me/mailboxSettings`). `set_working_hours` changes `days`,
+  `start_time`, `end_time`; anything not passed is carried over from what is there, because Graph
+  replaces the whole object. **These are not private** — they drive free/busy and the times Outlook
+  suggests to people scheduling with the account — so the tool description says so and the answer
+  prints before/after. The time zone is never set from here: Graph normalises whatever is sent to the
+  mailbox's own zone (`America/Toronto` went in, `Eastern Standard Time` came back).
+- **Focused-Inbox overrides** (`/me/inferenceClassification/overrides`) pin one sender to Focused or
+  Other. Verified live on this consumer account: `GET`, `POST` and `DELETE` all work. Setting an
+  override for a sender that already has one PATCHes the existing record — Graph refuses a duplicate.
+
+## Junk senders (what Graph will and will not do)
+
+`manage_senders` blocks or unblocks the sender of a message. It is deliberately smaller than
+Outlook's junk settings, because Microsoft Graph gives a consumer mailbox far less than the web UI
+suggests. Every one of these was probed live against this account before the tool was written:
+
+| Attempt | Result |
+| --- | --- |
+| `GET /beta/me/blockedSenders` | `404 UnknownError` |
+| `GET /beta/me/safeSenders` | `404 UnknownError` |
+| `GET /beta/me/outlook/blockedSenders` | `400 "Resource not found for the segment 'blockedSenders'"` |
+| `GET /beta/me/mailboxSettings?$select=blockedSenders` | `400 "Could not find a property named 'blockedSenders' on type mailboxSettings"` |
+| `GET /beta/me/mailboxSettings/junkMailRule` | `400 "Resource not found for the segment 'junkMailRule'"` |
+| `GET https://outlook.office.com/api/beta/me/blockedsenders` | `401` — a different resource audience, needing consent this connector does not have |
+| `POST /beta/me/messages/{id}/markAsJunk` | **`202 Accepted`** |
+| `POST /beta/me/messages/{id}/markAsNotJunk` | **`202 Accepted`** |
+| `POST /v1.0/me/messages/{id}/markAsJunk` | `400` — the action is beta-only |
+
+So blocking is **per message, not per address** (pass a message from the sender), the **lists cannot
+be read back at all**, and **safe senders cannot be managed** through Graph. The tool says all three
+in its description instead of offering actions that would silently do nothing, and its output tells
+the caller to check Outlook web (Settings → Mail → Junk email) for the list itself. `move_message`
+(default true) also files that message in Junk, or brings it back to the Inbox on unblock.
+
+## Message forensics
+
+Two pieces, both aimed at "is this message really from who it says?".
+
+- **`read_message` with `include_headers`** fetches `internetMessageHeaders` and `replyTo` and renders
+  them compactly rather than dumping sixty raw headers: the `Authentication-Results` header reduced to
+  `SPF pass · DKIM pass · DMARC pass · COMPAUTH pass` (with the raw value kept, truncated), an explicit
+  warning when the header is **absent**, the `Received` chain reversed to oldest-first as one
+  `from … by … — date` line per hop (capped at 12), and a `** MISMATCH **` line when `Reply-To`, or the
+  `Return-Path` domain, disagrees with `From` — the pattern behind most reply-address phishing. Drafts
+  have no internet headers and are told so explicitly rather than rendered as a clean bill of health.
+- **`export_message`** returns the raw MIME from `GET /me/messages/{id}/$value` — the artifact to hand
+  to a security team or an abuse address, or to keep after the message is deleted. It follows
+  `get_attachment`'s split exactly: a file on disk from the stdio server, an expiring
+  bearer-gated `…/mcp/download/<id>` link (`message/rfc822`, 18 MB cap) from the Worker. Attaching the
+  export to an outgoing mail stays a separate, explicit step (`create_draft` → `add_attachment`).
 
 ## Attachments on both transports
 
@@ -233,7 +321,8 @@ and `add_attachment`), then send that exact draft with `send_draft(draft_id)`. T
 Every *mailbox* delete in the tool surface (messages, events, contacts) is a **soft delete**: items move
 to Deleted Items and stay recoverable, and no tool permanently purges them. The one exception is
 `manage_task` delete: Microsoft To Do has no recoverable deleted-items store, so removing a task is
-permanent (see [Microsoft To Do notes](#microsoft-to-do-notes)). (The test harness contains a
+permanent (see [Microsoft To Do notes](#microsoft-to-do-notes)) — which is also why `manage_task`
+offers no way to delete a To Do *list*: that would destroy every task in it at once. (The test harness contains a
 `permanentDelete` helper strictly for cleaning up its own `[MCP TEST]` artifacts — it is not part of the
 tool surface.)
 
@@ -304,7 +393,8 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 - `npm run test:tools` — live test harness: exercises the tools against the real account (including a
   full delta-query lifecycle) plus unit tests of the webhook handshake, notification ingest and
   subscription renewal, and a stdio protocol smoke test covering tools, prompts and resources. Verifies
-  it leaves no `[MCP TEST]` artifacts behind and restores auto-reply.
+  it leaves no `[MCP TEST]` artifacts behind — mail, folders, rules, categories, calendars, tasks, task
+  lists, Focused-Inbox overrides, exported files — and restores auto-reply and working hours exactly.
 - `npm run verify` — the original auth/Graph foundation check.
 - `npm run typecheck` / `npm run build` — type-check (both the Node and Worker configs) / compile to `dist/`.
 - `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
@@ -321,7 +411,7 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 
 ## Remote deployment
 
-The same 24 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 27 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
@@ -473,7 +563,7 @@ the client (path included), RFC 9728 discovery fails; update it if the Worker is
    device code.
 6. In another tab open the link shown on that page (`microsoft.com/devicelogin`), enter the code, and
    sign in **as arthur.yuhao.zhang@outlook.com**. Any other account is rejected.
-7. The `/authorize` page polls, then returns to claude.ai. The connector's 24 tools, 2 prompts and 2 resources are now available.
+7. The `/authorize` page polls, then returns to claude.ai. The connector's 27 tools, 2 prompts and 2 resources are now available.
 
 ### Rotating and revoking access
 
