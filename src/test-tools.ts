@@ -2,8 +2,8 @@
 // transport) against the real account using the cached token, plus a stdio
 // protocol smoke test of the server itself. Every test cleans up after itself;
 // a final check verifies no "[MCP TEST]" artifacts remain in the account
-// (messages, drafts, folders, events, contacts, inbox rules, categories, To Do
-// tasks, temp files) and that mailbox settings (auto-reply) are restored exactly.
+// (messages, drafts, folders, events, calendars, contacts, inbox rules, categories,
+// To Do tasks, temp files) and that mailbox settings (auto-reply) are restored exactly.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -20,12 +20,14 @@ import { sendDraftHandler } from "./tools/send-draft.js";
 import { manageMessageHandler } from "./tools/manage-message.js";
 import { listFoldersHandler } from "./tools/list-folders.js";
 import { listEventsHandler, torontoToday, addDays } from "./tools/list-events.js";
+import { listCalendarsHandler } from "./tools/list-calendars.js";
 import { createEventHandler } from "./tools/create-event.js";
 import { manageEventHandler } from "./tools/manage-event.js";
 import { searchContactsHandler } from "./tools/search-contacts.js";
 import { manageContactHandler } from "./tools/manage-contact.js";
 import { autoReplyHandler } from "./tools/auto-reply.js";
 import { addAttachmentHandler } from "./tools/add-attachment.js";
+import { getAttachmentHandler } from "./tools/get-attachment.js";
 import { manageRulesHandler } from "./tools/manage-rules.js";
 import { createFolderHandler } from "./tools/create-folder.js";
 import { manageCategoriesHandler } from "./tools/manage-categories.js";
@@ -45,7 +47,8 @@ import {
   SUBSCRIPTION_RESOURCE,
   type SubscriptionRecord,
 } from "./core/subscriptions.js";
-import { STATE_ACTIVITY, STATE_SUBSCRIPTION, deltaKey } from "./core/kv-keys.js";
+import { STATE_ACTIVITY, STATE_SUBSCRIPTION, deltaKey, downloadKey } from "./core/kv-keys.js";
+import { readDownload } from "./core/downloads.js";
 import { createMemoryStateStore, runWithStateStore, writeJson } from "./core/state.js";
 import { installFileStateStore } from "./state-file.js";
 import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
@@ -174,6 +177,27 @@ async function purgeTestCategories(): Promise<void> {
       await callGraphServer(`/me/outlook/masterCategories/${encodeURIComponent(category.id)}`, {
         method: "DELETE",
       });
+    }
+  }
+}
+
+/** TEST-ONLY: remove any [MCP TEST] calendars, and test events in the ones that stay. */
+async function purgeTestCalendars(): Promise<void> {
+  const calendars = await callGraphServer("/me/calendars?$select=id,name&$top=100");
+  for (const calendar of calendars?.value ?? []) {
+    if (String(calendar.name ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/calendars/${encodeURIComponent(calendar.id)}`, {
+        method: "DELETE",
+      });
+      continue;
+    }
+    const events = await callGraphServer(
+      `/me/calendars/${encodeURIComponent(calendar.id)}/events?$filter=${encodeURIComponent(
+        `startswith(subject,'${TEST_PREFIX}')`
+      )}&$select=id,subject&$top=100`
+    );
+    for (const event of events?.value ?? []) {
+      await callGraphServer(`/me/events/${encodeURIComponent(event.id)}`, { method: "DELETE" });
     }
   }
 }
@@ -1641,6 +1665,521 @@ await test("v5e. get_mailbox_activity refuses to pretend on the local stdio serv
   );
 });
 
+// ---- v7a. add_attachment from an https URL --------------------------------
+
+// A small, public, always-on https resource this project owns: the deployed
+// Worker's health endpoint. Attaching it exercises the url source end to end
+// (fetch, size cap, content-type from the response, name from the URL path).
+const PROBE_URL = "https://outlook-mcp.arthur-yuhao-zhang.workers.dev/health";
+
+await test("v7a. add_attachment url (https fetch, name and type from the response, guards)", async () => {
+  const expected = await fetch(PROBE_URL);
+  assert(expected.ok, `the probe URL is not serving: HTTP ${expected.status}`);
+  const expectedBody = await expected.text();
+
+  const draftId = extractDraftId(
+    toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} attach url`,
+        body: "URL-attachment test draft. Safe to delete.",
+      }),
+      "create_draft attach url"
+    )
+  );
+  try {
+    const attachText = toolText(
+      await addAttachmentHandler({ draft_id: draftId, url: PROBE_URL }),
+      "add_attachment url"
+    );
+    assert(/Name: health/.test(attachText), `Name not taken from the URL path: ${attachText}`);
+    assert(
+      /Type: application\/json/.test(attachText),
+      `Content type not taken from the response: ${attachText}`
+    );
+
+    const listed = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name,contentType`
+    );
+    const att = (listed?.value ?? []).find((a: any) => a.name === "health");
+    assert(att, `URL attachment not in the inventory: ${JSON.stringify(listed?.value)}`);
+    const full = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
+    );
+    assert(
+      Buffer.from(full.contentBytes ?? "", "base64").toString("utf8") === expectedBody,
+      "the attached bytes differ from what the URL served"
+    );
+
+    // attachment_name overrides the URL-derived name, and drives the type.
+    const named = toolText(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        url: PROBE_URL,
+        attachment_name: "health-check.json",
+      }),
+      "add_attachment url (named)"
+    );
+    assert(/Name: health-check\.json/.test(named), `attachment_name ignored: ${named}`);
+
+    // Guards: scheme, unparseable URL, and a URL that does not resolve.
+    const plaintext = expectError(
+      await addAttachmentHandler({ draft_id: draftId, url: "http://example.com/x.txt" }),
+      "add_attachment(http url)"
+    );
+    assert(/https/i.test(plaintext), `Unexpected scheme error: ${plaintext}`);
+    const nonsense = expectError(
+      await addAttachmentHandler({ draft_id: draftId, url: "not a url" }),
+      "add_attachment(bad url)"
+    );
+    assert(/not a valid url/i.test(nonsense), `Unexpected parse error: ${nonsense}`);
+    const unreachable = expectError(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        url: "https://mcp-test.invalid/nothing.txt",
+      }),
+      "add_attachment(unreachable url)"
+    );
+    assert(
+      /download|fetch|failed/i.test(unreachable),
+      `Unexpected fetch failure text: ${unreachable}`
+    );
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+  }
+});
+
+// ---- v7b. add_attachment from inline base64 ------------------------------
+
+await test("v7b. add_attachment content_base64 (round-trip, source-count and size guards)", async () => {
+  const payload = Buffer.from("id,name\n1,[MCP TEST] inline attachment\n", "utf8");
+
+  const draftId = extractDraftId(
+    toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} attach base64`,
+        body: "Inline-attachment test draft. Safe to delete.",
+      }),
+      "create_draft attach base64"
+    )
+  );
+  try {
+    const attachText = toolText(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        content_base64: payload.toString("base64"),
+        attachment_name: "inline.csv",
+      }),
+      "add_attachment content_base64"
+    );
+    assert(/Type: text\/csv/.test(attachText), `Type not derived from the name: ${attachText}`);
+
+    const listed = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name`
+    );
+    const att = (listed?.value ?? []).find((a: any) => a.name === "inline.csv");
+    assert(att, `Inline attachment not in the inventory: ${JSON.stringify(listed?.value)}`);
+    const full = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
+    );
+    assert(
+      Buffer.from(full.contentBytes ?? "", "base64").equals(payload),
+      "the attached bytes differ from the base64 that was supplied"
+    );
+
+    // Guards: no source, two sources, malformed base64, and over the 3 MB cap.
+    const none = expectError(
+      await addAttachmentHandler({ draft_id: draftId }),
+      "add_attachment(no source)"
+    );
+    assert(/exactly one source/i.test(none), `Unexpected no-source error: ${none}`);
+    const both = expectError(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        url: PROBE_URL,
+        content_base64: payload.toString("base64"),
+      }),
+      "add_attachment(two sources)"
+    );
+    assert(/exactly one source/i.test(both), `Unexpected two-source error: ${both}`);
+    const malformed = expectError(
+      await addAttachmentHandler({ draft_id: draftId, content_base64: "not base64!!" }),
+      "add_attachment(bad base64)"
+    );
+    assert(/not valid base64/i.test(malformed), `Unexpected base64 error: ${malformed}`);
+    const oversize = expectError(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        content_base64: Buffer.alloc(3 * 1024 * 1024 + 16).toString("base64"),
+        attachment_name: "big.bin",
+      }),
+      "add_attachment(oversize base64)"
+    );
+    assert(/3 MB/.test(oversize), `Unexpected oversize error: ${oversize}`);
+
+    // file_path is refused when the server has no filesystem to read from.
+    const remoteRefusal = expectError(
+      await runWithStateStore(createMemoryStateStore("remote"), () =>
+        addAttachmentHandler({ draft_id: draftId, file_path: "/etc/hosts" })
+      ),
+      "add_attachment(file_path on a remote server)"
+    );
+    assert(
+      /hosted server has no access|file_path works only on the local/i.test(remoteRefusal),
+      `Unexpected remote file_path error: ${remoteRefusal}`
+    );
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+  }
+});
+
+// ---- v7c. get_attachment on both transports -------------------------------
+
+await test("v7c. get_attachment (local file save; remote inline text, TTL link, link expiry)", async () => {
+  const text = Buffer.from("[MCP TEST] attachment body\nline two\n", "utf8");
+  const binary = Buffer.alloc(2048);
+  for (let i = 0; i < binary.length; i++) binary[i] = (i * 7) % 256;
+
+  const draftId = extractDraftId(
+    toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} get attach`,
+        body: "get_attachment test draft. Safe to delete.",
+      }),
+      "create_draft get attach"
+    )
+  );
+  const saveDir = path.join(os.homedir(), "Downloads", "outlook-mcp-attachments");
+  const saveDirExisted = await fs
+    .access(saveDir)
+    .then(() => true)
+    .catch(() => false);
+  let savedPath: string | undefined;
+  try {
+    toolText(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        content_base64: text.toString("base64"),
+        attachment_name: "note.txt",
+      }),
+      "add_attachment note.txt"
+    );
+    toolText(
+      await addAttachmentHandler({
+        draft_id: draftId,
+        content_base64: binary.toString("base64"),
+        attachment_name: "blob.bin",
+      }),
+      "add_attachment blob.bin"
+    );
+    const listed = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name`
+    );
+    const idOf = (name: string) => {
+      const found = (listed?.value ?? []).find((a: any) => a.name === name);
+      assert(found, `${name} missing from the inventory`);
+      return found.id as string;
+    };
+
+    // Local mode: saved to disk, with the text also inline.
+    const localText = toolText(
+      await getAttachmentHandler({ message_id: draftId, attachment_id: idOf("note.txt") }),
+      "get_attachment (local)"
+    );
+    savedPath = localText.match(/Saved to: (.+)/)?.[1];
+    assert(savedPath, `No save path in the local output: ${localText}`);
+    assert(
+      (await fs.readFile(savedPath, "utf8")) === text.toString("utf8"),
+      "the saved file does not match the attachment"
+    );
+    assert(localText.includes("line two"), `Text attachment was not inlined: ${localText}`);
+
+    // Remote mode: text inline with no filesystem, binary behind a link.
+    const store = createMemoryStateStore("remote", "https://mcp-test.invalid");
+    const remoteText = toolText(
+      await runWithStateStore(store, () =>
+        getAttachmentHandler({ message_id: draftId, attachment_id: idOf("note.txt") })
+      ),
+      "get_attachment (remote, text)"
+    );
+    assert(/Delivered inline/.test(remoteText), `Text was not delivered inline: ${remoteText}`);
+    assert(!/Saved to:/.test(remoteText), `The hosted server claimed to save a file: ${remoteText}`);
+    assert(remoteText.includes("line two"), `Text body missing: ${remoteText}`);
+
+    const remoteBinary = toolText(
+      await runWithStateStore(store, () =>
+        getAttachmentHandler({
+          message_id: draftId,
+          attachment_id: idOf("blob.bin"),
+          link_ttl_minutes: 1,
+        })
+      ),
+      "get_attachment (remote, binary)"
+    );
+    const link = remoteBinary.match(
+      /Download: https:\/\/mcp-test\.invalid\/download\/([0-9a-f]{64})/
+    )?.[1];
+    assert(link, `No download link with an unguessable id: ${remoteBinary}`);
+    assert(/Link expires:/.test(remoteBinary), `No expiry in the output: ${remoteBinary}`);
+
+    const record = await readDownload(store, link);
+    assert(record, "the download record was not parked in the state store");
+    assert(
+      Buffer.from(record.base64, "base64").equals(binary),
+      "the parked bytes differ from the attachment"
+    );
+    assert(record.name === "blob.bin", `parked under the wrong name: ${record.name}`);
+
+    // An unknown or malformed id is never served.
+    assert((await readDownload(store, "f".repeat(64))) === null, "an unknown id was served");
+    assert((await readDownload(store, "short")) === null, "a malformed id was served");
+
+    // Expiry is enforced from inside the record, not just by the store's TTL:
+    // backdate it and the bytes must be refused and dropped.
+    await store.put(
+      downloadKey(link),
+      JSON.stringify({ ...record, expiresAt: new Date(Date.now() - 1000).toISOString() })
+    );
+    assert((await readDownload(store, link)) === null, "an expired link still served the bytes");
+    assert(
+      (await store.get(downloadKey(link))) === null,
+      "the expired record was not dropped from the store"
+    );
+  } finally {
+    if (savedPath) await fs.rm(savedPath, { force: true });
+    if (!saveDirExisted) await fs.rm(saveDir, { recursive: true, force: true });
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+  }
+});
+
+// ---- v7d. recurring event lifecycle --------------------------------------
+
+await test("v7d. recurring events (weekly ×3 → move one occurrence → cancel the series)", async () => {
+  const first = addDays(torontoToday(), 1);
+  const createText = toolText(
+    await createEventHandler({
+      subject: `${TEST_PREFIX} weekly standup`,
+      start: `${first}T09:00`,
+      end: `${first}T09:30`,
+      recurrence: { frequency: "weekly", count: 3 },
+    }),
+    "create_event (weekly series)"
+  );
+  const seriesId = createText.match(/Event id: (\S+)/)?.[1];
+  assert(seriesId, `Could not extract the series id: ${createText}`);
+  assert(/Repeats week\(s\) on \w+, 3 occurrence\(s\)/.test(createText), `Unexpected recurrence summary: ${createText}`);
+
+  try {
+    // calendarView expands the series into its three dates.
+    const view = () =>
+      callGraphServer(
+        `/me/calendarView?startDateTime=${first}T00:00:00&endDateTime=${addDays(first, 30)}T00:00:00` +
+          `&$select=id,subject,start,type&$orderby=start/dateTime&$top=50`,
+        { headers: { Prefer: 'outlook.timezone="America/Toronto"' } }
+      );
+    const mine = (data: any) =>
+      (data?.value ?? []).filter((e: any) => String(e.subject ?? "").startsWith(TEST_PREFIX));
+
+    const occurrences = mine(await view());
+    assert(occurrences.length === 3, `Expected 3 occurrences, got ${occurrences.length}`);
+    assert(
+      occurrences.every((o: any) => String(o.start.dateTime).slice(11, 16) === "09:00"),
+      `Occurrences are not all at 09:00: ${occurrences.map((o: any) => o.start.dateTime)}`
+    );
+
+    // list_events must surface occurrence ids, flagged as part of a series.
+    const listText = toolText(
+      await listEventsHandler({ start_date: first, days: 2, include_ids: true }),
+      "list_events include_ids"
+    );
+    assert(
+      listText.includes(occurrences[0].id),
+      `list_events did not print the occurrence id:\n${listText}`
+    );
+    assert(
+      /one occurrence of a repeating event/.test(listText),
+      `list_events did not flag the occurrence:\n${listText}`
+    );
+
+    // A repeat rule cannot be changed one date at a time.
+    const refusal = expectError(
+      await manageEventHandler({
+        event_id: occurrences[1].id,
+        action: "update",
+        recurrence: { frequency: "daily" },
+      }),
+      "manage_event(recurrence on one occurrence)"
+    );
+    assert(/whole series/i.test(refusal), `Unexpected refusal text: ${refusal}`);
+
+    // Move only the second occurrence: it becomes an exception, the others stay.
+    const second = occurrences[1];
+    const day = String(second.start.dateTime).slice(0, 10);
+    const moved = toolText(
+      await manageEventHandler({
+        event_id: second.id,
+        action: "update",
+        start: `${day}T11:00`,
+        end: `${day}T11:30`,
+        scope: "this_event_only",
+      }),
+      "manage_event (move one occurrence)"
+    );
+    assert(/this occurrence only/.test(moved), `Scope not reported: ${moved}`);
+
+    const afterMove = mine(await view());
+    assert(afterMove.length === 3, `Expected 3 dates after the move, got ${afterMove.length}`);
+    const times = afterMove.map((e: any) => String(e.start.dateTime).slice(11, 16));
+    assert(
+      JSON.stringify(times) === JSON.stringify(["09:00", "11:00", "09:00"]),
+      `Only the second date should have moved, got ${JSON.stringify(times)}`
+    );
+    assert(
+      afterMove[1].type === "exception",
+      `The moved date is ${afterMove[1].type}, expected an exception`
+    );
+
+    // Series-wide edits are reachable from an occurrence id.
+    const renamed = toolText(
+      await manageEventHandler({
+        event_id: afterMove[2].id,
+        action: "update",
+        subject: `${TEST_PREFIX} weekly standup (renamed)`,
+        reminder_minutes: 20,
+        scope: "entire_series",
+      }),
+      "manage_event (rename the series)"
+    );
+    assert(/the entire series/.test(renamed), `Series scope not reported: ${renamed}`);
+    const master = await callGraphServer(
+      `/me/events/${encodeURIComponent(seriesId)}?$select=subject,type,isReminderOn,reminderMinutesBeforeStart`
+    );
+    assert(
+      master.subject === `${TEST_PREFIX} weekly standup (renamed)` && master.type === "seriesMaster",
+      `The series master was not renamed: ${JSON.stringify(master)}`
+    );
+    assert(
+      master.isReminderOn === true && master.reminderMinutesBeforeStart === 20,
+      `Reminder not applied to the series: ${JSON.stringify(master)}`
+    );
+
+    // this_event_only on the series id is refused rather than guessed at.
+    const wrongScope = expectError(
+      await manageEventHandler({
+        event_id: seriesId,
+        action: "cancel",
+        scope: "this_event_only",
+      }),
+      "manage_event(this_event_only on a series id)"
+    );
+    assert(/include_ids/.test(wrongScope), `Refusal does not say how to fix it: ${wrongScope}`);
+
+    // Cancelling the series from one of its occurrences removes every date.
+    const cancelled = toolText(
+      await manageEventHandler({
+        event_id: mine(await view())[0].id,
+        action: "cancel",
+        scope: "entire_series",
+      }),
+      "manage_event (cancel the series)"
+    );
+    assert(/entire series/.test(cancelled), `Cancel did not report the scope: ${cancelled}`);
+    assert(mine(await view()).length === 0, "occurrences survived the series cancellation");
+    await expect404(`/me/events/${encodeURIComponent(seriesId)}?$select=id`, "Series master");
+  } catch (err) {
+    await callGraphServer(`/me/events/${encodeURIComponent(seriesId)}`, { method: "DELETE" }).catch(
+      () => {}
+    );
+    throw err;
+  }
+});
+
+// ---- v7e. reminders, named calendars, list_calendars ----------------------
+
+await test("v7e. calendars (list_calendars → create in a named calendar with a reminder → read back)", async () => {
+  const calendarName = `${TEST_PREFIX} calendar`;
+  const calendar = await callGraphServer("/me/calendars", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: calendarName }),
+  });
+  try {
+    const calendarsText = toolText(await listCalendarsHandler({}), "list_calendars");
+    assert(calendarsText.includes(calendarName), `New calendar not listed: ${calendarsText}`);
+    assert(calendarsText.includes(calendar.id), `Calendar ids missing: ${calendarsText}`);
+    assert(/— default/.test(calendarsText), `The default calendar is not marked: ${calendarsText}`);
+
+    const day = addDays(torontoToday(), 2);
+    const createText = toolText(
+      await createEventHandler({
+        subject: `${TEST_PREFIX} offsite`,
+        start: `${day}T13:00`,
+        end: `${day}T14:00`,
+        calendar: calendarName,
+        reminder_minutes: 45,
+      }),
+      "create_event (named calendar)"
+    );
+    assert(createText.includes(`Calendar: ${calendarName}`), `Calendar not reported: ${createText}`);
+    assert(/Reminder: 45 min before/.test(createText), `Reminder not reported: ${createText}`);
+    const eventId = createText.match(/Event id: (\S+)/)?.[1];
+    assert(eventId, `Could not extract the event id: ${createText}`);
+
+    const stored = await callGraphServer(
+      `/me/events/${encodeURIComponent(eventId)}?$select=subject,isReminderOn,reminderMinutesBeforeStart`
+    );
+    assert(
+      stored.isReminderOn === true && stored.reminderMinutesBeforeStart === 45,
+      `Reminder not stored: ${JSON.stringify(stored)}`
+    );
+
+    // The event is in the named calendar and nowhere else.
+    const inCalendar = toolText(
+      await listEventsHandler({ start_date: day, days: 1, calendar: calendarName, include_ids: true }),
+      "list_events (named calendar)"
+    );
+    assert(inCalendar.includes(`${TEST_PREFIX} offsite`), `Event missing from its calendar: ${inCalendar}`);
+    assert(inCalendar.includes(eventId), `list_events did not print the event id: ${inCalendar}`);
+    assert(inCalendar.includes(`in ${calendarName}`), `Calendar not named in the header: ${inCalendar}`);
+    const inDefault = toolText(
+      await listEventsHandler({ start_date: day, days: 1 }),
+      "list_events (default calendar)"
+    );
+    assert(
+      !inDefault.includes(`${TEST_PREFIX} offsite`),
+      `The event leaked into the default calendar: ${inDefault}`
+    );
+
+    // Turning the reminder off, and an unknown calendar name reporting the real ones.
+    const off = toolText(
+      await manageEventHandler({ event_id: eventId, action: "update", reminder_minutes: -1 }),
+      "manage_event (reminder off)"
+    );
+    assert(/Reminder: off/.test(off), `Reminder-off not reported: ${off}`);
+    const afterOff = await callGraphServer(
+      `/me/events/${encodeURIComponent(eventId)}?$select=isReminderOn`
+    );
+    assert(afterOff.isReminderOn === false, "the reminder was not turned off");
+
+    const unknown = expectError(
+      await listEventsHandler({ calendar: "[MCP TEST] no such calendar" }),
+      "list_events(unknown calendar)"
+    );
+    assert(/Available calendars:/.test(unknown), `Unknown calendar error is unhelpful: ${unknown}`);
+
+    toolText(
+      await manageEventHandler({ event_id: eventId, action: "cancel" }),
+      "manage_event (cancel offsite)"
+    );
+  } finally {
+    await callGraphServer(`/me/calendars/${encodeURIComponent(calendar.id)}`, {
+      method: "DELETE",
+    }).catch(() => {});
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -1707,6 +2246,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "create_folder",
       "get_attachment",
       "get_mailbox_activity",
+      "list_calendars",
       "list_events",
       "list_folders",
       "list_tasks",
@@ -1723,7 +2263,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 23, `Expected 23 tools, got ${tools.length}`);
+    assert(tools.length === 24, `Expected 24 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -1830,6 +2370,7 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   await purgeTestFolders();
   await purgeTestRules();
   await purgeTestCategories();
+  await purgeTestCalendars();
   await purgeTestTasks();
 
   const messages = await callGraphServer(
@@ -1847,6 +2388,24 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
     (events?.value ?? []).length === 0,
     `Leftover test events: ${JSON.stringify(events.value)}`
   );
+
+  // Every calendar, not just the default one: create_event can target any of them.
+  const calendars = await callGraphServer("/me/calendars?$select=id,name&$top=100");
+  const testCalendars = (calendars?.value ?? []).filter((c: any) =>
+    String(c.name ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(testCalendars.length === 0, `Leftover test calendars: ${JSON.stringify(testCalendars)}`);
+  for (const calendar of calendars?.value ?? []) {
+    const calendarEvents = await callGraphServer(
+      `/me/calendars/${encodeURIComponent(calendar.id)}/events?$filter=${encodeURIComponent(
+        `startswith(subject,'${TEST_PREFIX}')`
+      )}&$select=id,subject&$top=100`
+    );
+    assert(
+      (calendarEvents?.value ?? []).length === 0,
+      `Leftover test events in "${calendar.name}": ${JSON.stringify(calendarEvents.value)}`
+    );
+  }
 
   const contacts = await callGraphServer(
     `/me/contacts?$filter=${encodeURIComponent(`startswith(displayName,'${TEST_PREFIX}')`)}&$select=id,displayName`
