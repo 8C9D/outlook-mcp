@@ -603,3 +603,176 @@ touched in this batch.
   the stale-KV case, which now converges to exactly one subscription immediately.
 - The three orphans from the incident were deleted live via Graph (`DELETE /subscriptions/{id}`),
   keeping `95f07422…` — the one the `sub:mail` KV record holds the clientState for.
+
+## v7 batch A — attachments on both transports, recurring events, reminders, calendars
+
+### Live Graph behaviour verified before writing code
+Everything doubtful for a **personal (consumer)** account was probed against the real mailbox first,
+with a throwaway script, before any of it was designed in:
+- **Recurrence is fully supported.** A weekly `numbered` series (3 occurrences) was created and
+  `calendarView` expanded it into exactly three dates.
+- **Per-occurrence edits are supported.** `PATCH /me/events/{occurrenceId}` moved one date and Graph
+  turned that occurrence into `type: "exception"`, leaving the other two untouched;
+  `DELETE /me/events/{occurrenceId}` removed a single date without disturbing the series.
+- **Series-wide edits are supported.** `PATCH` on the `seriesMaster` id renamed every date and set a
+  reminder.
+- **Reminders are supported** (`isReminderOn` + `reminderMinutesBeforeStart`), on the default and on
+  secondary calendars.
+- **Secondary calendars are supported.** The account already had `Calendar` (default), `United States
+  holidays` and `Birthdays`; a new calendar was created, written to, read back through its own
+  `calendarView`, and deleted. Crucially `GET /me/events/{id}` resolves an event living in a
+  non-default calendar, which is why `manage_event` needs no `calendar` input.
+No consumer-account gap was found, so nothing had to ship as "graceful absence" this time.
+
+### add_attachment — three sources
+- Exactly one of `file_path` / `url` / `content_base64`; zero or several is a caller error naming what
+  it got. Every source shares the same 25 MB cap, draft check and upload strategy (single POST under
+  3 MB, chunked upload session above).
+- **Order of checks is deliberate and unchanged from v3:** cheap per-source pre-flight (path absolute
+  + `stat` + size, or URL parse + scheme, or base64 decode + size) runs *before* the draft lookup, so
+  a missing or oversized file is still reported as such even when the target is not a draft — v3e
+  asserts exactly that. The expensive part (reading the file, downloading the URL) runs only after the
+  draft check passes, so a 25 MB download is never spent on a message that cannot take attachments.
+- `url` is **https only**. Plaintext is refused, and so is `file:` — which is the point: without a
+  scheme check, `url` would re-introduce the local-filesystem read that `file_path` is explicitly
+  denied on the hosted server, and would do it server-side with no path validation at all.
+- The download is read chunk by chunk and abandoned the moment it exceeds 25 MB, rather than
+  `arrayBuffer()`-ing whatever arrives. `Content-Length` is checked first when present, but it is a
+  claim by a remote server, not a guarantee.
+- Content type: the response's own `Content-Type` wins when it says anything specific; a generic
+  `application/octet-stream` tells us nothing the filename extension does not, so the existing
+  extension table handles it. The URL's last path segment names the file unless `attachment_name`
+  overrides it.
+- `content_base64` is capped at **3 MB decoded** — the same threshold as the single-POST upload path,
+  and about as much base64 as is sane to put through a model's context.
+- `file_path` on the hosted server is refused via `getStateStore()?.mode`, the same "what kind of host
+  is this" check `get_mailbox_activity` uses. It names the two alternatives instead of failing with a
+  filesystem error.
+
+### get_attachment — links instead of a filesystem
+- Text-like content under 50 KB is returned inline on **both** transports (unchanged locally). Only
+  the "there are bytes and nowhere to put them" case differs.
+- The hosted server stores the base64 Graph already returned under an unguessable id
+  (`crypto.getRandomValues`, 256 bits, hex) in `dl:<id>` and returns a link. **Two expiries, on
+  purpose:** the record carries its own `expiresAt`, enforced on every read (exact, and the only one
+  that can be trusted), and the KV entry gets an `expirationTtl` purely as garbage collection — KV
+  expiry is eventual and its minimum is 60 s, so it cannot be the deadline. An expired record is
+  refused *and deleted*.
+- Cap: 18 MB. A KV value may not exceed 25 MB and the bytes are stored base64 (4/3 expansion). Over
+  that, the tool says so and points at Outlook or the local server rather than failing obscurely.
+- `link_ttl_minutes` (1–15, default 15) exists mostly so the remote suite can assert expiry inside a
+  test run; 1 minute is the floor because that is KV's own minimum TTL.
+
+### The download route lives under `/mcp/`, and why that is not cosmetic
+- First attempt served it at `/download/<id>` and listed that as a second `apiRoute`. Anonymous
+  requests were correctly refused — but so were **authenticated** ones:
+  `{"error":"invalid_token","error_description":"Token audience does not match resource server"}`,
+  while `/mcp` accepted the very same bearer. Found by driving a real `wrangler dev` Worker with a
+  real bearer before the interactive gate, not by reading the code.
+- Cause: `workers-oauth-provider` binds an access token's audience to the advertised resource
+  (`…/mcp`, pinned by RFC 9728 exact-match for claude.ai) and matches it *path-prefixed on path
+  boundaries* (`audienceMatches`). `/download/…` is outside `/mcp`, so no legitimate client's token
+  could ever open a link.
+- Fix: `DOWNLOAD_ROUTE_PREFIX = "/mcp/download/"`. It is inside the audience, and inside the existing
+  `/mcp` `apiRoute` (prefix-matched), so the second route entry went away too — one route, one bearer
+  check, links that the connector's own token opens. Re-verified end to end against `wrangler dev`:
+  anonymous → 401 with `WWW-Authenticate`, bogus bearer → 401, valid bearer → 200 with the exact 2048
+  probe bytes, `Content-Disposition: attachment; filename="blob.bin"`, unissued id → 404, malformed
+  id → 404, backdated record → 404 and the record dropped from KV.
+- The handler re-checks the grant's `userId` against the allowlist exactly as `mcp-handler.ts` does:
+  an unguessable id is a defence against enumeration, not a substitute for authentication.
+
+### StateStore gained two things
+- `put(key, value, {ttlSeconds})` — honoured by all three implementations (KV `expirationTtl` with the
+  60 s floor, in-memory expiry, and the on-disk store, which wraps a TTL'd entry as
+  `{value, expiresAt}` and drops expired entries whenever it rewrites the file; plain strings are
+  still read back as before).
+- `publicBaseUrl` — how a tool learns the URL to hand back without knowing it runs on a Worker. It
+  sits beside `mode` because it answers the same question: what kind of host is this. When it is
+  absent the tool says it cannot issue a link rather than emitting a broken one.
+
+### Recurrence mapping
+- The caller's vocabulary (`frequency`, `interval`, `weekdays`, `day_of_month`, `month`, `until`,
+  `count`) is mapped onto Graph's `pattern` + `range` pair in `create-event.ts`, next to
+  `toGraphDateTime` — shared by both calendar tools so a series is described identically wherever it
+  is built. Monthly and yearly map to Graph's *absolute* patterns; `relativeMonthly` ("third Tuesday")
+  is deliberately not exposed yet — it needs a second axis (index + weekday) that no natural request
+  in this mailbox has needed.
+- Anything omitted is taken from the event's own start date (weekday for weekly, day/month for
+  monthly and yearly), so the common case is `{frequency, count}`.
+- `until` and `count` are mutually exclusive (Graph has one `range.type`), and `until` before the
+  start date is refused rather than sent. Neither given = `noEnd`, stated in the schema description so
+  an unbounded series is never a surprise.
+- `range.recurrenceTimeZone` is `America/Toronto`, matching every other datetime in this server.
+
+### manage_event — occurrence vs series
+- Graph models a repeating event as a `seriesMaster` plus per-date `occurrence`s with their own ids,
+  so the tool reads `type` and `seriesMasterId` *before* acting rather than trusting the caller's
+  `scope`. Defaults follow the id: an occurrence id changes that date, a series id changes the series.
+- `scope: entire_series` from an occurrence walks up to `seriesMasterId` and re-reads the master (its
+  attendee list and organizer flag, not the occurrence's, are what the output reports).
+- `this_event_only` against a **series** id is refused, with instructions to get the occurrence id
+  from `list_events include_ids`. Picking a date on the caller's behalf would be a guess that mails
+  attendees.
+- A `recurrence` change on a single occurrence is refused for the same reason: a repeat rule belongs
+  to the whole series.
+- Both descriptions state the notification consequences, since that is the part a user would be
+  surprised by: a series edit notifies every attendee about all occurrences (and replacing the rule
+  re-issues the series), one occurrence notifies about that date only.
+- `reminder_minutes: -1` means "off" on update. A separate boolean would have been a second way to
+  say the same thing; the sentinel is documented in the schema description and in the README.
+
+### list_events / list_calendars decisions
+- **A separate `list_calendars` tool, not folded into `list_events`.** Recorded as asked: the two
+  answer different questions ("which calendars exist" vs "what is on one"), folding it in would have
+  meant a mode flag whose output has nothing in common with the normal one, and `list_folders` already
+  sets the precedent that "list the containers, with ids" is its own tool. It also gives `calendar` a
+  discoverable vocabulary — an unknown name fails with the real names, and the model can find them
+  without guessing. Cost: one more tool (24).
+- Like `list_folders`, it carries one harmless optional flag (`writable_only`) because MCP clients
+  handle an empty input schema poorly.
+- **`include_ids` on `list_events` defaults to false.** Event ids are ~150 characters; printing them
+  for every event in a 7-day (or 31-day) window would dominate the output. But without them
+  `manage_event` was unreachable from `list_events` at all — a pre-existing gap that only became
+  load-bearing once single occurrences became addressable. Off by default keeps the daily listing
+  readable; the description tells the model exactly when to turn it on. Occurrence lines say they are
+  occurrences, so the model knows a `scope` decision exists.
+- `calendar` accepts a name or an id, resolved with one GET and matched exactly, then
+  case-insensitively, then by prefix — the same shape as `resolveTaskList`.
+
+### Harness (v7 tests)
+- Local: 29 → **34 tests**, all against the real mailbox and self-cleaning.
+  - `v7a` attaches the deployed Worker's own `/health` endpoint over `url` — a small, public, always-on
+    https resource this project owns, which also proves name-from-URL and type-from-response — plus the
+    scheme, parse and unreachable-host guards.
+  - `v7b` round-trips `content_base64` and asserts the no-source, two-source, malformed and 3 MB
+    guards, and that `file_path` is refused under a remote-mode store.
+  - `v7c` covers `get_attachment` on **both** transports from one draft: local save to
+    `~/Downloads/outlook-mcp-attachments/` (the file is deleted afterwards, and the directory too if
+    the test created it), remote inline text, and a remote binary parked behind a link whose id is
+    unguessable, whose record round-trips the exact bytes, and which is refused *and dropped* once its
+    `expiresAt` is backdated. Unknown and malformed ids are refused too.
+  - `v7d` is the full recurring lifecycle against `calendarView`: weekly ×3 → one occurrence moved
+    (exception; the other two hold their time) → series-wide rename + reminder *from an occurrence id*
+    → `this_event_only` on the series id refused → series cancelled and every date gone.
+  - `v7e` creates a real secondary calendar, checks `list_calendars`, creates an event there with a
+    reminder, reads it back through `list_events calendar=…` (and asserts it is **absent** from the
+    default calendar), turns the reminder off, and checks the unknown-calendar error names the real
+    calendars.
+  - The sweep now purges and then asserts on **calendars** and on `[MCP TEST]` events in *every*
+    calendar — `/me/events` only sees the default one, so without this a leaked event in a secondary
+    calendar would have gone unnoticed.
+- Remote: 20 → **22 tests**. `r3` now also asserts the download route refuses anonymous and
+  bogus-bearer callers (a well-formed but unissued id must be a `401`, not a `404` — that ordering is
+  what keeps links private, and it runs headless). `r18` attaches an https URL from the Worker and
+  checks Graph's own inventory with the local token, then confirms `file_path` is refused there.
+  `r19` takes the whole download path end to end: a 1-minute link, anonymous → 401, bearer → 200 with
+  the exact bytes and the right `Content-Disposition`, an unissued id → 404, then a bounded poll until
+  the link dies with 404. The old r18–r20 (cleanups, revoked-bearer sweep) are now r20–r22.
+- Both new remote tests are `testAuthed`, so a headless run still reports 22/22 with 12 skips.
+
+### Docs/versioning
+- `package.json` and `src/core/version.ts` → **0.7.0** (the harness asserts they match).
+- README: v7 header, 24-tool table with the new inputs, and three new sections — attachments on both
+  transports (including why the download route sits under `/mcp/`), repeating events (with the
+  occurrence/series scope table), and calendars/reminders.

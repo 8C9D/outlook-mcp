@@ -1,32 +1,36 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v6 serves **twenty-three tools, two prompts and two resources** over **two transports** — the local
+v7 serves **twenty-four tools, two prompts and two resources** over **two transports** — the local
 stdio server and a remote Cloudflare Worker (see [Remote deployment](#remote-deployment)) — covering mail (search, read, compose, send,
 manage, categorize), attachments (read and add), folders (list and create), inbox rules, categories,
-calendar (list, create, update, cancel, respond), contacts, Microsoft To Do tasks, auto-reply
-settings, and — new in v6 — **incremental "what changed" checks** and **push notifications** for
-arriving mail (see [Knowing what is new](#knowing-what-is-new)). All datetimes are handled in
-America/Toronto unless a caller supplies an explicit UTC offset.
+calendar (list calendars and events, create, update, cancel, respond), contacts, Microsoft To Do
+tasks, auto-reply settings, **incremental "what changed" checks** and **push notifications** for
+arriving mail (see [Knowing what is new](#knowing-what-is-new)), and — new in v7 — attachments that
+work on both transports plus **repeating events, reminders and multiple calendars** (see
+[Attachments on both transports](#attachments-on-both-transports) and
+[Repeating events](#repeating-events)). All datetimes are handled in America/Toronto unless a caller
+supplies an explicit UTC offset.
 
-## Tools (v6)
+## Tools (v7)
 
 | Tool | What it does |
 | --- | --- |
 | `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview. |
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
 | `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). |
-| `get_attachment` | Saves an attachment to `~/Downloads/outlook-mcp-attachments/` (collision-safe names); small text/JSON attachments are also returned inline. |
+| `get_attachment` | Small text/JSON attachments come back inline on both transports. Otherwise the **stdio** server saves the file to `~/Downloads/outlook-mcp-attachments/` (collision-safe names) and the **hosted** server, having no filesystem, returns a sign-in-required download link that expires within 15 minutes (`link_ttl_minutes`). |
 | `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`). Never sends. |
 | `update_draft` | Edits a draft's body/subject/to/cc (recipient arrays replace, not append). Rejects non-drafts. |
 | `send_draft` | **The only send path.** Sends an existing draft by id after verifying it really is a draft. |
-| `add_attachment` | Attaches a local file to a draft (≤ 25 MB: single request under 3 MB, chunked upload session for 3–25 MB). Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
+| `add_attachment` | Attaches a file to a draft from **exactly one** of `file_path` (a local file — stdio server only), `url` (an `https` link the server downloads, ≤ 25 MB) or `content_base64` (bytes inline, ≤ 3 MB). Uploads in a single request under 3 MB, chunked upload session for 3–25 MB. Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
 | `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, categorize, with per-message results. `categorize` **replaces** a message's categories rather than appending, and validates every name against the mailbox's category list first. All ids go out as **one Graph `$batch` request** (one HTTP round-trip instead of up to 20); throttled items are retried once per their `Retry-After`. |
 | `list_folders` | Mail folder tree (2 levels) with unread/total counts and folder ids. |
 | `create_folder` | Creates a mail folder at the mailbox root or under `parent_folder`. Rejects a duplicate name at the same level, naming the existing folder's id. |
-| `list_events` | Calendar events for a date window (default: next 7 days), grouped by day. |
-| `create_event` | Creates an event. **If attendees are given, Outlook emails them invitations immediately.** |
-| `manage_event` | Update / cancel / respond (accept, decline, tentative). Updates and cancellations on events with attendees notify them. |
+| `list_calendars` | The account's calendars with ids, marking the default one and any that are read-only. Supplies the names `calendar` accepts elsewhere. |
+| `list_events` | Calendar events for a date window (default: next 7 days) of the default or a named `calendar`, grouped by day; repeating events appear once per occurrence. `include_ids` adds the event ids `manage_event` needs, flagging occurrences of a series. |
+| `create_event` | Creates an event, optionally with a `reminder_minutes`, on a named `calendar`, and repeating (`recurrence`: daily/weekly/monthly/yearly, `interval`, `weekdays`, ending by `until` or after `count`). **If attendees are given, Outlook emails them invitations immediately — for a series, to every occurrence.** |
+| `manage_event` | Update / cancel / respond (accept, decline, tentative), on a single event, **one occurrence** of a repeating event, or the **entire series** (`scope`). Also sets `reminder_minutes` (`-1` turns the reminder off) and replaces the `recurrence` rule. Updates and cancellations on events with attendees notify them — series-wide edits notify about every occurrence. |
 | `search_contacts` | Search saved contacts by name prefix; returns name, emails, phones, contact id. |
 | `manage_contact` | Create / update / delete (soft) a saved contact. |
 | `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). |
@@ -79,6 +83,75 @@ Tasks live in Microsoft To Do (Graph `/me/todo`), reached with the `Tasks.ReadWr
 - **Email → task.** `manage_task(action: "create", linked_message_id: …)` appends the mail's subject,
   sender, received time, and `webLink` to the task notes. It copies a reference, not the message body,
   and never modifies the message.
+
+## Attachments on both transports
+
+The stdio server sits on a machine with a filesystem and the Worker does not, so v7 gives every
+attachment operation a route that works on both.
+
+**Adding.** `add_attachment` takes exactly one source, and says so when given none or several:
+
+- `file_path` — a local absolute path. On the hosted server this fails with an explanation and a
+  pointer to the other two sources, rather than pretending to read a filesystem it does not have.
+- `url` — an `https` link (only `https`; plaintext and `file:` URLs are refused). The server
+  downloads it itself, so the bytes never travel through the model. The body is read chunk by chunk
+  and abandoned as soon as it passes 25 MB, so a server that lies about `Content-Length` cannot make
+  the Worker buffer gigabytes. The response's own `Content-Type` names the attachment's type; the last
+  path segment names the file unless `attachment_name` says otherwise.
+- `content_base64` — bytes inline, up to 3 MB decoded, for content the model already holds.
+
+**Reading.** `get_attachment` returns text/JSON under 50 KB inline on both transports. Beyond that the
+stdio server writes the file to `~/Downloads/outlook-mcp-attachments/` as before, while the hosted
+server parks the bytes in KV under a 256-bit random id and returns a link to
+`…/mcp/download/<id>`. That link:
+
+- **needs the connector's own OAuth token.** The route is inside the `/mcp` API route, so
+  `workers-oauth-provider` validates a bearer before the handler runs and an anonymous request gets
+  `401` + `WWW-Authenticate`, never the file. It is under `/mcp/` deliberately: a client binds its
+  token's audience to the resource it was told about (`…/mcp`), and audience matching is path-prefixed
+  — a link at `/download/…` would be refused even for the client that asked for it.
+- **expires**, by default in 15 minutes and never later (`link_ttl_minutes`, 1–15). The deadline lives
+  inside the stored record and is enforced on every read, because KV's own expiry is eventual and
+  cannot go below 60 seconds; an expired record is refused and dropped.
+- is capped at 18 MB of attachment, which is what fits in a 25 MB KV value once base64-encoded.
+
+## Repeating events
+
+`create_event` and `manage_event` take a `recurrence` rule — `frequency` (daily/weekly/monthly/
+yearly), `interval`, `weekdays` for weekly, `day_of_month`/`month` for monthly and yearly, ending
+either `until` a date or after `count` occurrences (neither = no end date). Anything left out is taken
+from the event's own start date, so "every week from Wednesday the 19th" needs only
+`{frequency: "weekly", count: 3}`. Graph is told the rule in `America/Toronto`.
+
+Graph stores a repeating event as a **series master** plus one **occurrence** per date, each with its
+own id, and `manage_event` resolves which of those an id names before doing anything:
+
+| `event_id` names | `scope` | What happens |
+| --- | --- | --- |
+| an occurrence | omitted or `this_event_only` | Only that date changes; Graph records it as an *exception* and the rest of the series is untouched. |
+| an occurrence | `entire_series` | The tool walks up to the series master and changes every date. |
+| the series master | omitted or `entire_series` | Every date changes. |
+| the series master | `this_event_only` | **Refused**, with instructions to fetch the occurrence's own id from `list_events` (`include_ids`). Guessing which date was meant is not something a tool should do. |
+
+The notification consequences are stated in both tool descriptions, because they are what the user
+would be surprised by: a series-wide edit mails every attendee about *all* the occurrences, and
+replacing the `recurrence` rule re-issues the series; editing one occurrence tells them about that
+date only. A repeat rule cannot be set on a single occurrence at all — the tool says so rather than
+silently applying it to everything.
+
+Occurrence ids only come from `list_events` with `include_ids`, which is off by default to keep the
+day-by-day listing readable.
+
+## Calendars
+
+`list_calendars` names the account's calendars (marking the default and any read-only ones such as
+subscribed holiday calendars). Its names and ids are what `create_event` and `list_events` accept as
+`calendar`; omitted, both use the default calendar. An unknown name fails with the list of real ones
+rather than a bare 404. `manage_event` needs no calendar input — an event id resolves across every
+calendar in the mailbox.
+
+Reminders are `reminder_minutes` on both tools (0 = at start time, up to 4 weeks); on `manage_event`,
+`-1` turns the reminder off. Omitting it leaves the calendar's own default alone.
 
 ## Prompts
 
@@ -248,9 +321,11 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 
 ## Remote deployment
 
-The same 23 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 24 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
-on. The Worker additionally does the one thing a laptop cannot: receive Graph change notifications.
+on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
+and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
+[Attachments on both transports](#attachments-on-both-transports)).
 
 **Deployed endpoint:** `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
 
@@ -398,7 +473,7 @@ the client (path included), RFC 9728 discovery fails; update it if the Worker is
    device code.
 6. In another tab open the link shown on that page (`microsoft.com/devicelogin`), enter the code, and
    sign in **as arthur.yuhao.zhang@outlook.com**. Any other account is rejected.
-7. The `/authorize` page polls, then returns to claude.ai. The connector's 23 tools, 2 prompts and 2 resources are now available.
+7. The `/authorize` page polls, then returns to claude.ai. The connector's 24 tools, 2 prompts and 2 resources are now available.
 
 ### Rotating and revoking access
 
