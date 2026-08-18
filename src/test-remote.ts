@@ -3,21 +3,39 @@
 // Everything here runs from the local machine against the real workers.dev
 // endpoint and the real Microsoft tenant: discovery metadata, refusal of
 // anonymous callers, a full OAuth authorization-code exchange, an MCP
-// round-trip over Streamable HTTP, and proof that the mailbox refresh token in
-// KV actually rotates. Like the local harness it cleans up after itself — the
-// OAuth client it registers and every grant and token derived from it are
-// deleted from KV at the end, and the final sweep asserts nothing is left.
+// round-trip over Streamable HTTP, proof that the mailbox refresh token in KV
+// actually rotates, and the three things only the hosted server can do —
+// KV-backed delta positions, MCP resources, and a Graph change notification
+// travelling from a real send all the way into get_mailbox_activity.
+//
+// Like the local harness it cleans up after itself — the OAuth client it
+// registers and every grant and token derived from it are deleted from KV, the
+// probe mail is purged, the notifications it caused are removed from the ring
+// buffer and the delta position is restored — and the final sweep asserts
+// nothing is left. The mail subscription itself is deliberately NOT torn down:
+// it is the production subscription for the real inbox, not a test artifact.
 //
 // Prerequisites: `npm run deploy`, the three wrangler secrets, and `npm run
 // seed:kv`. Run with `npm run test:remote`.
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { PROJECT_ROOT } from "./project-root.js";
 import { installMsalTokenProvider, getAccessTokenSilent } from "./auth.js";
-import { KV_ACCESS_TOKEN, KV_REFRESH_TOKEN } from "./core/kv-keys.js";
+import { callGraphServer } from "./core/graph.js";
+import {
+  KV_ACCESS_TOKEN,
+  KV_REFRESH_TOKEN,
+  STATE_ACTIVITY,
+  STATE_SUBSCRIPTION,
+  deltaKey,
+} from "./core/kv-keys.js";
+import type { ActivityEntry } from "./core/notifications.js";
 import { TOOLS } from "./core/registry.js";
+import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
+import { SUBSCRIPTION_RESOURCE, type SubscriptionRecord } from "./core/subscriptions.js";
 
 const BASE_URL = process.env.MCP_REMOTE_URL ?? "https://outlook-mcp.arthur-yuhao-zhang.workers.dev";
 const MCP_URL = `${BASE_URL}/mcp`;
@@ -85,6 +103,28 @@ async function kvDelete(nsId: string, key: string): Promise<void> {
   await wrangler(["kv", "key", "delete", key, "--namespace-id", nsId, "--remote"]);
 }
 
+/** Write a KV value through a 0600 temp file rather than argv, as seed:kv does. */
+async function kvPut(nsId: string, key: string, value: string): Promise<void> {
+  const tmpFile = path.join(os.tmpdir(), `outlook-mcp-remote-${randomBytes(8).toString("hex")}`);
+  await fs.writeFile(tmpFile, value, { mode: 0o600 });
+  try {
+    const { code, stderr } = await wrangler([
+      "kv",
+      "key",
+      "put",
+      key,
+      "--path",
+      tmpFile,
+      "--namespace-id",
+      nsId,
+      "--remote",
+    ]);
+    assert(code === 0, `wrangler kv key put ${key} failed: ${stderr}`);
+  } finally {
+    await fs.rm(tmpFile, { force: true });
+  }
+}
+
 async function kvListKeys(nsId: string): Promise<string[]> {
   const { code, stdout, stderr } = await wrangler([
     "kv",
@@ -149,6 +189,36 @@ function resultOf(
   return response.body.result;
 }
 
+/** Call a tool over the remote endpoint and return its text, refusing isError. */
+async function callTool(name: string, args: Record<string, unknown> = {}): Promise<string> {
+  assert(bearer, `no bearer token (r6 must pass first) — cannot call ${name}`);
+  const result = resultOf(
+    await mcpCall(bearer!, "tools/call", { name, arguments: args }),
+    `tools/call ${name}`
+  );
+  const text = (result.content as { text: string }[]).map((part) => part.text).join("\n");
+  assert(result.isError !== true, `${name} returned isError: ${text}`);
+  return text;
+}
+
+/** Retry `fn` until it returns a value or the deadline passes. */
+async function poll<T>(
+  what: string,
+  timeoutMs: number,
+  intervalMs: number,
+  fn: () => Promise<T | undefined>
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await fn();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${what}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 /** MCP requires an initialize before anything useful; stateless mode needs it per POST. */
 const INIT_PARAMS = {
   protocolVersion: "2025-06-18",
@@ -164,6 +234,11 @@ console.log(`Remote endpoint: ${MCP_URL}\n`);
 
 const oauthNs = await namespaceId("OAUTH_KV");
 const outlookNs = await namespaceId("OUTLOOK_KV");
+
+// Used to send the change-notification probe to this mailbox, and to clean up
+// afterwards with the local Microsoft token rather than through the connector.
+const me = await callGraphServer("/me?$select=mail,userPrincipalName");
+const ownAddress: string = me.mail ?? me.userPrincipalName;
 
 let registeredClientId: string | undefined;
 let bearer: string | undefined;
@@ -435,9 +510,266 @@ await test("r12. the mailbox refresh token in KV rotates on every exchange", asy
   assert(again.isError !== true, "the rotated refresh token could not mint an access token");
 });
 
+// ------------------------------------------- v6: notifications, delta, resources
+
+const TEST_PREFIX = "[MCP TEST]";
+const notificationsUrl = `${BASE_URL}/notifications`;
+
+/** What the run has to put back or clean out afterwards. */
+const v6: {
+  deltaBefore?: string | null;
+  activityBefore?: ActivityEntry[];
+  probeSubject?: string;
+} = {};
+
+await test("r13. the notification endpoint is public, echoes the handshake, and enforces clientState", async () => {
+  // Graph presents no credential, so this route must answer unauthenticated —
+  // and must still refuse to record anything without the shared secret.
+  const token = `validation-${randomBytes(8).toString("hex")}`;
+  const handshake = await fetch(`${notificationsUrl}?validationToken=${encodeURIComponent(token)}`, {
+    method: "POST",
+  });
+  assert(handshake.status === 200, `handshake returned HTTP ${handshake.status}, expected 200`);
+  assert(
+    (handshake.headers.get("content-type") ?? "").startsWith("text/plain"),
+    `handshake content-type is ${handshake.headers.get("content-type")}`
+  );
+  assert((await handshake.text()) === token, "the deployed endpoint did not echo the token");
+
+  const forged = await fetch(notificationsUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      value: [
+        {
+          subscriptionId: "forged",
+          clientState: "not-the-secret",
+          changeType: "created",
+          resourceData: { id: "forged-message" },
+        },
+      ],
+    }),
+  });
+  assert(forged.status === 202, `forged delivery returned HTTP ${forged.status}, expected 202`);
+  const outcome = (await forged.json()) as { accepted: number; discarded: number };
+  assert(
+    outcome.accepted === 0 && outcome.discarded === 1,
+    `a forged delivery was not discarded: ${JSON.stringify(outcome)}`
+  );
+});
+
+await test("r14. resources/list and resources/read serve the same two resources as stdio", async () => {
+  assert(bearer, "no bearer token");
+  const result = resultOf(await mcpCall(bearer!, "resources/list"), "resources/list");
+  const uris = (result.resources as { uri: string }[]).map((r) => r.uri).sort();
+  assert(
+    uris.join(",") === [FOLDERS_URI, RECENT_INBOX_URI].sort().join(","),
+    `remote resources are ${uris.join(", ") || "(none)"}`
+  );
+
+  const read = resultOf(
+    await mcpCall(bearer!, "resources/read", { uri: RECENT_INBOX_URI }),
+    "resources/read"
+  );
+  const contents = read.contents as { uri: string; text?: string }[];
+  assert(contents?.length === 1, `resources/read returned ${contents?.length} contents`);
+  assert(contents[0]!.uri === RECENT_INBOX_URI, `read back ${contents[0]!.uri}`);
+  assert(
+    /latest message\(s\) in inbox|No messages in inbox/.test(contents[0]!.text ?? ""),
+    `unexpected resource body: ${(contents[0]!.text ?? "").slice(0, 200)}`
+  );
+});
+
+await test("r15. check_new_mail keeps its delta position in KV between requests", async () => {
+  // The stateless Worker builds a new server per POST, so the only thing that
+  // can carry a delta position between calls is KV.
+  v6.deltaBefore = await kvGet(outlookNs, deltaKey("inbox"));
+
+  const baseline = await callTool("check_new_mail", { folder: "inbox", reset: true });
+  assert(
+    /Starting position recorded for inbox/.test(baseline),
+    `unexpected baseline output: ${baseline}`
+  );
+
+  const stored = await poll("the delta position to appear in KV", 60_000, 3_000, async () => {
+    const raw = await kvGet(outlookNs, deltaKey("inbox"));
+    return raw && raw !== v6.deltaBefore ? raw : undefined;
+  });
+  assert(
+    /\$deltatoken=/.test(stored),
+    `the stored position does not look like a Graph delta link: ${stored.slice(0, 120)}`
+  );
+
+  const second = await callTool("check_new_mail", {});
+  assert(
+    /No changes in inbox since|new or changed message/.test(second),
+    `a second call did not resume from the stored position: ${second}`
+  );
+  assert(
+    !/Starting position recorded/.test(second),
+    `the position was lost between requests: ${second}`
+  );
+});
+
+await test("r16. a mail subscription exists, points here, and expires in the future", async () => {
+  const record = await poll(
+    "the Worker to create the inbox subscription",
+    120_000,
+    5_000,
+    async () => {
+      const raw = await kvGet(outlookNs, STATE_SUBSCRIPTION);
+      if (!raw) return undefined;
+      try {
+        return JSON.parse(raw) as SubscriptionRecord;
+      } catch {
+        return undefined;
+      }
+    }
+  );
+  assert(record.id, `subscription record has no id: ${JSON.stringify(record)}`);
+  assert(
+    record.notificationUrl === notificationsUrl,
+    `subscription notifies ${record.notificationUrl}, expected ${notificationsUrl}`
+  );
+  assert(
+    record.resource === SUBSCRIPTION_RESOURCE,
+    `subscription watches ${record.resource}, expected ${SUBSCRIPTION_RESOURCE}`
+  );
+  assert(
+    record.clientState?.length >= 32,
+    "the stored clientState is not a long random secret"
+  );
+
+  const remaining = (Date.parse(record.expirationDateTime) - Date.now()) / 60000;
+  assert(remaining > 0, `the stored subscription already expired at ${record.expirationDateTime}`);
+  assert(remaining <= 4230, `expiry is ${Math.round(remaining)} min away, beyond Graph's maximum`);
+
+  // Graph's own view has to agree; a record for a subscription Graph forgot is
+  // exactly the failure the cron exists to repair.
+  const live = await callGraphServer(`/subscriptions/${encodeURIComponent(record.id)}`);
+  assert(live.id === record.id, `Graph returned subscription ${live.id}`);
+  assert(
+    live.notificationUrl === notificationsUrl,
+    `Graph has notificationUrl ${live.notificationUrl}`
+  );
+  assert(
+    Date.parse(live.expirationDateTime) > Date.now(),
+    `Graph says the subscription expired at ${live.expirationDateTime}`
+  );
+  console.log(
+    `      subscription ${record.id} expires ${live.expirationDateTime} ` +
+      `(${Math.round(remaining / 60)}h away); cron: see wrangler.jsonc triggers`
+  );
+
+  // The cron that keeps it alive must actually be configured.
+  const config = JSON.parse(
+    (await fs.readFile(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8")).replace(
+      /^\s*\/\/.*$/gm,
+      ""
+    )
+  ) as { triggers?: { crons?: string[] } };
+  assert(
+    (config.triggers?.crons ?? []).length > 0,
+    "wrangler.jsonc declares no cron trigger, so nothing would renew this subscription"
+  );
+});
+
+await test("r17. end-to-end: a message sent to this mailbox shows up in get_mailbox_activity", async () => {
+  v6.activityBefore = JSON.parse((await kvGet(outlookNs, STATE_ACTIVITY)) || "[]") as ActivityEntry[];
+
+  const subject = `${TEST_PREFIX} v6 webhook ${randomBytes(4).toString("hex")}`;
+  v6.probeSubject = subject;
+  const createText = await callTool("create_draft", {
+    to: [ownAddress],
+    subject,
+    body: "Change-notification probe from the remote harness. Safe to delete.",
+  });
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `could not extract a draft id from: ${createText}`);
+  await callTool("send_draft", { draft_id: draftId });
+
+  // Graph delivers notifications asynchronously and sometimes slowly; this is a
+  // bounded wait with a diagnostic, not an indefinite one.
+  let lastSeen = "";
+  try {
+    await poll("Graph to deliver the change notification", 240_000, 10_000, async () => {
+      lastSeen = await callTool("get_mailbox_activity", { since_hours: 1, limit: 25 });
+      return lastSeen.includes(subject) ? true : undefined;
+    });
+  } catch (err) {
+    const arrived = await callGraphServer(
+      `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,receivedDateTime`
+    );
+    throw new Error(
+      `${err instanceof Error ? err.message : String(err)}\n` +
+        `The message itself ${arrived?.value?.length ? "did" : "did NOT"} reach the inbox, so the ` +
+        `gap is ${arrived?.value?.length ? "in Graph's delivery to /notifications" : "in sending"}.\n` +
+        `Last get_mailbox_activity output:\n${lastSeen}`
+    );
+  }
+
+  const line = lastSeen.split("\n").find((entry) => entry.includes(subject));
+  assert(line, "the activity output changed between the poll and the assertion");
+  assert(
+    /Notified: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(lastSeen),
+    `activity entries carry no notification timestamp:\n${lastSeen}`
+  );
+  assert(
+    /Message id: \S+/.test(lastSeen),
+    `activity entries carry no message id:\n${lastSeen}`
+  );
+});
+
+await test("r18. cleanup: the probe message, its notifications and the delta position are gone", async () => {
+  // The mail itself: both copies, permanently (the tools only soft-delete).
+  const messages = await callGraphServer(
+    `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject`
+  );
+  for (const message of messages?.value ?? []) {
+    await callGraphServer(`/me/messages/${encodeURIComponent(message.id)}/permanentDelete`, {
+      method: "POST",
+    });
+  }
+  const leftover = await callGraphServer(
+    `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject`
+  );
+  assert(
+    (leftover?.value ?? []).length === 0,
+    `leftover test messages: ${JSON.stringify(leftover.value)}`
+  );
+
+  // The ring buffer: drop what this run put there, keep everything else. The
+  // subscription itself stays — it is the point of the feature, not an artifact.
+  const current = JSON.parse((await kvGet(outlookNs, STATE_ACTIVITY)) || "[]") as ActivityEntry[];
+  const kept = current.filter(
+    (entry) => !String(entry.subject ?? "").startsWith(TEST_PREFIX)
+  );
+  await kvPut(outlookNs, STATE_ACTIVITY, JSON.stringify(kept));
+
+  const after = await poll("the ring buffer to lose the test entries", 60_000, 5_000, async () => {
+    const raw = (await kvGet(outlookNs, STATE_ACTIVITY)) || "[]";
+    return raw.includes(TEST_PREFIX) ? undefined : (JSON.parse(raw) as ActivityEntry[]);
+  });
+  assert(
+    !after.some((entry) => String(entry.subject ?? "").startsWith(TEST_PREFIX)),
+    "the ring buffer still holds test notifications"
+  );
+  assert(
+    after.length === kept.length,
+    `ring buffer holds ${after.length} entries, expected the ${kept.length} that predate this run`
+  );
+
+  // The delta position: put back exactly what was there, or remove ours.
+  if (v6.deltaBefore) {
+    await kvPut(outlookNs, deltaKey("inbox"), v6.deltaBefore);
+  } else {
+    await kvDelete(outlookNs, deltaKey("inbox"));
+  }
+});
+
 // ------------------------------------------------------------------- teardown
 
-await test("r13. cleanup: every OAuth record this run created is deleted", async () => {
+await test("r19. cleanup: every OAuth record this run created is deleted", async () => {
   const keys = await kvListKeys(oauthNs);
   const created = keys.filter((key) => !baselineOauthKeys.has(key));
   for (const key of created) await kvDelete(oauthNs, key);
@@ -449,7 +781,7 @@ await test("r13. cleanup: every OAuth record this run created is deleted", async
   );
 });
 
-await test("r14. final sweep: the revoked bearer no longer opens /mcp", async () => {
+await test("r20. final sweep: the revoked bearer no longer opens /mcp", async () => {
   assert(bearer, "no bearer token");
   // KV caches reads at the edge for up to a minute, so a just-deleted token can
   // still validate briefly. Poll rather than accept that as a pass.
