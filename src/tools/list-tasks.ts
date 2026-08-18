@@ -22,6 +22,12 @@ export const listTasksSchema = {
     .boolean()
     .default(false)
     .describe("Also list tasks already marked complete (default false — open tasks only)."),
+  include_subtasks: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Also list each task's subtasks (checklist items) with their ids, for use with manage_task's *_subtask actions (default false — counts only)."
+    ),
   due_within_days: z
     .number()
     .int()
@@ -36,7 +42,7 @@ export const listTasksSchema = {
 const listTasksArgs = z.object(listTasksSchema);
 
 export const listTasksDescription =
-  "List Microsoft To Do tasks, grouped as overdue / today / upcoming / no due date in America/Toronto local time. Shows each task's title, due date, reminder, and task id (use the id with manage_task). Defaults to open tasks in the default list; set include_completed to also see finished ones, or due_within_days to narrow to what is due soon.";
+  "List Microsoft To Do tasks, grouped as overdue / today / upcoming / no due date in America/Toronto local time. Shows each task's title, due date, reminder, repeat rule, subtask progress, and task id (use the id with manage_task). Defaults to open tasks in the default list; set include_completed to also see finished ones, include_subtasks to see each checklist item and its id, or due_within_days to narrow to what is due soon.";
 
 const TASK_CAP = 300;
 
@@ -85,12 +91,14 @@ function stamp(local: string): string {
 
 export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Promise<ToolResult> {
   return runTool(async () => {
-    const { task_list, include_completed, due_within_days } = listTasksArgs.parse(input);
+    const { task_list, include_completed, include_subtasks, due_within_days } =
+      listTasksArgs.parse(input);
     const list = await resolveTaskList(task_list);
 
     const filter = include_completed ? "" : `&$filter=${encodeURIComponent("status ne 'completed'")}`;
+    // checklistItems come back only when asked for, so the default listing stays small.
     const tasks = await fetchPaged(
-      `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100${filter}`,
+      `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100${filter}&$expand=checklistItems`,
       TASK_CAP,
       { Prefer: TZ_PREFER }
     );
@@ -111,14 +119,28 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       if (cutoff !== undefined && (!dueDate || dueDate > cutoff)) continue;
       shown++;
       const reminder = task.isReminderOn ? localDateTime(task.reminderDateTime) : undefined;
+      const subtasks: any[] = task.checklistItems ?? [];
       const details = [
         due ? `due ${stamp(due)}` : undefined,
         reminder ? `reminder ${stamp(reminder)}` : undefined,
+        task.recurrence ? "repeating" : undefined,
+        subtasks.length
+          ? `${subtasks.filter((s) => s.isChecked).length}/${subtasks.length} subtasks done`
+          : undefined,
         task.status === "completed" ? "completed" : undefined,
       ].filter(Boolean);
+      const subtaskLines =
+        include_subtasks && subtasks.length
+          ? subtasks
+              .map(
+                (s) =>
+                  `\n      [${s.isChecked ? "x" : " "}] ${s.displayName || "(untitled)"} — subtask id: ${s.id}`
+              )
+              .join("")
+          : "";
       const line =
         `  ${task.title || "(untitled)"}${details.length ? ` — ${details.join(" · ")}` : ""}\n` +
-        `    id: ${task.id}`;
+        `    id: ${task.id}${subtaskLines}`;
       if (!dueDate) groups.none.push(line);
       else if (dueDate < today) groups.overdue.push(line);
       else if (dueDate === today) groups.today.push(line);
