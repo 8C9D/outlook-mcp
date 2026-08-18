@@ -34,10 +34,10 @@ export const createEventDescription =
 const NAIVE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/;
 const OFFSET_RE = /(Z|[+-]\d{2}:?\d{2})$/;
 
-type GraphDateTime = { dateTime: string; timeZone: string };
+export type GraphDateTime = { dateTime: string; timeZone: string };
 
 /** Normalize an input datetime: naive strings stay Toronto wall-clock; offset strings become UTC. */
-function toGraphDateTime(value: string): GraphDateTime | undefined {
+export function toGraphDateTime(value: string): GraphDateTime | undefined {
   if (NAIVE_RE.test(value)) {
     const dateTime = value.includes("T") ? value : `${value}T00:00:00`;
     return { dateTime: dateTime.length === 16 ? `${dateTime}:00` : dateTime, timeZone: TIMEZONE };
