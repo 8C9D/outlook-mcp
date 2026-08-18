@@ -4,8 +4,8 @@
 // a final check verifies no "[MCP TEST]" artifacts remain in the account.
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { GraphError, callGraphServer } from "./graph.js";
+import { PROJECT_ROOT } from "./project-root.js";
 import { searchMailHandler } from "./tools/search-mail.js";
 import { readThreadHandler } from "./tools/read-thread.js";
 import { createDraftHandler } from "./tools/create-draft.js";
@@ -13,7 +13,6 @@ import { listEventsHandler, torontoToday, addDays } from "./tools/list-events.js
 import { createEventHandler } from "./tools/create-event.js";
 import type { ToolResult } from "./tools/common.js";
 
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TEST_PREFIX = "[MCP TEST]";
 
 type Outcome = { name: string; passed: boolean; detail?: string };

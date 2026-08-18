@@ -1,14 +1,18 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   PublicClientApplication,
   type ICachePlugin,
   type TokenCacheContext,
 } from "@azure/msal-node";
+import { PROJECT_ROOT } from "./project-root.js";
 
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Explicit path: bare dotenv.config() reads .env from process.cwd(), which is
+// arbitrary under Claude Desktop. quiet keeps dotenv's tip off stdout, which
+// must carry only JSON-RPC in server mode.
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env"), quiet: true });
+
 const CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
 
 // offline_access is added by MSAL automatically; openid/profile must not be listed.

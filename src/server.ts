@@ -3,7 +3,6 @@
 // tools fail with a "run `npm run login`" message when the token cache is unusable.
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { searchMailDescription, searchMailHandler, searchMailSchema } from "./tools/search-mail.js";
@@ -19,8 +18,8 @@ import {
   createEventHandler,
   createEventSchema,
 } from "./tools/create-event.js";
+import { PROJECT_ROOT } from "./project-root.js";
 
-const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { version } = JSON.parse(
   readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8")
 ) as { version: string };
