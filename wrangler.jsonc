@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "outlook-mcp",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-08-01",
+  // core/token.ts scopes the Graph token provider with AsyncLocalStorage from
+  // node:async_hooks, which nodejs_compat provides on workerd.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "kv_namespaces": [
+    // Microsoft tokens: the rotating refresh token, the cached access token,
+    // and short-lived device-code authorization flows.
+    { "binding": "OUTLOOK_KV", "id": "a7e71a84c60549e48b32ef0ac7a7569d" },
+    // Owned entirely by @cloudflare/workers-oauth-provider: registered clients,
+    // grants, authorization codes and tokens. The binding name is fixed.
+    { "binding": "OAUTH_KV", "id": "bea2cb89a11f42ce82f0182149828a08" }
+  ]
+  // Secrets (never committed; set with `npx wrangler secret put <NAME>`):
+  //   MS_CLIENT_ID       Application (client) ID of the Entra app registration
+  //   ALLOWED_MS_USER_ID Graph /me id of the one account allowed to authorize
+  //   ALLOWED_MS_UPN     that account's userPrincipalName / mail
+}

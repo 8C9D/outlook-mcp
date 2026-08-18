@@ -295,3 +295,131 @@ touched in this batch.
   update/exceptions paragraph under "Inbox rules", `Tasks.ReadWrite` added to the setup scope list, the
   soft-delete policy narrowed to *mailbox* deletes with the To Do exception called out, and `manage_task`
   added to both the keep-per-call-approval list and a dedicated security-model bullet.
+
+## v5 batch 3 — dual-mode (stdio + Cloudflare Worker)
+
+### Transport-agnostic refactor
+- The tools were already transport-independent except for one thing: `graph.ts` imported `auth.ts`,
+  which pulls in MSAL, `dotenv` and `node:fs`. That single edge would have dragged all of Node into
+  the Worker bundle. Broke it with `src/core/token.ts`: a **token provider** indirection that hosts
+  install and `core/graph.ts` consumes. Nothing in `src/tools/` changed beyond import paths.
+- The provider is stored in an `AsyncLocalStorage` with a process-wide default. The default serves
+  single-tenant hosts (stdio, CLI scripts, harness); the ALS scope serves the Worker, where the KV
+  binding only exists per request and concurrent requests must not observe each other's provider.
+  `node:async_hooks` is available on workerd under `nodejs_compat`.
+- `callGraph` (the device-code-capable variant) moved to `src/graph-interactive.ts` so `core/graph.ts`
+  has no Node-only imports at all.
+- `src/core/registry.ts` is the single tool/prompt table. Both entry points call `createMcpServer()`,
+  so the surfaces cannot drift; remote test `r9` asserts the deployed tool list equals `TOOLS`.
+- Version is duplicated: `package.json` (read at runtime by the stdio entry) and `core/version.ts`
+  (a literal, because the Worker has no filesystem). Kept in sync by hand at release time.
+
+### SDK choice — why not `agents` / `McpAgent`
+- Cloudflare's `McpAgent` (from the `agents` package) is **deprecated and feature-frozen** as of the
+  July 2026 SDK v2 release, and it requires Durable Objects (one DO instance per session). Free-tier
+  accounts *can* use SQLite-backed DOs, so that was not the blocker — the blockers were that it is a
+  deprecated path and that its successor, `createMcpHandler`, wants `@modelcontextprotocol/server@2`,
+  a different SDK from the `@modelcontextprotocol/sdk@1.30.0` the 21 tools are written against.
+- Chose instead **`WebStandardStreamableHTTPServerTransport`**, which ships in the SDK we already
+  depend on (`@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js`) and is fetch-native —
+  its own JSDoc carries a Cloudflare Workers example. This keeps *one* MCP SDK across both transports
+  and means the Worker registers the identical `McpServer` object the stdio server does.
+- Ran **stateless**: `sessionIdGenerator: undefined`, `enableJsonResponse: true`, a fresh server and
+  transport per POST. Verified in the SDK source that `validateSession()` returns early when
+  `sessionIdGenerator` is undefined, so the "Server not initialized" gate never fires for a
+  non-`initialize` request on a fresh transport — which is what makes per-request construction safe.
+  Consequence: no Durable Objects, no migrations, no DO bindings in `wrangler.jsonc`.
+
+### OAuth design
+- `@cloudflare/workers-oauth-provider@0.10.3` owns the authorization-server surface: RFC 8414 and RFC
+  9728 metadata, RFC 7591 dynamic client registration, S256 PKCE, the token endpoint, bearer
+  validation, and the `401` + `WWW-Authenticate: ... resource_metadata=...` challenge claude.ai needs
+  in order to start the flow. `apiRoute: "/mcp"` means nothing anonymous can reach the MCP handler.
+- DCR is enabled because claude.ai registers itself; CIMD was left off (it needs the
+  `global_fetch_strictly_public` compat flag and DCR alone is sufficient here).
+- `resourceMetadata.resource` is the literal deployed URL **including `/mcp`**. RFC 9728 requires it
+  to match what the client was given exactly, and the provider is constructed at module scope where
+  `env` is not available, so it cannot be read from a binding. Renaming the Worker means editing it.
+- **Identity is proved with Microsoft's device-code flow, not an auth-code redirect.** The Entra app
+  registration is a public native client registered for device code with no web redirect URI; adding
+  one would have meant changing the registration (portal access this task did not have). Device code
+  needs no redirect URI, so `/authorize` renders a code, polls Microsoft, and completes. The token it
+  obtains is scoped `offline_access User.Read`, used only to call Graph `/me`, and never stored.
+- **Allowlist**: `isAllowedIdentity()` matches the Graph `/me` `id` against `ALLOWED_MS_USER_ID`, or
+  `userPrincipalName`/`mail` against `ALLOWED_MS_UPN`. Consumer (MSA) accounts return no
+  `userPrincipalName` from Graph and their `/me` `id` (`c85e8009ffaa7530`) is *not* the `oid` in the
+  token, so both forms are checked. Every authorization path funnels through this one function, and
+  `mcp-handler.ts` re-checks `props.userId` against the allowlist as defence in depth (it catches a
+  grant minted before the allowlist was narrowed).
+- **Deviation worth flagging:** `/authorize` also accepts `POST` with an `ms_access_token` form field,
+  which runs the identical Graph `/me` allowlist check and completes the authorization without a
+  browser. This exists so the remote harness can drive a *real* OAuth exchange (DCR → authorize →
+  PKCE token exchange) non-interactively; a device-code sign-in cannot be automated. It is not a
+  bypass: it demands a live Microsoft access token for the allowlisted account, and anyone holding
+  one already has the mailbox. It was preferred over a static test bearer secret precisely because it
+  reuses the real gate instead of adding a second credential path. Note that MSA access tokens are
+  opaque (not JWTs), so the token cannot be additionally checked for `appid` — validation is
+  necessarily "does Graph accept it, and for whom".
+
+### Token handling
+- MSAL Node does not run on workerd, so `src/worker/ms-token.ts` issues the refresh-token grant
+  directly: form POST to `https://login.microsoftonline.com/consumers/oauth2/v2.0/token` with
+  `client_id`, `grant_type=refresh_token`, `refresh_token`, `scope`. No client secret (public
+  client), no `redirect_uri`, no `Origin` header.
+- `scope` repeats **exactly** the consented set with `offline_access` first. `offline_access` must be
+  present or the response carries no rotated refresh token; requesting the same scopes guarantees no
+  new consent prompt, which was a hard requirement.
+- **Rotation**: the new `refresh_token` is written back to `ms:refresh_token` on every exchange,
+  before the access token is cached, so a later failure cannot lose it. Microsoft does *not* revoke
+  the previous refresh token when it issues a new one, which is why (a) a concurrent double-refresh
+  is not fatal, and (b) the Worker rotating its copy leaves `.token-cache.json` working — the two
+  credential chains are independent from the moment of seeding.
+- Access tokens are cached in KV under `ms:access_token` with a 5-minute expiry skew and a matching
+  `expirationTtl`, so a typical tool call costs no token exchange.
+- Seeding (`src/scripts/seed-kv.ts`) reads the single `RefreshToken` entry from `.token-cache.json`,
+  refuses to guess if the cache holds more than one account, and passes the value to wrangler through
+  a `0600` temp file rather than argv (argv is world-readable via `ps`). It prints only a SHA-256
+  fingerprint, and reports the two allowlist values.
+
+### Secrets
+- `MS_CLIENT_ID`, `ALLOWED_MS_USER_ID`, `ALLOWED_MS_UPN` are wrangler secrets. Only the first is
+  arguably sensitive (it is a public client identifier), but all three stay out of the repo.
+- `wrangler.jsonc` is committed and contains only the two KV namespace ids, which are not secrets.
+  `.gitignore` gained `.dev.vars` and `.wrangler/`.
+- `worker-configuration.d.ts` (generated by `npm run cf-types`) **is** committed so `npm run
+  typecheck` works from a clean checkout. It contains binding *names* only, no values.
+
+### Workers limitations hit
+- Two tsconfigs were unavoidable: `@types/node` and the workerd runtime types both declare `Request`,
+  `Response` and `fetch` globally. `tsconfig.json` excludes `src/worker` and covers the Node side;
+  `tsconfig.worker.json` covers `src/worker` + `src/core` + `src/tools` against the generated runtime
+  types. `npm run typecheck` runs both.
+- KV is eventually consistent and caches reads at the edge for up to a minute. This showed up twice:
+  the rotation assertion polls for the new value, and the post-revocation `401` assertion polls for
+  up to two minutes. Both are genuine platform behaviour, not flakiness to paper over.
+- A `/.well-known/oauth-authorization-server` fetch immediately after the first deploy returned
+  Cloudflare error 1042; it resolved on its own within a minute and has not recurred. Treated as
+  deploy propagation, not a code fault.
+
+### Tests
+- Local harness unchanged and still 23/23 — it now calls `installMsalTokenProvider()` explicitly,
+  since the token source is no longer implicit in the import graph.
+- `src/test-remote.ts` (`npm run test:remote`) adds 14 live checks against the deployed endpoint:
+  discovery metadata (r1, r2), anonymous/bogus-bearer rejection across POST, GET and DELETE (r3),
+  DCR (r4), allowlist refusal (r5), a full authorize + PKCE token exchange (r6), bad-verifier
+  rejection (r7), `initialize` (r8), the 21-tool surface compared against the registry (r9),
+  `prompts/list` (r10), a read-only `list_events` round-trip (r11), refresh-token rotation proven by
+  forcing an exchange and comparing stored fingerprints (r12), and teardown (r13, r14).
+- Self-cleaning extends to the cloud: the run snapshots `OAUTH_KV`'s key list before registering
+  anything and deletes every key that appeared, then asserts the namespace is back to its baseline
+  and that the issued bearer no longer opens `/mcp`. Comparing against a baseline rather than
+  matching on the client id was deliberate — grants and tokens are keyed by user and grant id, so an
+  id-based filter silently missed them (which is exactly how r14 caught the incomplete first version).
+- The rotation test deliberately mutates real state (it spends the refresh token). That is safe and
+  needs no cleanup: rotation is the normal steady-state behaviour, and the replacement token is live.
+
+### Docs/versioning
+- Version 0.5.0. README gained a "Remote deployment" section (architecture, allowlist, token storage,
+  from-scratch setup, the exact claude.ai connector steps, and rotation/revocation procedures), five
+  new script entries, and a security-model bullet for the remote endpoint.
+- Deployed URL: `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`.

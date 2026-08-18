@@ -1,7 +1,8 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v4 exposes twenty-one tools and two prompts over stdio, covering mail (search, read, compose, send,
+v5 keeps v4's twenty-one tools and two prompts and serves them over **two transports** — the local
+stdio server and a remote Cloudflare Worker (see [Remote deployment](#remote-deployment)) — covering mail (search, read, compose, send,
 manage, categorize), attachments (read and add), folders (list and create), inbox rules, categories,
 calendar (list, create, update, cancel, respond), contacts, Microsoft To Do tasks, and auto-reply
 settings. All datetimes are handled in America/Toronto unless a caller supplies an explicit UTC offset.
@@ -130,6 +131,11 @@ can contain text that tries to instruct the model into sending, deleting, or for
   description flags this and points the model at `complete` for the non-destructive case, but the
   approval prompt is the real backstop — keep it on.
 - Sending is structurally two-step (above) and mailbox deletes are soft (above).
+- **The remote endpoint is single-user.** Nothing anonymous can reach `/mcp` or any route that
+  touches Graph, and only one Microsoft identity — matched on the Graph `/me` id or UPN captured at
+  setup — can complete an authorization. A remote connector runs the same tools with the same
+  approval expectations; the caveats above apply there too, and claude.ai's own tool-approval
+  prompts are the equivalent safety boundary.
 
 ## Login and re-authentication
 
@@ -159,7 +165,128 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 - `npm run test:tools` — live test harness: exercises the tools against the real account plus a stdio
   protocol smoke test, and verifies it leaves no `[MCP TEST]` artifacts behind and restores auto-reply.
 - `npm run verify` — the original auth/Graph foundation check.
-- `npm run typecheck` / `npm run build` — type-check / compile to `dist/`.
+- `npm run typecheck` / `npm run build` — type-check (both the Node and Worker configs) / compile to `dist/`.
+- `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
+- `npm run seed:kv` — push the current Microsoft refresh token from `.token-cache.json` into Workers KV.
+- `npm run deploy` — deploy the Worker to Cloudflare.
+- `npm run test:remote` — live tests against the deployed endpoint (discovery, anonymous rejection, a
+  full OAuth exchange, an MCP round-trip, refresh-token rotation); cleans up every KV record it creates.
+
+## Remote deployment
+
+The same 21 tools and 2 prompts are also served over MCP Streamable HTTP from a Cloudflare Worker, so
+claude.ai can reach the mailbox as a custom connector without this laptop being on.
+
+**Deployed endpoint:** `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
+
+### Architecture
+
+Everything transport-independent lives under `src/core/`: `registry.ts` (the tool and prompt table),
+`graph.ts` (the Graph transport), `prompts.ts`, and `token.ts`. Both entry points build the *same*
+`McpServer` from `createMcpServer()`, so the two hosts cannot drift apart — `src/test-remote.ts`
+asserts the deployed tool list equals the local registry.
+
+```
+src/core/*            transport-agnostic: registry, Graph calls, prompts, token indirection
+src/tools/*           the 21 tool handlers (unchanged by transport)
+src/server.ts         stdio entry  -> MSAL + .token-cache.json      (Claude Desktop)
+src/worker/index.ts   Worker entry -> OAuth + refresh token in KV   (claude.ai)
+```
+
+The tool layer never knows where its Graph token comes from. `core/token.ts` holds a *token provider*
+that each host installs: the stdio server installs MSAL silent acquisition; the Worker installs a
+KV-backed provider, scoped per request with `AsyncLocalStorage`.
+
+The Worker is **stateless** — no Durable Objects. Each POST builds a fresh `McpServer` and a
+`WebStandardStreamableHTTPServerTransport` with `sessionIdGenerator: undefined`, and discards them
+when the response is written.
+
+`@cloudflare/workers-oauth-provider` fronts the whole thing. It owns discovery metadata, dynamic
+client registration, PKCE, the token endpoint and bearer validation, and routes only authenticated
+requests to `/mcp`. **Anonymous access is impossible** — an unauthenticated call to `/mcp` (by any
+verb) gets `401` with a `WWW-Authenticate` challenge, which is what makes a client start the OAuth
+flow. This is asserted by test `r3`.
+
+### Single-user allowlist
+
+Only one Microsoft identity may authorize a client. Authorization ends in a Graph `/me` call whose
+result must match the `ALLOWED_MS_USER_ID` (Graph `/me` `id`) or `ALLOWED_MS_UPN` secret; anything
+else is refused with `403`, and no grant is issued. The check lives in one place
+(`isAllowedIdentity` in `src/worker/ms-token.ts`) and every authorization path runs through it.
+
+Identity is proved with Microsoft's **device-code flow**, not a redirect-based auth code flow: the
+Entra app registration is a public native client with no web redirect URI, and device code needs
+none, so nothing about the registration had to change. `/authorize` shows a code to enter at
+microsoft.com/devicelogin and polls until sign-in completes. That Microsoft token is used only to
+read `/me` and is never stored.
+
+### Token storage
+
+The mailbox credential is a Microsoft refresh token in the `OUTLOOK_KV` namespace under
+`ms:refresh_token`. MSAL Node does not run on workerd, so `src/worker/ms-token.ts` performs the
+refresh-token grant directly against `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`
+with `fetch`, requesting exactly the scopes already consented (so no new consent is ever needed).
+**Microsoft rotates the refresh token on every exchange and the new value is written back to KV**;
+test `r12` proves this by forcing a refresh and comparing the stored value before and after.
+Access tokens are cached under `ms:access_token` with a TTL so most calls skip the exchange.
+
+Local stdio mode is untouched by all of this: it still uses MSAL and `.token-cache.json`. The two
+credential chains are independent (Microsoft does not revoke an old refresh token when it issues a
+new one), so the Worker rotating its copy does not disturb the local one.
+
+### Setting it up from scratch
+
+```bash
+npx wrangler kv namespace create OUTLOOK_KV   # ids go in wrangler.jsonc
+npx wrangler kv namespace create OAUTH_KV
+npm run deploy                                 # prints the workers.dev URL
+
+# Secrets — never committed. The client id is not really secret, but .env is
+# gitignored and it stays out of the repo for consistency.
+printf '%s' "<Entra application (client) id>"   | npx wrangler secret put MS_CLIENT_ID
+printf '%s' "<Graph /me id>"                    | npx wrangler secret put ALLOWED_MS_USER_ID
+printf '%s' "<userPrincipalName / mail>"        | npx wrangler secret put ALLOWED_MS_UPN
+
+npm run seed:kv        # pushes the refresh token into KV; prints the two allowlist values
+npm run test:remote    # 14 live checks against the deployed endpoint
+```
+
+`npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local cache is
+stale. It hands the token to wrangler through a `0600` temp file rather than argv, and prints only a
+SHA-256 fingerprint. Re-run it only after a fresh `npm run login` — at any other time it would
+overwrite the Worker's rotated token with an older one.
+
+If `resourceMetadata.resource` in `src/worker/index.ts` does not exactly match the URL pasted into
+the client (path included), RFC 9728 discovery fails; update it if the Worker is ever renamed.
+
+### Adding it to claude.ai as a custom connector
+
+1. In claude.ai, open **Settings → Connectors** (Team/Enterprise: **Organization settings →
+   Connectors**, added by an owner).
+2. Click **Add custom connector**.
+3. Paste the full URL **including the path**: `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
+4. Leave the OAuth Client ID and Secret fields **empty** — the server supports dynamic client
+   registration, so Claude registers itself.
+5. Click **Add**, then **Connect**. A browser tab opens on the Worker's `/authorize` page showing a
+   device code.
+6. In another tab open the link shown on that page (`microsoft.com/devicelogin`), enter the code, and
+   sign in **as arthur.yuhao.zhang@outlook.com**. Any other account is rejected.
+7. The `/authorize` page polls, then returns to claude.ai. The connector's 21 tools are now available.
+
+### Rotating and revoking access
+
+- **Revoke one client** (disconnect claude.ai): remove the connector in claude.ai, then delete its
+  records from the OAuth store — `npx wrangler kv key list --namespace-id <OAUTH_KV id> --remote`
+  and `npx wrangler kv key delete <key> --namespace-id <OAUTH_KV id> --remote`. Deletions take up to
+  a minute to propagate because KV caches reads at the edge.
+- **Revoke everything at once**: delete `ms:refresh_token` from `OUTLOOK_KV`. Every tool call then
+  fails with an auth error while the OAuth grants stay intact; `npm run seed:kv` restores service.
+- **Cut off Microsoft entirely**: remove the app at
+  <https://account.live.com/consent/Manage>. That kills the local cache and the Worker's KV token
+  together; recover with `npm run login` followed by `npm run seed:kv`.
+- **Rotate the mailbox credential**: `npm run login` then `npm run seed:kv`.
+- **Take the endpoint down**: `npx wrangler delete` removes the Worker; the KV namespaces survive and
+  must be deleted separately if you want the tokens gone.
 
 ## Claude Desktop
 

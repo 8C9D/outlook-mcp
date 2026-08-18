@@ -11,5 +11,7 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // src/worker is typechecked against the Workers runtime by tsconfig.worker.json.
+  "exclude": ["src/worker"]
 }
