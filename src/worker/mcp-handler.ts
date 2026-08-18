@@ -8,10 +8,13 @@
 // session validation entirely, so each POST is self-contained.
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer } from "../core/registry.js";
+import { runWithStateStore } from "../core/state.js";
 import { runWithTokenProvider } from "../core/token.js";
 import { VERSION } from "../core/version.js";
 import type { Env } from "./env.js";
 import { mailboxTokenProvider } from "./ms-token.js";
+import { keepSubscriptionAlive } from "./notifications.js";
+import { kvStateStore } from "./state-kv.js";
 
 /** Props stamped onto the grant at authorization time. */
 export type GrantProps = {
@@ -50,13 +53,21 @@ export const mcpHandler = {
     await server.connect(transport);
 
     try {
-      // Scope the KV-backed Graph token to this request; the tool layer reads
-      // it back out through core/token.js without knowing where it came from.
+      // Scope the KV-backed Graph token and state store to this request; the
+      // tool layer reads both back out through core/token.js and core/state.js
+      // without knowing where they came from.
       return await runWithTokenProvider(mailboxTokenProvider(env), () =>
-        transport.handleRequest(request)
+        runWithStateStore(kvStateStore(env), () => transport.handleRequest(request))
       );
     } finally {
       ctx.waitUntil(server.close());
+      // Belt and braces for the cron: using the connector at all is enough to
+      // notice a lapsed subscription. Costs one KV read when nothing is due.
+      ctx.waitUntil(
+        keepSubscriptionAlive(env).catch((err) =>
+          console.error(`Background subscription upkeep failed: ${String(err)}`)
+        )
+      );
     }
   },
 };

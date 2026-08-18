@@ -20,6 +20,7 @@ import {
   resolveIdentity,
 } from "./ms-token.js";
 import type { GrantProps } from "./mcp-handler.js";
+import { NOTIFICATIONS_PATH, handleNotifications } from "./notifications.js";
 
 /** Pending device-code authorizations, keyed by an unguessable flow id. */
 const FLOW_PREFIX = "flow:";
@@ -289,6 +290,11 @@ export const defaultHandler = {
     }
     if (url.pathname === "/authorize/poll" && request.method === "GET") {
       return handleAuthorizePoll(request, env);
+    }
+    if (url.pathname === NOTIFICATIONS_PATH) {
+      // Microsoft Graph posts here with no credential of its own; the endpoint
+      // authenticates deliveries with the subscription's clientState instead.
+      return handleNotifications(request, env);
     }
     if (url.pathname === "/health") {
       // Deliberately says nothing about the mailbox or whether anyone is authorized.

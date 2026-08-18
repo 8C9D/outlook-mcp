@@ -7,6 +7,16 @@
   // node:async_hooks, which nodejs_compat provides on workerd.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Keeps the Graph change-notification subscription alive. Mail subscriptions
+  // expire after at most 4230 minutes (~2.9 days) and Graph deletes them
+  // silently, so this runs every 6 hours and renews once less than a day is
+  // left — many chances to recover before anything lapses.
+  "triggers": { "crons": ["17 */6 * * *"] },
+  "vars": {
+    // Public origin of this Worker. Graph is told to deliver notifications to
+    // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname.
+    "PUBLIC_BASE_URL": "https://outlook-mcp.arthur-yuhao-zhang.workers.dev"
+  },
   "kv_namespaces": [
     // Microsoft tokens: the rotating refresh token, the cached access token,
     // and short-lived device-code authorization flows.
