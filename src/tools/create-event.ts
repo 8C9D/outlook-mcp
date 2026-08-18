@@ -5,7 +5,7 @@ import { addDays } from "./list-events.js";
 import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
 
 /** Graph's weekday names, indexed by JavaScript's day-of-week. */
-const WEEKDAYS = [
+export const WEEKDAYS = [
   "sunday",
   "monday",
   "tuesday",
