@@ -439,11 +439,16 @@ await testAuthed("r6. an interactive device-code sign-in completes authorization
   const flowId = pageBody.match(/const flow = "([^"]+)"/)?.[1];
   assert(userCode && verificationUri && flowId, `could not parse the /authorize page: ${pageBody.slice(0, 500)}`);
 
+  // How long to wait for the human sign-in. 10 minutes by default; a run that
+  // has to route around throttled verification emails can extend it via
+  // MCP_REMOTE_SIGNIN_TIMEOUT_MS without touching the flow being tested.
+  const signinTimeoutMs = Number(process.env.MCP_REMOTE_SIGNIN_TIMEOUT_MS) || 600_000;
+
   console.log(`\n      ACTION REQUIRED: open ${verificationUri} and enter the code ${userCode},`);
-  console.log("      signing in as the mailbox owner. Waiting up to 10 minutes...\n");
+  console.log(`      signing in as the mailbox owner. Waiting up to ${Math.round(signinTimeoutMs / 60_000)} minutes...\n`);
 
   // Poll exactly as the page's own script does, until the sign-in lands.
-  const deadline = Date.now() + 600_000;
+  const deadline = Date.now() + signinTimeoutMs;
   let redirectTo: string | undefined;
   for (;;) {
     const pollResponse = await fetch(
