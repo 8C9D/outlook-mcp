@@ -3,7 +3,7 @@
   "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, calendar, contacts, auto-reply; sending only via explicit two-step draft-then-send).",
+  "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, inbox rules, categories, calendar, contacts, Microsoft To Do tasks, auto-reply; sending only via explicit two-step draft-then-send).",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "verify": "tsx src/verify.ts",
