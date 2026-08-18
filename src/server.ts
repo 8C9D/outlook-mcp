@@ -60,6 +60,16 @@ import {
   manageContactSchema,
 } from "./tools/manage-contact.js";
 import { autoReplyDescription, autoReplyHandler, autoReplySchema } from "./tools/auto-reply.js";
+import {
+  addAttachmentDescription,
+  addAttachmentHandler,
+  addAttachmentSchema,
+} from "./tools/add-attachment.js";
+import {
+  manageRulesDescription,
+  manageRulesHandler,
+  manageRulesSchema,
+} from "./tools/manage-rules.js";
 import { PROJECT_ROOT } from "./project-root.js";
 
 const { version } = JSON.parse(
@@ -142,6 +152,16 @@ server.registerTool(
   "auto_reply",
   { description: autoReplyDescription, inputSchema: autoReplySchema },
   autoReplyHandler
+);
+server.registerTool(
+  "add_attachment",
+  { description: addAttachmentDescription, inputSchema: addAttachmentSchema },
+  addAttachmentHandler
+);
+server.registerTool(
+  "manage_rules",
+  { description: manageRulesDescription, inputSchema: manageRulesSchema },
+  manageRulesHandler
 );
 
 await server.connect(new StdioServerTransport());
