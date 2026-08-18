@@ -1,5 +1,5 @@
-import { AuthRequiredError } from "../auth.js";
-import { GraphError, callGraphServer } from "../graph.js";
+import { AuthRequiredError } from "../core/token.js";
+import { GraphError, callGraphServer } from "../core/graph.js";
 
 export const TIMEZONE = "America/Toronto";
 export const TZ_PREFER = `outlook.timezone="${TIMEZONE}"`;

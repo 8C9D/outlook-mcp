@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { callGraphServer } from "../graph.js";
+import { callGraphServer } from "../core/graph.js";
 import { ToolResult, errorResult, runTool, textResult } from "./common.js";
 import { formatSize } from "./read-message.js";
 

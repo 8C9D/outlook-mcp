@@ -7,6 +7,9 @@ import {
   type TokenCacheContext,
 } from "@azure/msal-node";
 import { PROJECT_ROOT } from "./project-root.js";
+import { AuthRequiredError, setDefaultTokenProvider } from "./core/token.js";
+
+export { AuthRequiredError };
 
 // Explicit path: bare dotenv.config() reads .env from process.cwd(), which is
 // arbitrary under Claude Desktop. quiet keeps dotenv's tip off stdout, which
@@ -81,17 +84,6 @@ async function acquireByDeviceCode(pca: PublicClientApplication): Promise<string
   return result.accessToken;
 }
 
-/** Thrown when no token can be acquired without user interaction. */
-export class AuthRequiredError extends Error {
-  constructor(reason?: string) {
-    super(
-      "Authentication expired. Run `npm run login` in a terminal in ~/dev/outlook-mcp, then retry." +
-        (reason ? ` (${reason})` : "")
-    );
-    this.name = "AuthRequiredError";
-  }
-}
-
 async function acquireSilent(pca: PublicClientApplication): Promise<string | undefined> {
   const accounts = await pca.getTokenCache().getAllAccounts();
   const account = accounts[0];
@@ -115,6 +107,15 @@ export async function getAccessTokenSilent(): Promise<string> {
     const reason = err instanceof Error ? err.message : String(err);
     throw new AuthRequiredError(reason);
   }
+}
+
+/**
+ * Make MSAL + the on-disk cache the token source for core/graph.js. Called by
+ * every Node entry point (stdio server, CLI scripts, test harness); the Worker
+ * installs a KV-backed provider instead and never loads this module.
+ */
+export function installMsalTokenProvider(): void {
+  setDefaultTokenProvider(getAccessTokenSilent);
 }
 
 export async function getAccessToken(): Promise<string> {

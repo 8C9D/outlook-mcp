@@ -1,4 +1,4 @@
-import { callGraph } from "./graph.js";
+import { callGraph } from "./graph-interactive.js";
 
 type CheckResult = { name: string; passed: boolean; detail?: string };
 const results: CheckResult[] = [];
