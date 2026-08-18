@@ -1,22 +1,70 @@
-import { getAccessToken } from "./auth.js";
+import { getAccessToken, getAccessTokenSilent } from "./auth.js";
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
-export async function callGraph(path: string, init?: RequestInit): Promise<any> {
-  const token = await getAccessToken();
-  const response = await fetch(GRAPH_BASE + path, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(init?.headers as Record<string, string> | undefined),
-    },
-  });
+/** A non-2xx response from Microsoft Graph, carrying the status and error body. */
+export class GraphError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly statusText: string,
+    public readonly requestPath: string,
+    public readonly body: string
+  ) {
+    super(`Graph request failed: ${status} ${statusText} for ${requestPath}\n${body}`);
+    this.name = "GraphError";
+  }
+}
+
+async function callGraphWithToken(
+  getToken: () => Promise<string>,
+  path: string,
+  init?: RequestInit
+): Promise<any> {
+  const token = await getToken();
+  const doFetch = () =>
+    fetch(path.startsWith("https://") ? path : GRAPH_BASE + path, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    });
+
+  let response = await doFetch();
+  if (response.status === 429) {
+    // Honor Retry-After once, then fail readably if still throttled.
+    const retryAfter = Number(response.headers.get("Retry-After") ?? "2");
+    const waitSeconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) : 2;
+    console.error(`Graph throttled (429) on ${path}; retrying once after ${waitSeconds}s.`);
+    await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+    response = await doFetch();
+    if (response.status === 429) {
+      throw new GraphError(
+        429,
+        "Too Many Requests",
+        path,
+        "Microsoft Graph is throttling requests. Wait a minute and retry."
+      );
+    }
+  }
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(
-      `Graph request failed: ${response.status} ${response.statusText} for ${path}\n${body}`
-    );
+    throw new GraphError(response.status, response.statusText, path, await response.text());
   }
   if (response.status === 204) return null;
-  return response.json();
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+/** Interactive-capable Graph call (may trigger device-code sign-in). For CLI scripts only. */
+export async function callGraph(path: string, init?: RequestInit): Promise<any> {
+  return callGraphWithToken(getAccessToken, path, init);
+}
+
+/**
+ * Server-mode Graph call: silent token acquisition only. Throws AuthRequiredError
+ * (never prompts) when re-authentication is needed. `path` may also be a full
+ * @odata.nextLink URL.
+ */
+export async function callGraphServer(path: string, init?: RequestInit): Promise<any> {
+  return callGraphWithToken(getAccessTokenSilent, path, init);
 }

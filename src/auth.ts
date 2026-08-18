@@ -58,7 +58,8 @@ async function acquireByDeviceCode(pca: PublicClientApplication): Promise<string
   const result = await pca.acquireTokenByDeviceCode({
     scopes: SCOPES,
     deviceCodeCallback: (deviceCode) => {
-      console.log(`\n=== Sign-in required ===\n${deviceCode.message}\n`);
+      // stderr: stdout must stay clean in case this ever runs under an MCP client.
+      console.error(`\n=== Sign-in required ===\n${deviceCode.message}\n`);
     },
   });
   if (!result?.accessToken) {
@@ -67,22 +68,53 @@ async function acquireByDeviceCode(pca: PublicClientApplication): Promise<string
   return result.accessToken;
 }
 
-export async function getAccessToken(): Promise<string> {
-  const pca = getPca();
+/** Thrown when no token can be acquired without user interaction. */
+export class AuthRequiredError extends Error {
+  constructor(reason?: string) {
+    super(
+      "Authentication expired. Run `npm run login` in a terminal in ~/dev/outlook-mcp, then retry." +
+        (reason ? ` (${reason})` : "")
+    );
+    this.name = "AuthRequiredError";
+  }
+}
+
+async function acquireSilent(pca: PublicClientApplication): Promise<string | undefined> {
   const accounts = await pca.getTokenCache().getAllAccounts();
   const account = accounts[0];
-  if (account) {
-    try {
-      const result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
-      if (result?.accessToken) return result.accessToken;
-      console.log("Silent token acquisition returned no token; starting device-code sign-in.");
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.log(
-        `Cached sign-in could not be refreshed (refresh token expired or revoked): ${reason}\n` +
-          "Re-authentication is required; starting a fresh device-code sign-in."
-      );
-    }
+  if (!account) return undefined;
+  const result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
+  return result?.accessToken ?? undefined;
+}
+
+/**
+ * Server-mode token getter: silent acquisition only. Never starts a device-code
+ * flow; throws AuthRequiredError when the cache is missing or unusable.
+ */
+export async function getAccessTokenSilent(): Promise<string> {
+  const pca = getPca();
+  try {
+    const token = await acquireSilent(pca);
+    if (token) return token;
+    throw new AuthRequiredError("no cached account");
+  } catch (err) {
+    if (err instanceof AuthRequiredError) throw err;
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new AuthRequiredError(reason);
+  }
+}
+
+export async function getAccessToken(): Promise<string> {
+  const pca = getPca();
+  try {
+    const token = await acquireSilent(pca);
+    if (token) return token;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(
+      `Cached sign-in could not be refreshed (refresh token expired or revoked): ${reason}\n` +
+        "Re-authentication is required; starting a fresh device-code sign-in."
+    );
   }
   return acquireByDeviceCode(pca);
 }
