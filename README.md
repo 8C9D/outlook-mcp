@@ -1,22 +1,24 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v2 exposes fifteen tools over stdio covering mail (search, read, compose, send, manage), attachments,
-folders, calendar (list, create, update, cancel, respond), contacts, and auto-reply settings.
-All datetimes are handled in America/Toronto unless a caller supplies an explicit UTC offset.
+v3 exposes seventeen tools over stdio covering mail (search, read, compose, send, manage), attachments
+(read and add), folders, inbox rules, calendar (list, create, update, cancel, respond), contacts, and
+auto-reply settings. All datetimes are handled in America/Toronto unless a caller supplies an explicit
+UTC offset.
 
-## Tools (v2)
+## Tools (v3)
 
 | Tool | What it does |
 | --- | --- |
-| `search_mail` | Full-text search over a mail folder (default inbox). Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview. |
+| `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview. |
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
 | `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). |
 | `get_attachment` | Saves an attachment to `~/Downloads/outlook-mcp-attachments/` (collision-safe names); small text/JSON attachments are also returned inline. |
 | `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`). Never sends. |
 | `update_draft` | Edits a draft's body/subject/to/cc (recipient arrays replace, not append). Rejects non-drafts. |
 | `send_draft` | **The only send path.** Sends an existing draft by id after verifying it really is a draft. |
-| `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, with per-message results. |
+| `add_attachment` | Attaches a local file to a draft (≤ 25 MB: single request under 3 MB, chunked upload session for 3–25 MB). Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
+| `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, with per-message results. All ids go out as **one Graph `$batch` request** (one HTTP round-trip instead of up to 20); throttled items are retried once per their `Retry-After`. |
 | `list_folders` | Mail folder tree (2 levels) with unread/total counts and folder ids. |
 | `list_events` | Calendar events for a date window (default: next 7 days), grouped by day. |
 | `create_event` | Creates an event. **If attendees are given, Outlook emails them invitations immediately.** |
@@ -24,12 +26,27 @@ All datetimes are handled in America/Toronto unless a caller supplies an explici
 | `search_contacts` | Search saved contacts by name prefix; returns name, emails, phones, contact id. |
 | `manage_contact` | Create / update / delete (soft) a saved contact. |
 | `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). |
+| `manage_rules` | List / create / delete inbox rules (conditions: from/sender/subject/body; actions: move, mark read, soft delete). **Rules act automatically on all future incoming mail** — see below. |
+
+## Inbox rules (`manage_rules`)
+
+A rule runs server-side on **every future incoming message that matches, with no per-message
+approval** — it keeps acting long after the conversation that created it. The tool description
+therefore instructs the model to state the complete rule (all conditions → all actions) before
+creating one, and to keep rules conservative. Move targets are validated to exist before the rule
+is created.
+
+**No forwarding actions, by design.** Graph rules can forward or redirect mail to arbitrary
+addresses; this server deliberately does not expose those actions (creating or listing aside — the
+list output *does* flag externally created forward rules). A standing silent forward is an
+exfiltration primitive: one approved call would export all future mail. Rules here can only move,
+mark read, or soft-delete within the mailbox.
 
 ## Two-step send by design
 
-v2 can send email, but **no tool composes and sends in one call**, and `/me/sendMail` is never used.
-Sending is always two separate tool calls: compose with `create_draft` (and optionally `update_draft`),
-then send that exact draft with `send_draft(draft_id)`. This means:
+The server can send email, but **no tool composes and sends in one call**, and `/me/sendMail` is never
+used. Sending is always separate tool calls: compose with `create_draft` (and optionally `update_draft`
+and `add_attachment`), then send that exact draft with `send_draft(draft_id)`. This means:
 
 - The complete outgoing message exists as a reviewable draft before anything leaves the account.
 - The calling model must present the draft (subject, recipients) and take a second deliberate action to send.
@@ -49,8 +66,11 @@ can contain text that tries to instruct the model into sending, deleting, or for
 (prompt injection). Mitigations built in and recommended:
 
 - **Keep per-call approval prompts in Claude Desktop** for `send_draft`, `manage_message`
-  (delete/move), `manage_event`, `manage_contact`, and `auto_reply` — do **not** "always allow" these.
-  Each approval shows you what is about to happen; that review is the real safety boundary.
+  (delete/move), `manage_event`, `manage_contact`, `auto_reply`, and `manage_rules` — do **not**
+  "always allow" these. Each approval shows you what is about to happen; that review is the real
+  safety boundary. `manage_rules` especially: a rule keeps acting on all future mail after one
+  approval, which is why rule creation must stay reviewable and forwarding actions are excluded
+  entirely.
 - The operations third parties can see are: `send_draft`, event **invitations** (`create_event` with
   attendees), event **updates/cancellations** on events with attendees, invitation **responses**, and
   **auto-replies**. Everything else stays inside the mailbox.
@@ -112,7 +132,7 @@ runtime. The server resolves its own project root from its module location, so i
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.
 - **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether
-  it started; in a chat, the tools icon lists its fifteen tools when connected.
+  it started; in a chat, the tools icon lists its seventeen tools when connected.
 - **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and
   `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.
 - **Auth expired?** Tool calls will return *"Authentication expired. Run `npm run login` …"* — see

@@ -126,3 +126,45 @@ Recorded while executing the "v2 full-parity tool surface" task on 2026-08-18.
 - The device-code sign-in again required Microsoft's "Verify your email" challenge; the user completed the verification and the consent screen themselves (the automation entered the device code only). Mitigation for the unseen consent screen: the granted scopes were verified afterwards from the cached token's target — exactly User.Read, Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, Contacts.ReadWrite, MailboxSettings.ReadWrite (+ implicit openid/profile) — matching Phase A.
 - Silent acquisition confirmed: `npm run verify` completed all three checks with no sign-in prompt immediately after login.
 - Full harness: 13/13 PASS on the first run, including the final artifact sweep and exact auto-reply restoration.
+
+## v3 batch 1
+
+Recorded while executing the "v3 batch 1 — daily-use sharpening" task on 2026-08-18.
+
+### Scope verification (before building manage_rules)
+- Verified live before implementation: a silent-token GET of `/me/mailFolders/inbox/messageRules` succeeded (0 existing rules), confirming MailboxSettings.ReadWrite covers inbox rules with **no re-consent and no portal changes** — exactly as the task asserted. Entra registration, scopes, and the Claude Desktop config were not touched.
+
+### Extension 1 — get_latest in search_mail
+- No-query mode uses `$orderby=receivedDateTime desc` + `$top` through the same `fetchPaged` path (so `@odata.nextLink` still works if Graph pages) with the same Prefer-timezone header and output shape; the header line says "latest message(s) … (newest first)" instead of "result(s) … (relevance-ranked)" so the calling model can tell the modes apart.
+- An empty folder in no-query mode returns "No messages in {folder}." (not an error), mirroring the no-matches case.
+
+### Extension 2 — $batch in manage_message
+- The 20-id schema cap equals Graph's $batch limit, so every call fits in exactly ONE batch request; ids map to batch item ids "0".."19".
+- Per-item 429s are retried once in a **second** $batch containing only the throttled items, after waiting the LONGEST of their Retry-After values (case-insensitive header lookup, default 2 s, capped 60 s). Items still 429 after that are reported FAILED with a "wait a minute" message.
+- A batch-level 429 (the /$batch POST itself throttled) is still handled by the shared Graph layer's single retry, unchanged.
+- Success criteria per item: any 2xx status. Moves read the new message id from the item's response body, as before. An item id missing from Graph's response array (never observed) is reported FAILED rather than assumed OK.
+- `graphRequestLog` was added to src/graph.ts (method + path per Graph call) so the harness can assert exactly one /$batch request; it is an append-only in-process array, unread in server mode, and its comment documents that the transport-level 429 retry does not add an entry.
+
+### Extension 3 — add_attachment
+- Guard order: absolute-path check → stat (missing/unreadable → isError) → regular-file check → **size stat BEFORE reading any bytes** (> 25 MB → isError naming the cap) → isDraft guard (same pattern as send_draft) → read + upload.
+- < 3 MB uses a single POST fileAttachment (base64 contentBytes); 3–25 MB uses createUploadSession + 4 MB PUT chunks. Chunk PUTs go to the session's `uploadUrl` with a **plain fetch, not callGraphServer**: the uploadUrl embeds its own auth token and lives on outlook.office.com, where the graph.microsoft.com bearer token is the wrong audience.
+- contentType comes from a ~30-entry extension map (text, images, office, pdf, archives, media) with fallback application/octet-stream; the extension is taken from the effective attachment name (attachment_name if given, else the file basename).
+- The 3 MB single-POST threshold is checked against actual bytes read; the 25 MB cap against stat.size. Graph's own single-POST limit is ~3 MB and personal-account message limits are near 25 MB, so the caps are honest to the platform.
+
+### Extension 4 — manage_rules
+- The create path's first Graph call is a GET of the rules collection (used for the auto-assigned sequence = max existing sequence + 1), so a scope/permission problem fails loudly before anything is created; list is itself a GET.
+- Forwarding/redirect rule actions are excluded per the task (exfiltration primitive). The list output still FLAGS forward/redirect actions on rules created elsewhere ("FORWARD/REDIRECT (created outside this server)") — surfacing them seemed safer than hiding them. Unknown conditions/actions on externally created rules are shown as raw key: JSON rather than dropped.
+- A rule with zero conditions is rejected client-side with an explanation (it would match ALL mail) even though Graph would accept it — conservative-by-default per the task.
+- move_to_folder is resolved via GET /me/mailFolders/{target} before creation (well-known name or id); 404 → isError; the rule stores the resolved folder id and the confirmation/list show the folder's display name.
+- Rule delete is a hard DELETE of the rule object (Graph has no soft delete for messageRules); the rule stops acting but no mail is touched, so the soft-delete policy for content is unaffected.
+
+### Harness (v3 tests)
+- v3a asserts the first no-query result id equals a direct `$orderby=receivedDateTime desc&$top=1` call's id, and (when ≥2 results) compares the first two receivedDateTimes fetched by id.
+- v3b snapshots graphRequestLog around the mark_read call and asserts the requests issued were exactly one /$batch and nothing else (a clean run has no throttling, so the strict ==1 is safe), plus 3/3 OK lines.
+- v3d uses ~4.5 MB (not exactly 4 MB) so the session path uploads TWO chunks (4 MB + 0.5 MB); verification re-downloads the attachment's contentBytes and compares length AND sha256 against the local file — stronger than trusting Graph's `size` property, which can include metadata overhead.
+- v3e's oversize file is created with truncate() to 26 MB — a sparse file whose stat.size is truthfully over the cap without writing 26 MB — and the guard rejects it before any read. The non-draft/missing-file guards run against the latest inbox message id.
+- v3f cleans up in a finally block (rule delete by id if the tool-path delete didn't run, then permanentDelete of the test folder); the final sweep gained purgeTestRules() plus assertions that zero [MCP TEST] rules remain and that the run's temp dir is gone.
+- Temp files live in one fs.mkdtemp dir under os.tmpdir(), removed per-test and swept at the end.
+
+### Docs/versioning
+- Version 0.3.0; README tool table now 17 tools, with a dedicated "Inbox rules" section (future-mail warning + no-forwarding rationale) and manage_rules added to the keep-per-call-approval list in the security model.
