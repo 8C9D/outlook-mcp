@@ -30,8 +30,14 @@ export const DOWNLOAD_TTL_MAX_MINUTES = 15;
  */
 export const DOWNLOAD_MAX_BYTES = 18 * 1024 * 1024;
 
-/** The path a download is served from. Prefix-matched by the Worker's router. */
-export const DOWNLOAD_ROUTE_PREFIX = "/download/";
+/**
+ * The path a download is served from. Deliberately *under* the MCP endpoint:
+ * an OAuth client binds its token's audience to the resource it was told about
+ * (this server advertises ".../mcp"), and audience matching is path-prefixed on
+ * path boundaries. A link at /download/… would be refused as out-of-audience
+ * even for the client that asked for it; /mcp/download/… is inside it.
+ */
+export const DOWNLOAD_ROUTE_PREFIX = "/mcp/download/";
 
 export type DownloadRecord = {
   /** Filename to serve the bytes under. */

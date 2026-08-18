@@ -24,10 +24,12 @@ import type { Env } from "./env.js";
 const SCOPES_SUPPORTED = ["outlook"];
 
 /**
- * Both protected routes behind one handler: the MCP endpoint, and the
- * attachment downloads get_attachment hands out. Listing /download/ as an
- * apiRoute is what puts it behind the same bearer check as /mcp — a link with
- * no token gets OAuthProvider's 401, not the file.
+ * Both protected surfaces behind one handler: the MCP endpoint itself, and the
+ * attachment downloads get_attachment hands out. The downloads live under
+ * /mcp/, so the single apiRoute below covers them (it is prefix-matched) and
+ * they carry the same bearer check — a link with no token gets OAuthProvider's
+ * 401, not the file. See DOWNLOAD_ROUTE_PREFIX for why they cannot sit at the
+ * root instead.
  */
 const apiHandler = {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -38,7 +40,7 @@ const apiHandler = {
 };
 
 const oauthProvider = new OAuthProvider<Env>({
-  apiRoute: ["/mcp", DOWNLOAD_ROUTE_PREFIX],
+  apiRoute: "/mcp",
   apiHandler,
   defaultHandler,
 

@@ -48,7 +48,7 @@ import {
   type SubscriptionRecord,
 } from "./core/subscriptions.js";
 import { STATE_ACTIVITY, STATE_SUBSCRIPTION, deltaKey, downloadKey } from "./core/kv-keys.js";
-import { readDownload } from "./core/downloads.js";
+import { DOWNLOAD_ROUTE_PREFIX, readDownload } from "./core/downloads.js";
 import { createMemoryStateStore, runWithStateStore, writeJson } from "./core/state.js";
 import { installFileStateStore } from "./state-file.js";
 import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
@@ -1919,7 +1919,9 @@ await test("v7c. get_attachment (local file save; remote inline text, TTL link, 
       "get_attachment (remote, binary)"
     );
     const link = remoteBinary.match(
-      /Download: https:\/\/mcp-test\.invalid\/download\/([0-9a-f]{64})/
+      new RegExp(
+        `Download: https://mcp-test\\.invalid${DOWNLOAD_ROUTE_PREFIX}([0-9a-f]{64})`
+      )
     )?.[1];
     assert(link, `No download link with an unguessable id: ${remoteBinary}`);
     assert(/Link expires:/.test(remoteBinary), `No expiry in the output: ${remoteBinary}`);
