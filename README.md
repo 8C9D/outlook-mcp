@@ -347,6 +347,12 @@ cron "17 */6 * * *"  --> create / renew the subscription       get_mailbox_activ
   re-checks it in the background (`ctx.waitUntil`), so a lapse heals the moment the connector is used
   rather than at the next scheduled run. When nothing is due, the check is a single KV read and makes
   no Graph call at all.
+- **Concurrency.** Whenever the KV record alone cannot justify "keep", Graph is the source of truth
+  and KV only a cache: upkeep lists the live subscriptions for this endpoint first, renews the one
+  whose `clientState` it holds, and sweeps any duplicates a concurrent upkeep left behind — so a
+  stale KV read (KV is eventually consistent) can never grow a pile of subscriptions. A listed
+  subscription comes back with `clientState: null`, so a foreign one is never adopted — it is
+  replaced, because its deliveries could never be validated.
 - **`PUBLIC_BASE_URL`.** A `vars` entry in `wrangler.jsonc` (not a secret): the notification URL is
   `PUBLIC_BASE_URL + /notifications`, so it must match the deployed hostname exactly or Graph will
   validate against the wrong origin.

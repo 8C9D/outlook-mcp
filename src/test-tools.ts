@@ -1417,9 +1417,14 @@ await test("v5c. notification ingest (clientState enforced, enriched, ring cappe
 
 // ---- v5d. subscription renewal (the cron handler's logic) ----------------
 
-await test("v5d. cron renewal (create → keep → renew → recreate when Graph forgot it)", async () => {
-  const store = createMemoryStateStore("remote");
-  const url = "https://example.invalid/notifications";
+/**
+ * An in-memory stand-in for Graph's /subscriptions surface. Mirrors the two
+ * behaviours the renewal logic depends on: subscriptions persist across calls,
+ * and list responses never reveal the clientState secret (verified live —
+ * Graph returns it as null).
+ */
+function memorySubscriptionGraph() {
+  const subs = new Map<string, any>();
   const calls: { method: string; path: string; body: any }[] = [];
   let nextId = 1;
   let patchFails = false;
@@ -1428,21 +1433,51 @@ await test("v5d. cron renewal (create → keep → renew → recreate when Graph
     const method = (init?.method ?? "GET").toUpperCase();
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ method, path, body });
-    if (method === "POST") {
-      return { id: `sub-${nextId++}`, expirationDateTime: body.expirationDateTime };
+    if (method === "GET" && path === "/subscriptions") {
+      return { value: [...subs.values()].map((sub) => ({ ...sub, clientState: null })) };
     }
+    if (method === "POST" && path === "/subscriptions") {
+      const id = `sub-${nextId++}`;
+      subs.set(id, {
+        id,
+        resource: body.resource,
+        notificationUrl: body.notificationUrl,
+        expirationDateTime: body.expirationDateTime,
+      });
+      return { id, expirationDateTime: body.expirationDateTime };
+    }
+    const id = decodeURIComponent(path.split("/").pop()!);
     if (method === "PATCH") {
-      if (patchFails) throw new Error("ErrorItemNotFound: subscription no longer exists");
-      return { id: path.split("/").pop(), expirationDateTime: body.expirationDateTime };
+      if (patchFails || !subs.has(id)) {
+        throw new Error("ErrorItemNotFound: subscription no longer exists");
+      }
+      subs.get(id)!.expirationDateTime = body.expirationDateTime;
+      return { id, expirationDateTime: body.expirationDateTime };
+    }
+    if (method === "DELETE") {
+      subs.delete(id);
+      return undefined;
     }
     throw new Error(`unexpected ${method} ${path}`);
   };
 
+  return { graph, subs, calls, setPatchFails: (v: boolean) => (patchFails = v) };
+}
+
+await test("v5d. cron renewal (create → keep → renew → recreate when Graph forgot it)", async () => {
+  const store = createMemoryStateStore("remote");
+  const url = "https://example.invalid/notifications";
+  const { graph, subs, calls, setPatchFails } = memorySubscriptionGraph();
+
   const start = new Date("2026-08-18T00:00:00Z");
   const created = await ensureMailSubscription(store, url, { now: start, graph });
   assert(created.action === "created", `first run did ${created.action}, expected created`);
-  assert(calls.length === 1 && calls[0]!.method === "POST", "creation did not POST /subscriptions");
-  const posted = calls[0]!.body;
+  // Graph is consulted before anything is created: list first, then POST.
+  assert(
+    calls.map((c) => c.method).join(",") === "GET,POST",
+    `creation made ${calls.map((c) => c.method).join(",")}, expected GET,POST`
+  );
+  const posted = calls.find((c) => c.method === "POST")!.body;
   assert(posted.resource === SUBSCRIPTION_RESOURCE, `wrong resource: ${posted.resource}`);
   assert(posted.notificationUrl === url, `wrong notificationUrl: ${posted.notificationUrl}`);
   assert(posted.changeType === "created", `wrong changeType: ${posted.changeType}`);
@@ -1465,13 +1500,13 @@ await test("v5d. cron renewal (create → keep → renew → recreate when Graph
   assert(kept.action === "kept", `healthy subscription was ${kept.action}, expected kept`);
   assert(calls.length === 0, `keeping the subscription made ${calls.length} Graph call(s)`);
 
-  // Inside the renewal window: PATCH, same subscription id and clientState.
+  // Inside the renewal window: list, then PATCH the same id, same clientState.
   const nearExpiry = new Date(Date.parse(created.record.expirationDateTime) - 6 * 3600_000);
   const renewed = await ensureMailSubscription(store, url, { now: nearExpiry, graph });
   assert(renewed.action === "renewed", `near-expiry run did ${renewed.action}, expected renewed`);
   const patchCall = calls.find((call) => call.method === "PATCH");
   assert(patchCall, `renewal made no PATCH: ${JSON.stringify(calls.map((c) => c.method))}`);
-  const strayCalls = calls.filter((call) => call.method !== "PATCH");
+  const strayCalls = calls.filter((call) => call.method !== "PATCH" && call.method !== "GET");
   assert(
     strayCalls.length === 0,
     `renewal made unexpected Graph calls: ${JSON.stringify(strayCalls.map((c) => c.method))}`
@@ -1489,21 +1524,34 @@ await test("v5d. cron renewal (create → keep → renew → recreate when Graph
     "renewal did not push the expiry out"
   );
 
-  // Graph forgot the subscription: renewal falls back to creating a new one,
-  // with a fresh secret.
+  // Graph forgot the subscription entirely (gone from the list too): the next
+  // upkeep re-creates it with a fresh secret, without attempting a PATCH.
   calls.length = 0;
-  patchFails = true;
+  subs.clear();
   const stillNear = new Date(Date.parse(renewed.record.expirationDateTime) - 6 * 3600_000);
   const recreated = await ensureMailSubscription(store, url, { now: stillNear, graph });
   assert(recreated.action === "recreated", `expected recreated, got ${recreated.action}`);
   assert(
-    calls.some((call) => call.method === "PATCH") && calls.some((call) => call.method === "POST"),
-    "recreation did not try PATCH first and then POST"
+    calls.map((c) => c.method).join(",") === "GET,POST",
+    `recreation made ${calls.map((c) => c.method).join(",")}, expected GET,POST`
   );
   assert(recreated.record.id !== created.record.id, "recreation reused the dead subscription id");
   assert(
     recreated.record.clientState !== firstClientState,
     "recreation reused the old clientState"
+  );
+
+  // The narrower race: still listed, but the PATCH itself fails (the
+  // subscription died between the list and the renewal). Same recovery.
+  calls.length = 0;
+  setPatchFails(true);
+  const nearAgain = new Date(Date.parse(recreated.record.expirationDateTime) - 6 * 3600_000);
+  const patchRaced = await ensureMailSubscription(store, url, { now: nearAgain, graph });
+  setPatchFails(false);
+  assert(patchRaced.action === "recreated", `expected recreated, got ${patchRaced.action}`);
+  assert(
+    calls.some((call) => call.method === "PATCH") && calls.some((call) => call.method === "POST"),
+    "recovery did not try PATCH first and then POST"
   );
 
   // A lapsed record, or one pointing at a different endpoint, must be rebuilt.
@@ -1521,6 +1569,52 @@ await test("v5d. cron renewal (create → keep → renew → recreate when Graph
     "a moved notification URL did not force re-creation"
   );
   assert(renewalDecision(null, url, stillNear) === "create", "an absent record was not created");
+});
+
+// ---- v5f. concurrent upkeep is idempotent --------------------------------
+
+await test("v5f. two racing ensure calls leave exactly one subscription (stale-KV race)", async () => {
+  const url = "https://example.invalid/notifications";
+  const { graph, subs } = memorySubscriptionGraph();
+  const start = new Date("2026-08-18T00:00:00Z");
+
+  // The production incident: upkeep B runs with a stale KV view (its store
+  // never saw upkeep A's write) after A has already created the subscription.
+  // Before the fix, B blindly created a duplicate; now it must consult Graph
+  // and converge — B cannot reuse A's subscription (Graph withholds the
+  // clientState), so it replaces it, but exactly one survives either way.
+  const storeA = createMemoryStateStore("remote");
+  const storeB = createMemoryStateStore("remote");
+  const first = await ensureMailSubscription(storeA, url, { now: start, graph });
+  assert(first.action === "created", `A did ${first.action}, expected created`);
+  const second = await ensureMailSubscription(storeB, url, { now: start, graph });
+  assert(
+    subs.size === 1,
+    `after the stale-KV race Graph holds ${subs.size} subscriptions, expected exactly 1`
+  );
+  assert(
+    subs.has(second.record.id),
+    "the surviving subscription is not the one the last KV write describes — " +
+      "its deliveries could never be validated"
+  );
+
+  // Truly simultaneous bootstrap: both list before either creates, so both
+  // create — and the next upkeep of either sweeps the loser back down to one.
+  subs.clear();
+  const storeC = createMemoryStateStore("remote");
+  const storeD = createMemoryStateStore("remote");
+  const [c, d] = await Promise.all([
+    ensureMailSubscription(storeC, url, { now: start, graph }),
+    ensureMailSubscription(storeD, url, { now: start, graph }),
+  ]);
+  assert(c.action === "created" && d.action === "created", "both bootstraps should create");
+  const nearExpiry = new Date(Date.parse(d.record.expirationDateTime) - 6 * 3600_000);
+  const converged = await ensureMailSubscription(storeD, url, { now: nearExpiry, graph });
+  assert(converged.action === "renewed", `convergence run did ${converged.action}`);
+  assert(
+    subs.size === 1 && subs.has(d.record.id),
+    `the renewal sweep left ${subs.size} subscription(s), expected only ${d.record.id}`
+  );
 });
 
 // ---- v5e. get_mailbox_activity is remote-only ----------------------------
