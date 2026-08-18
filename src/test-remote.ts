@@ -6,8 +6,8 @@
 // round-trip over Streamable HTTP, proof that the mailbox refresh token in KV
 // actually rotates, and the things only the hosted server can do — KV-backed
 // delta positions, MCP resources, a Graph change notification travelling from a
-// real send all the way into get_mailbox_activity, and attachments moving in
-// and out of a mailbox on a server with no filesystem.
+// real send all the way into get_mailbox_activity, and attachments and MIME
+// exports moving in and out of a mailbox on a server with no filesystem.
 //
 // Like the local harness it cleans up after itself — the OAuth client it
 // registers and every grant and token derived from it are deleted from KV, the
@@ -34,13 +34,14 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { PROJECT_ROOT } from "./project-root.js";
 import { installMsalTokenProvider } from "./auth.js";
-import { callGraphServer } from "./core/graph.js";
+import { callGraphServer, callGraphServerBytes } from "./core/graph.js";
 import {
   KV_ACCESS_TOKEN,
   KV_REFRESH_TOKEN,
   STATE_ACTIVITY,
   STATE_SUBSCRIPTION,
   deltaKey,
+  downloadKey,
 } from "./core/kv-keys.js";
 import { DOWNLOAD_ROUTE_PREFIX } from "./core/downloads.js";
 import type { ActivityEntry } from "./core/notifications.js";
@@ -935,6 +936,67 @@ await testAuthed("r19. get_attachment hands out a bearer-gated download link tha
     await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}/permanentDelete`, {
       method: "POST",
     }).catch(() => {});
+  }
+});
+
+// ------------------------------------------- v8: MIME export without a filesystem
+
+await testAuthed("r23. export_message serves a message's MIME through a bearer-gated link", async () => {
+  const inbox = await callGraphServer(
+    "/me/mailFolders/inbox/messages?$top=1&$select=id,subject,internetMessageId"
+  );
+  const message = inbox?.value?.[0];
+  assert(message, "the inbox is empty; no message to export");
+
+  const text = await callTool("export_message", {
+    message_id: message.id,
+    link_ttl_minutes: 1,
+  });
+  assert(!/Saved to:/.test(text), `the hosted server claimed to save a file: ${text}`);
+  const link = text.match(/Download: (\S+)/)?.[1];
+  assert(link, `no download link in the output: ${text}`);
+  assert(
+    link.startsWith(`${BASE_URL}${DOWNLOAD_ROUTE_PREFIX}`) && /\/[0-9a-f]{64}$/.test(link),
+    `the link is not an unguessable id on this Worker: ${link}`
+  );
+  const downloadId = link.slice(link.lastIndexOf("/") + 1);
+
+  try {
+    const anonymous = await fetch(link);
+    assert(anonymous.status === 401, `anonymous download returned ${anonymous.status}, expected 401`);
+
+    const authed = await fetch(link, { headers: { authorization: `Bearer ${bearer}` } });
+    assert(authed.status === 200, `authenticated download returned ${authed.status}`);
+    assert(
+      (authed.headers.get("content-type") ?? "").startsWith("message/rfc822"),
+      `the link does not serve MIME: ${authed.headers.get("content-type")}`
+    );
+    assert(
+      (authed.headers.get("content-disposition") ?? "").includes(".eml"),
+      `content-disposition does not name a .eml: ${authed.headers.get("content-disposition")}`
+    );
+
+    const served = Buffer.from(await authed.arrayBuffer());
+    // Byte-for-byte what Graph hands this machine for the same message.
+    const direct = await callGraphServerBytes(
+      `/me/messages/${encodeURIComponent(message.id)}/$value`
+    );
+    assert(
+      served.equals(Buffer.from(direct.bytes)),
+      `the served MIME is ${served.length} bytes, Graph's own copy is ${direct.bytes.length}`
+    );
+    const separator = served.indexOf("\r\n\r\n");
+    assert(separator > 0, "the served bytes have no RFC 822 header/body separator");
+    if (message.internetMessageId) {
+      assert(
+        served.toString("utf8", 0, separator).includes(message.internetMessageId),
+        "the served MIME is not this message (Message-ID does not match)"
+      );
+    }
+  } finally {
+    // The record would expire on its own within the minute; drop it now so the
+    // run leaves nothing at all in KV.
+    await kvDelete(outlookNs, downloadKey(downloadId));
   }
 });
 
