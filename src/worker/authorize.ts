@@ -252,10 +252,15 @@ async function handleAuthorizePoll(request: Request, env: Env): Promise<Response
 }
 
 /**
- * Non-interactive authorization for the local test harness and CLI tooling.
- * The caller supplies a Microsoft access token it already holds instead of
- * completing the device-code flow in a browser; the allowlist check is the
- * identical one, so this grants nothing an interactive sign-in would not.
+ * Non-interactive authorization for local and test Workers only. The caller
+ * supplies a Microsoft access token it already holds instead of completing the
+ * device-code flow in a browser; the allowlist check is the identical one.
+ *
+ * Reachable only when ALLOW_DIRECT_AUTHORIZE=true (see env.ts), which
+ * production deliberately leaves unset: even allowlist-gated, this path lets
+ * anonymous callers feed arbitrary tokens to Graph through the Worker, and
+ * would turn a leaked (short-lived) Microsoft access token into a persistent
+ * grant without any interactive sign-in.
  */
 async function handleAuthorizeDirect(request: Request, env: Env): Promise<Response> {
   let authRequest: AuthRequest;
@@ -285,7 +290,22 @@ export const defaultHandler = {
 
     if (url.pathname === "/authorize") {
       if (request.method === "GET") return handleAuthorizeStart(request, env);
-      if (request.method === "POST") return handleAuthorizeDirect(request, env);
+      if (request.method === "POST") {
+        // Refused before the request is even parsed unless this Worker is
+        // explicitly a local/test one; the deployed Worker never sets the flag.
+        if (env.ALLOW_DIRECT_AUTHORIZE !== "true") {
+          return json(
+            {
+              status: "failed",
+              detail:
+                "Direct authorization is disabled on this server. " +
+                "Use the interactive sign-in at GET /authorize.",
+            },
+            403
+          );
+        }
+        return handleAuthorizeDirect(request, env);
+      }
       return new Response("Method not allowed", { status: 405 });
     }
     if (url.pathname === "/authorize/poll" && request.method === "GET") {

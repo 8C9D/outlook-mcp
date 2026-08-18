@@ -177,13 +177,70 @@ backstop added beyond the brief (rationale above). Ring-buffer writes are
 read-modify-write without a lock — fine at single-user scale; a Durable
 Object would fix it at scale but was deliberately avoided in Batch 3.
 
+## v6.1 — Production hardening: direct authorize path disabled — PASSED
+
+**Shipped.**
+- `POST /authorize` with a caller-supplied `ms_access_token` (the path the
+  remote harness used to mint bearers non-interactively) is now gated on
+  `ALLOW_DIRECT_AUTHORIZE === "true"` and refused with a `403` "disabled"
+  answer **before the request is parsed**. The flag is deliberately absent
+  from the deployed Worker (not a var, not a secret — `wrangler secret list`
+  re-verified: only the original three), so production authorizes exclusively
+  through the interactive device-code flow. Local `wrangler dev` enables the
+  path via the gitignored `.dev.vars` (flag + mirrors of the three secrets).
+- Remote suite reworked to match: **r5** now asserts the deployed endpoint
+  refuses the direct path (403 + /disabled/i, proving the gate fires before
+  token validation); **r6** drives the real production `/authorize` page —
+  parses the device code and flow id out of the HTML, asks the human running
+  the suite to sign in at microsoft.com/devicelogin, polls `/authorize/poll`.
+  Headless runs (no TTY, or `MCP_REMOTE_HEADLESS=1`) report the ten
+  bearer-dependent tests as SKIP; `MCP_REMOTE_INTERACTIVE=1` forces the
+  interactive path.
+- Docs: README (security-model bullet, allowlist section, `test:remote`
+  description, setup snippet warning) and ASSUMPTIONS.md ("v6.1: production
+  hardening" section; the old "deviation worth flagging" bullet marked
+  superseded).
+
+**Gate review.**
+- `npm run typecheck` (both tsconfigs) clean.
+- Gate verified both ways against `wrangler dev --local` before deploying:
+  with the flag, DCR + a real MSAL token completed a full direct
+  authorization (`status: "ok"` with a code); without `.dev.vars`, the same
+  POST got the 403 "disabled" answer.
+- Deployed (version `a3417b80`); live probe of the deployed `/authorize`
+  confirmed the 403; remote suite **20/20** headless (10 passed live, 10
+  SKIP pending an interactive sign-in), including the new r5.
+- Webhook state re-verified live after the deploy: subscription
+  `95f07422-d465-455d-b03f-14d098692d93` on
+  `/me/mailFolders('inbox')/messages`, notification URL correct, expiry
+  2026-08-21T17:31:56Z (future), no `renewedAt` yet (fresh from the Batch 4
+  run); cron `17 */6 * * *` present in the deploy output's trigger list.
+
+**Assumptions / deviations of consequence.**
+- Disabling the direct path removes headless bearer acquisition *by design*;
+  full authenticated remote coverage now costs one interactive device-code
+  sign-in per run. Judged the right trade: the path let anonymous callers
+  relay arbitrary tokens to Graph and could turn a leaked short-lived
+  Microsoft access token into a persistent grant.
+- Found while re-verifying the webhook: Graph held **four** subscriptions,
+  all created within one second (2026-08-18T19:31:56Z, during the Batch 4
+  remote run) — the request-time upkeep backstop raced itself across
+  concurrent authenticated requests while KV reads were still stale, and
+  each created a subscription; the last KV write won. Harmless in effect
+  (the three orphans' deliveries fail the clientState check and are
+  discarded, and they expire 2026-08-21 with nothing renewing them), but it
+  is a real unlocked-check-then-act race, kin to the ring-buffer caveat in
+  Batch 4. Orphan deletion was prepared but not executed (tool-permission
+  gate); left for the user to run or to let them lapse.
+
 ## Final state
 
 - **Version 0.6.0** — 23 tools, 2 prompts, 2 resources, two transports.
 - Local: `node dist/server.js` (Claude Desktop), MSAL + disk cache.
 - Remote: **https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp** —
-  OAuth-gated (single-user allowlist), tokens in Workers KV with refresh
-  rotation, live inbox webhook subscription with cron renewal.
+  OAuth-gated (single-user allowlist, interactive device-code sign-in only in
+  production as of v6.1), tokens in Workers KV with refresh rotation, live
+  inbox webhook subscription with cron renewal.
 - All four gates passed with the orchestrator re-running every check.
 - Run totals: local harness 19/19 → 28/28; remote suite 0 → 20/20.
 

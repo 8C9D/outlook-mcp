@@ -15,6 +15,15 @@
 // nothing is left. The mail subscription itself is deliberately NOT torn down:
 // it is the production subscription for the real inbox, not a test artifact.
 //
+// The deployed Worker refuses the non-interactive POST-with-ms_access_token
+// authorize path (r5 asserts exactly that), so the bearer that the
+// authenticated tests need can only come from a real device-code sign-in.
+// When run in a terminal (or with MCP_REMOTE_INTERACTIVE=1) r6 drives the
+// production /authorize page and waits for the owner to enter the code at
+// microsoft.com/devicelogin; in a headless run (no TTY, or
+// MCP_REMOTE_HEADLESS=1) the bearer-dependent tests are reported as SKIP and
+// everything unauthenticated still runs.
+//
 // Prerequisites: `npm run deploy`, the three wrangler secrets, and `npm run
 // seed:kv`. Run with `npm run test:remote`.
 import { spawn } from "node:child_process";
@@ -23,7 +32,7 @@ import os from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { PROJECT_ROOT } from "./project-root.js";
-import { installMsalTokenProvider, getAccessTokenSilent } from "./auth.js";
+import { installMsalTokenProvider } from "./auth.js";
 import { callGraphServer } from "./core/graph.js";
 import {
   KV_ACCESS_TOKEN,
@@ -41,7 +50,7 @@ const BASE_URL = process.env.MCP_REMOTE_URL ?? "https://outlook-mcp.arthur-yuhao
 const MCP_URL = `${BASE_URL}/mcp`;
 const TEST_CLIENT_NAME = "[MCP TEST] remote harness";
 
-type Outcome = { name: string; passed: boolean; detail?: string };
+type Outcome = { name: string; passed: boolean; skipped?: boolean; detail?: string };
 const outcomes: Outcome[] = [];
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
@@ -54,6 +63,29 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
     outcomes.push({ name, passed: false, detail });
     console.log(`FAIL  ${name}\n      ${detail.split("\n").join("\n      ")}`);
   }
+}
+
+function skip(name: string, why: string): void {
+  outcomes.push({ name, passed: true, skipped: true, detail: why });
+  console.log(`SKIP  ${name}\n      ${why}`);
+}
+
+// Production only authorizes through the interactive device-code flow, so the
+// authenticated tests need a human to enter a code at microsoft.com/devicelogin.
+// A TTY implies one is present; MCP_REMOTE_INTERACTIVE / MCP_REMOTE_HEADLESS
+// override the guess in either direction.
+const interactive =
+  process.env.MCP_REMOTE_INTERACTIVE === "1" ||
+  (process.stdout.isTTY === true && process.env.MCP_REMOTE_HEADLESS !== "1");
+const HEADLESS_SKIP =
+  "needs a bearer, and only an interactive device-code sign-in can mint one against " +
+  "production (the direct authorize path is disabled there) — rerun in a terminal or " +
+  "with MCP_REMOTE_INTERACTIVE=1";
+
+/** A test that needs the bearer from r6: reported as SKIP in headless runs. */
+async function testAuthed(name: string, fn: () => Promise<void>): Promise<void> {
+  if (!interactive) return skip(name, HEADLESS_SKIP);
+  return test(name, fn);
 }
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -336,51 +368,72 @@ function authorizeUrl(codeChallenge: string, state: string): string {
   return url.toString();
 }
 
-await test("r5. authorization refuses an identity it cannot verify (allowlist gate)", async () => {
+await test("r5. the direct POST-with-token authorize path is disabled in production", async () => {
   assert(registeredClientId, "no registered client (r4 must pass first)");
   const verifier = base64url(randomBytes(32));
   const challenge = base64url(createHash("sha256").update(verifier).digest());
-  const response = await fetch(authorizeUrl(challenge, "state-reject"), {
+  // The value of the token must never matter: the deployed Worker has
+  // ALLOW_DIRECT_AUTHORIZE unset, so the request is refused before the token
+  // is looked at (a live token would be refused identically).
+  const response = await fetch(authorizeUrl(challenge, "state-direct"), {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ ms_access_token: "definitely-not-a-microsoft-token" }),
+    body: new URLSearchParams({ ms_access_token: "any-value-must-not-matter" }),
   });
   assert(
-    response.status === 401,
-    `an unverifiable Microsoft token was answered with ${response.status}, expected 401`
+    response.status === 403,
+    `POST /authorize with an ms_access_token returned ${response.status}, expected 403 — ` +
+      "the direct authorization path must be disabled on the deployed Worker"
   );
   const body = (await response.json()) as any;
   assert(body.status === "failed", `expected status "failed", got ${JSON.stringify(body)}`);
+  assert(
+    /disabled/i.test(body.detail ?? ""),
+    `the refusal must say the path is disabled, not that the token is bad: ${JSON.stringify(body)}`
+  );
 });
 
-let codeVerifier = "";
-
-await test("r6. the owner's Microsoft identity completes authorization and yields a bearer", async () => {
+await testAuthed("r6. an interactive device-code sign-in completes authorization and yields a bearer", async () => {
   assert(registeredClientId, "no registered client (r4 must pass first)");
-  codeVerifier = base64url(randomBytes(32));
+  const codeVerifier = base64url(randomBytes(32));
   const challenge = base64url(createHash("sha256").update(codeVerifier).digest());
   const state = "state-" + randomBytes(6).toString("hex");
 
-  // Stands in for the browser device-code sign-in: the same Graph /me allowlist
-  // check runs, using a Microsoft token this machine already holds.
-  const msAccessToken = await getAccessTokenSilent();
-  const authorizeResponse = await fetch(authorizeUrl(challenge, state), {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ ms_access_token: msAccessToken }),
-  });
-  const authorizeBody = await authorizeResponse.text();
-  assert(
-    authorizeResponse.ok,
-    `authorize failed: HTTP ${authorizeResponse.status} ${authorizeBody}`
-  );
-  const authorized = JSON.parse(authorizeBody) as any;
-  assert(authorized.status === "ok", `authorize said ${JSON.stringify(authorized)}`);
+  // GET /authorize starts a real device-code flow and renders the user code;
+  // pull the code, the verification URL and the flow id out of the page and
+  // ask the human running this suite to complete the sign-in.
+  const pageResponse = await fetch(authorizeUrl(challenge, state));
+  const pageBody = await pageResponse.text();
+  assert(pageResponse.ok, `GET /authorize failed: HTTP ${pageResponse.status} ${pageBody.slice(0, 300)}`);
+  const userCode = pageBody.match(/<code id="code">([^<]+)<\/code>/)?.[1];
+  const verificationUri = pageBody.match(/<a href="([^"]+)" target="_blank"/)?.[1];
+  const flowId = pageBody.match(/const flow = "([^"]+)"/)?.[1];
+  assert(userCode && verificationUri && flowId, `could not parse the /authorize page: ${pageBody.slice(0, 500)}`);
 
-  const redirect = new URL(authorized.redirectTo);
+  console.log(`\n      ACTION REQUIRED: open ${verificationUri} and enter the code ${userCode},`);
+  console.log("      signing in as the mailbox owner. Waiting up to 10 minutes...\n");
+
+  // Poll exactly as the page's own script does, until the sign-in lands.
+  const deadline = Date.now() + 600_000;
+  let redirectTo: string | undefined;
+  for (;;) {
+    const pollResponse = await fetch(
+      `${BASE_URL}/authorize/poll?flow=${encodeURIComponent(flowId)}`
+    );
+    const poll = (await pollResponse.json()) as any;
+    if (poll.status === "ok") {
+      redirectTo = poll.redirectTo;
+      break;
+    }
+    assert(poll.status === "pending", `authorization failed: ${JSON.stringify(poll)}`);
+    assert(Date.now() < deadline, "timed out waiting for the device-code sign-in");
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+
+  const redirect = new URL(redirectTo!);
   assert(redirect.searchParams.get("state") === state, "authorization returned the wrong state");
   const code = redirect.searchParams.get("code");
-  assert(code, `no authorization code in ${authorized.redirectTo}`);
+  assert(code, `no authorization code in ${redirectTo}`);
 
   const tokenResponse = await fetch(`${BASE_URL}/oauth/token`, {
     method: "POST",
@@ -419,7 +472,7 @@ await test("r7. token exchange rejects a wrong PKCE verifier", async () => {
   assert(response.status >= 400, `a bogus code was accepted with HTTP ${response.status}`);
 });
 
-await test("r8. initialize over Streamable HTTP reports this server", async () => {
+await testAuthed("r8. initialize over Streamable HTTP reports this server", async () => {
   assert(bearer, "no bearer token (r6 must pass first)");
   const response = await mcpCall(bearer!, "initialize", INIT_PARAMS);
   const result = resultOf(response, "initialize");
@@ -432,7 +485,7 @@ await test("r8. initialize over Streamable HTTP reports this server", async () =
   );
 });
 
-await test(`r9. tools/list serves all ${TOOLS.length} tools, identical to the stdio surface`, async () => {
+await testAuthed(`r9. tools/list serves all ${TOOLS.length} tools, identical to the stdio surface`, async () => {
   assert(bearer, "no bearer token");
   const result = resultOf(await mcpCall(bearer!, "tools/list"), "tools/list");
   const remoteNames = (result.tools as { name: string }[]).map((t) => t.name).sort();
@@ -447,7 +500,7 @@ await test(`r9. tools/list serves all ${TOOLS.length} tools, identical to the st
   );
 });
 
-await test("r10. prompts/list serves both prompts", async () => {
+await testAuthed("r10. prompts/list serves both prompts", async () => {
   assert(bearer, "no bearer token");
   const result = resultOf(await mcpCall(bearer!, "prompts/list"), "prompts/list");
   const names = (result.prompts as { name: string }[]).map((p) => p.name).sort();
@@ -457,7 +510,7 @@ await test("r10. prompts/list serves both prompts", async () => {
   );
 });
 
-await test("r11. tools/call list_events reaches Graph through the KV token", async () => {
+await testAuthed("r11. tools/call list_events reaches Graph through the KV token", async () => {
   assert(bearer, "no bearer token");
   const result = resultOf(
     await mcpCall(bearer!, "tools/call", { name: "list_events", arguments: { days: 3 } }),
@@ -471,7 +524,7 @@ await test("r11. tools/call list_events reaches Graph through the KV token", asy
   );
 });
 
-await test("r12. the mailbox refresh token in KV rotates on every exchange", async () => {
+await testAuthed("r12. the mailbox refresh token in KV rotates on every exchange", async () => {
   assert(bearer, "no bearer token");
   const before = await kvGet(outlookNs, KV_REFRESH_TOKEN);
   assert(before, `${KV_REFRESH_TOKEN} is missing from KV — run \`npm run seed:kv\``);
@@ -558,7 +611,7 @@ await test("r13. the notification endpoint is public, echoes the handshake, and 
   );
 });
 
-await test("r14. resources/list and resources/read serve the same two resources as stdio", async () => {
+await testAuthed("r14. resources/list and resources/read serve the same two resources as stdio", async () => {
   assert(bearer, "no bearer token");
   const result = resultOf(await mcpCall(bearer!, "resources/list"), "resources/list");
   const uris = (result.resources as { uri: string }[]).map((r) => r.uri).sort();
@@ -580,7 +633,7 @@ await test("r14. resources/list and resources/read serve the same two resources 
   );
 });
 
-await test("r15. check_new_mail keeps its delta position in KV between requests", async () => {
+await testAuthed("r15. check_new_mail keeps its delta position in KV between requests", async () => {
   // The stateless Worker builds a new server per POST, so the only thing that
   // can carry a delta position between calls is KV.
   v6.deltaBefore = await kvGet(outlookNs, deltaKey("inbox"));
@@ -674,7 +727,7 @@ await test("r16. a mail subscription exists, points here, and expires in the fut
   );
 });
 
-await test("r17. end-to-end: a message sent to this mailbox shows up in get_mailbox_activity", async () => {
+await testAuthed("r17. end-to-end: a message sent to this mailbox shows up in get_mailbox_activity", async () => {
   v6.activityBefore = JSON.parse((await kvGet(outlookNs, STATE_ACTIVITY)) || "[]") as ActivityEntry[];
 
   const subject = `${TEST_PREFIX} v6 webhook ${randomBytes(4).toString("hex")}`;
@@ -781,7 +834,7 @@ await test("r19. cleanup: every OAuth record this run created is deleted", async
   );
 });
 
-await test("r20. final sweep: the revoked bearer no longer opens /mcp", async () => {
+await testAuthed("r20. final sweep: the revoked bearer no longer opens /mcp", async () => {
   assert(bearer, "no bearer token");
   // KV caches reads at the edge for up to a minute, so a just-deleted token can
   // still validate briefly. Poll rather than accept that as a pass.
@@ -795,7 +848,14 @@ await test("r20. final sweep: the revoked bearer no longer opens /mcp", async ()
 });
 
 const passed = outcomes.filter((o) => o.passed).length;
-console.log(`\n${passed}/${outcomes.length} remote tests passed.`);
+const skipped = outcomes.filter((o) => o.skipped).length;
+console.log(
+  `\n${passed}/${outcomes.length} remote tests passed` +
+    (skipped
+      ? ` (${skipped} skipped — the authenticated surface needs an interactive device-code sign-in)`
+      : "") +
+    "."
+);
 if (passed !== outcomes.length) {
   for (const outcome of outcomes.filter((o) => !o.passed)) {
     console.log(`  FAILED: ${outcome.name}`);

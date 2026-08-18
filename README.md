@@ -198,6 +198,10 @@ can contain text that tries to instruct the model into sending, deleting, or for
   setup — can complete an authorization. A remote connector runs the same tools with the same
   approval expectations; the caveats above apply there too, and claude.ai's own tool-approval
   prompts are the equivalent safety boundary.
+- **In production, authorization is interactive-only.** The non-interactive `POST /authorize` path
+  (caller-supplied `ms_access_token`) exists for local and test Workers behind the
+  `ALLOW_DIRECT_AUTHORIZE` flag, which the deployed Worker never sets — it refuses that path with
+  `403` before parsing the request, asserted live by remote test `r5`.
 
 ## Login and re-authentication
 
@@ -233,10 +237,14 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 - `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
 - `npm run seed:kv` — push the current Microsoft refresh token from `.token-cache.json` into Workers KV.
 - `npm run deploy` — deploy the Worker to Cloudflare.
-- `npm run test:remote` — live tests against the deployed endpoint (discovery, anonymous rejection, a
-  full OAuth exchange, an MCP round-trip, refresh-token rotation, resources, the KV-backed delta
-  position, the subscription's health, and a full change-notification round trip); cleans up every KV
-  record, ring-buffer entry and probe message it creates, leaving the production subscription alone.
+- `npm run test:remote` — live tests against the deployed endpoint (discovery, anonymous rejection,
+  refusal of the direct authorize path, a full OAuth exchange, an MCP round-trip, refresh-token
+  rotation, resources, the KV-backed delta position, the subscription's health, and a full
+  change-notification round trip); cleans up every KV record, ring-buffer entry and probe message it
+  creates, leaving the production subscription alone. Because production only authorizes through the
+  interactive device-code flow, the authenticated checks ask you to enter a code at
+  microsoft.com/devicelogin when run in a terminal (force with `MCP_REMOTE_INTERACTIVE=1`); in a
+  headless run they are reported as SKIP and everything unauthenticated still runs.
 
 ## Remote deployment
 
@@ -290,6 +298,13 @@ Entra app registration is a public native client with no web redirect URI, and d
 none, so nothing about the registration had to change. `/authorize` shows a code to enter at
 microsoft.com/devicelogin and polls until sign-in completes. That Microsoft token is used only to
 read `/me` and is never stored.
+
+A second, non-interactive path — `POST /authorize` with an `ms_access_token` form field the caller
+already holds — exists for local and test Workers, but is **disabled in production**: it runs only
+when the `ALLOW_DIRECT_AUTHORIZE` binding is exactly `"true"`, and the deployed Worker sets it
+neither as a var nor as a secret, so the request is refused with `403` before it is even parsed.
+Local `wrangler dev` runs enable it via the gitignored `.dev.vars`. Test `r5` asserts the deployed
+endpoint refuses this path.
 
 ### Token storage
 
@@ -350,6 +365,8 @@ npm run deploy                                 # prints the workers.dev URL
 printf '%s' "<Entra application (client) id>"   | npx wrangler secret put MS_CLIENT_ID
 printf '%s' "<Graph /me id>"                    | npx wrangler secret put ALLOWED_MS_USER_ID
 printf '%s' "<userPrincipalName / mail>"        | npx wrangler secret put ALLOWED_MS_UPN
+# Do NOT set ALLOW_DIRECT_AUTHORIZE on the deployed Worker — leaving it unset
+# is what keeps the non-interactive authorize path disabled in production.
 
 npm run seed:kv        # pushes the refresh token into KV; prints the two allowlist values
 npm run test:remote    # 20 live checks against the deployed endpoint

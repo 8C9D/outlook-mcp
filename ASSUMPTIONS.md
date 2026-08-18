@@ -351,15 +351,17 @@ touched in this batch.
   token, so both forms are checked. Every authorization path funnels through this one function, and
   `mcp-handler.ts` re-checks `props.userId` against the allowlist as defence in depth (it catches a
   grant minted before the allowlist was narrowed).
-- **Deviation worth flagging:** `/authorize` also accepts `POST` with an `ms_access_token` form field,
-  which runs the identical Graph `/me` allowlist check and completes the authorization without a
-  browser. This exists so the remote harness can drive a *real* OAuth exchange (DCR → authorize →
-  PKCE token exchange) non-interactively; a device-code sign-in cannot be automated. It is not a
-  bypass: it demands a live Microsoft access token for the allowlisted account, and anyone holding
-  one already has the mailbox. It was preferred over a static test bearer secret precisely because it
-  reuses the real gate instead of adding a second credential path. Note that MSA access tokens are
-  opaque (not JWTs), so the token cannot be additionally checked for `appid` — validation is
-  necessarily "does Graph accept it, and for whom".
+- **Deviation worth flagging (since gated — see "v6.1: production hardening" below):** `/authorize`
+  also accepts `POST` with an `ms_access_token` form field, which runs the identical Graph `/me`
+  allowlist check and completes the authorization without a browser. This exists so the remote
+  harness can drive a *real* OAuth exchange (DCR → authorize → PKCE token exchange)
+  non-interactively; a device-code sign-in cannot be automated. It is not a bypass: it demands a
+  live Microsoft access token for the allowlisted account, and anyone holding one already has the
+  mailbox. It was preferred over a static test bearer secret precisely because it reuses the real
+  gate instead of adding a second credential path. Note that MSA access tokens are opaque (not
+  JWTs), so the token cannot be additionally checked for `appid` — validation is necessarily "does
+  Graph accept it, and for whom". As of v6.1 this path only runs when `ALLOW_DIRECT_AUTHORIZE=true`,
+  which production never sets.
 
 ### Token handling
 - MSAL Node does not run on workerd, so `src/worker/ms-token.ts` issues the refresh-token grant
@@ -536,3 +538,44 @@ touched in this batch.
   `clientState`, renewal, `PUBLIC_BASE_URL`), and a security-model bullet for the one public route.
 - `PUBLIC_BASE_URL` is a `vars` entry rather than a secret: it is a hostname, it must match the
   deployment, and having it in the committed config is what makes the notification URL reviewable.
+
+## v6.1: production hardening — the direct authorize path is now disabled in production
+
+### The change
+- `POST /authorize` with an `ms_access_token` form field (the non-interactive path the remote
+  harness used) is now gated on a new binding, `ALLOW_DIRECT_AUTHORIZE`. Unless it is exactly the
+  string `"true"`, the Worker answers `403` with a "disabled" detail **before parsing anything** —
+  no auth-request parsing, no form read, no Graph call. The flag is deliberately absent from the
+  deployed Worker (neither a `vars` entry in `wrangler.jsonc` nor a secret), so production only
+  authorizes through the interactive device-code flow. Local `wrangler dev` runs enable it via the
+  gitignored `.dev.vars`.
+- Why, given the path was already allowlist-gated: (1) it let anonymous callers make the Worker
+  forward arbitrary attacker-supplied tokens to Graph, making the endpoint a token-validation
+  oracle; (2) it would convert a leaked *short-lived* Microsoft access token into a persistent MCP
+  grant with no interactive sign-in — the device-code flow requires a live sign-in the token holder
+  may not be able to perform; (3) production should not carry test-only affordances at all.
+- Presence-plus-value (`=== "true"`) rather than mere presence was chosen so an accidentally set but
+  falsy value (`"false"`, `"0"`, empty) still means disabled.
+
+### Consequences for the remote suite
+- r5 changed meaning: it used to prove the allowlist refused a bogus token on this path; it now
+  asserts the deployed endpoint refuses the path outright (`403` + a detail matching /disabled/i,
+  which also proves the gate fires before token validation — a bad token used to earn a `401`).
+- r6 could no longer POST a locally held Microsoft token to production, so the bearer for the
+  authenticated tests (r6, r8–r12, r14, r15, r17, r20) now comes from driving the *real* device-code
+  flow: r6 fetches the production `/authorize` page, parses the user code, verification URL and flow
+  id out of the HTML, asks the human running the suite to enter the code at
+  microsoft.com/devicelogin, and polls `/authorize/poll` (10-minute bound) exactly as the page's own
+  script does. This is strictly more end-to-end than before — the browser flow itself is now
+  exercised.
+- A device-code sign-in cannot be automated, so in a headless run (no TTY, or
+  `MCP_REMOTE_HEADLESS=1`; force interactive with `MCP_REMOTE_INTERACTIVE=1`) the bearer-dependent
+  tests are reported as `SKIP` (counted as passed, listed in the summary) and everything
+  unauthenticated still runs: r1–r5, r7 (PKCE rejection needs no bearer), r13 (webhook handshake),
+  r16 (subscription health via local Graph + KV), r18/r19 (cleanup, both idempotent when nothing
+  authenticated ran).
+- `.dev.vars` (gitignored, never deployed) now holds `ALLOW_DIRECT_AUTHORIZE=true` plus mirrors of
+  the three wrangler secrets, so a local `wrangler dev` Worker can run the full direct-path exchange.
+  Verified both ways against `wrangler dev --local` before deploying: with the flag, a registered
+  client plus a real MSAL token completed authorization (`status: "ok"` with a code); without
+  `.dev.vars`, the same POST got the `403` "disabled" answer.
