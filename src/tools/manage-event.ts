@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { callGraphServer } from "../graph.js";
+import { callGraphServer } from "../core/graph.js";
 import { TIMEZONE, TZ_PREFER, ToolResult, errorResult, runTool, textResult } from "./common.js";
 import { toGraphDateTime } from "./create-event.js";
 import { addDays } from "./list-events.js";

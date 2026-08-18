@@ -1,4 +1,7 @@
-import { getAccessToken, getAccessTokenSilent } from "./auth.js";
+// Microsoft Graph transport. Deliberately free of Node-only imports: this module
+// is bundled into the Cloudflare Worker as well as the stdio server, so it asks
+// core/token.js for a token rather than knowing how one is obtained.
+import { getAccessTokenSilent } from "./token.js";
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
@@ -23,7 +26,7 @@ export class GraphError extends Error {
   }
 }
 
-async function callGraphWithToken(
+export async function callGraphWithToken(
   getToken: () => Promise<string>,
   path: string,
   init?: RequestInit
@@ -62,11 +65,6 @@ async function callGraphWithToken(
   if (response.status === 204) return null;
   const text = await response.text();
   return text ? JSON.parse(text) : null;
-}
-
-/** Interactive-capable Graph call (may trigger device-code sign-in). For CLI scripts only. */
-export async function callGraph(path: string, init?: RequestInit): Promise<any> {
-  return callGraphWithToken(getAccessToken, path, init);
 }
 
 /**

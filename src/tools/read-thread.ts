@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { GraphError } from "../graph.js";
+import { GraphError } from "../core/graph.js";
 import {
   TZ_PREFER,
   ToolResult,

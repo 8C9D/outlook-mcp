@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { callGraphServer } from "../graph.js";
+import { callGraphServer } from "../core/graph.js";
 import { ToolResult, errorResult, runTool, textResult, toRecipients } from "./common.js";
 
 // NOTE: Sending is two-step by structure. This tool only composes drafts;

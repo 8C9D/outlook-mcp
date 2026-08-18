@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { GraphError, callGraphServer } from "../graph.js";
+import { GraphError, callGraphServer } from "../core/graph.js";
 import {
   ToolResult,
   errorResult,

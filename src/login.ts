@@ -2,7 +2,7 @@
 // caching tokens. This is the ONLY entry point that may prompt for sign-in;
 // the MCP server itself never initiates authentication.
 import { getAccessToken } from "./auth.js";
-import { callGraph } from "./graph.js";
+import { callGraph } from "./graph-interactive.js";
 
 try {
   await getAccessToken();

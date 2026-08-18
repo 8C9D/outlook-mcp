@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { callGraphServer } from "../graph.js";
+import { callGraphServer } from "../core/graph.js";
 import {
   TZ_PREFER,
   ToolResult,

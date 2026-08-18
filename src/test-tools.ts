@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { GraphError, callGraphServer, graphRequestLog } from "./graph.js";
+import { GraphError, callGraphServer, graphRequestLog } from "./core/graph.js";
 import { PROJECT_ROOT } from "./project-root.js";
 import { searchMailHandler } from "./tools/search-mail.js";
 import { readThreadHandler } from "./tools/read-thread.js";
@@ -32,6 +32,11 @@ import { manageCategoriesHandler } from "./tools/manage-categories.js";
 import { listTasksHandler, resolveTaskList } from "./tools/list-tasks.js";
 import { manageTaskHandler } from "./tools/manage-task.js";
 import type { ToolResult } from "./tools/common.js";
+import { installMsalTokenProvider } from "./auth.js";
+
+// Tool handlers reach Graph through core/token.js; in Node the token comes from
+// MSAL and the disk cache, exactly as under the stdio server.
+installMsalTokenProvider();
 
 const TEST_PREFIX = "[MCP TEST]";
 
