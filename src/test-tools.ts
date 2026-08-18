@@ -33,6 +33,10 @@ import { createFolderHandler } from "./tools/create-folder.js";
 import { manageCategoriesHandler } from "./tools/manage-categories.js";
 import { listTasksHandler, resolveTaskList } from "./tools/list-tasks.js";
 import { manageTaskHandler } from "./tools/manage-task.js";
+import { manageSendersHandler } from "./tools/manage-senders.js";
+import { mailboxSettingsHandler } from "./tools/mailbox-settings.js";
+import { exportMessageHandler } from "./tools/export-message.js";
+import { SAVE_DIR } from "./tools/save-local.js";
 import { checkNewMailHandler } from "./tools/check-new-mail.js";
 import { getMailboxActivityHandler } from "./tools/get-mailbox-activity.js";
 import {
@@ -202,6 +206,33 @@ async function purgeTestCalendars(): Promise<void> {
   }
 }
 
+/** TEST-ONLY: remove any [MCP TEST] To Do lists, tasks and all.
+ * manage_task deliberately cannot delete a list (it would destroy the tasks in
+ * it with no recoverable copy), so the harness cleans up its own lists with a
+ * raw Graph DELETE rather than through the tool surface. */
+async function purgeTestTaskLists(): Promise<void> {
+  const lists = await callGraphServer("/me/todo/lists?$top=100");
+  for (const list of lists?.value ?? []) {
+    if (String(list.displayName ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/todo/lists/${encodeURIComponent(list.id)}`, { method: "DELETE" });
+    }
+  }
+}
+
+/** TEST-ONLY: remove any Focused-Inbox override this harness created. */
+async function purgeTestFocusOverrides(): Promise<void> {
+  const data = await callGraphServer("/me/inferenceClassification/overrides?$top=100");
+  for (const override of data?.value ?? []) {
+    const address = String(override.senderEmailAddress?.address ?? "");
+    if (address === FOCUS_TEST_SENDER || address.startsWith("mcp-test-")) {
+      await callGraphServer(
+        `/me/inferenceClassification/overrides/${encodeURIComponent(override.id)}`,
+        { method: "DELETE" }
+      );
+    }
+  }
+}
+
 /** TEST-ONLY: remove any [MCP TEST] To Do tasks, across every list. */
 async function purgeTestTasks(): Promise<void> {
   const lists = await callGraphServer("/me/todo/lists?$top=100");
@@ -237,6 +268,8 @@ const state: {
   sentId?: string;
   testFolderId?: string;
   savedAutoReply?: any;
+  savedWorkingHours?: any;
+  exportedEmlPath?: string;
   tempDir?: string;
 } = {};
 
@@ -2182,6 +2215,515 @@ await test("v7e. calendars (list_calendars → create in a named calendar with a
   }
 });
 
+// ---- v8a. To Do depth: lists, recurrence, subtasks ------------------------
+
+await test("v8a. task depth (create list → repeating task → subtasks add/complete/remove → rename list)", async () => {
+  const listName = `${TEST_PREFIX} v8 list`;
+  const renamedList = `${TEST_PREFIX} v8 list renamed`;
+  const dueDate = addDays(torontoToday(), 3);
+
+  const createListText = toolText(
+    await manageTaskHandler({ action: "create_list", list_name: listName }),
+    "manage_task create_list"
+  );
+  const listId = createListText.match(/List id: (\S+)/)?.[1];
+  assert(listId, `no list id in the output: ${createListText}`);
+
+  try {
+    // A second list of the same name is refused rather than silently duplicated.
+    const dup = expectError(
+      await manageTaskHandler({ action: "create_list", list_name: listName }),
+      "manage_task create_list (duplicate)"
+    );
+    assert(/already exists/i.test(dup), `Unexpected duplicate-list error: ${dup}`);
+
+    const createText = toolText(
+      await manageTaskHandler({
+        action: "create",
+        task_list: listName,
+        title: `${TEST_PREFIX} weekly task`,
+        due_date: dueDate,
+        recurrence: { frequency: "weekly", weekdays: ["monday"] },
+      }),
+      "manage_task create (recurring)"
+    );
+    assert(/Repeats week\(s\) on monday/.test(createText), `Repeat not reported: ${createText}`);
+    const taskId = createText.match(/Task id: (\S+)/)?.[1];
+    assert(taskId, `no task id in the output: ${createText}`);
+
+    // Graph's own view: the task really is in the new list and really repeats.
+    const raw = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`
+    );
+    assert(
+      raw?.recurrence?.pattern?.type === "weekly",
+      `Graph does not show a weekly recurrence: ${JSON.stringify(raw?.recurrence)}`
+    );
+
+    // A repeating task needs a due date, and recurrence cannot be changed later.
+    const noDue = expectError(
+      await manageTaskHandler({
+        action: "create",
+        task_list: listName,
+        title: `${TEST_PREFIX} undated repeat`,
+        recurrence: { frequency: "daily" },
+      }),
+      "manage_task create (recurrence without due_date)"
+    );
+    assert(/needs due_date/i.test(noDue), `Unexpected error: ${noDue}`);
+    const changeRepeat = expectError(
+      await manageTaskHandler({
+        action: "update",
+        task_list: listName,
+        task_id: taskId,
+        recurrence: { frequency: "daily" },
+      }),
+      "manage_task update (recurrence)"
+    );
+    assert(
+      /only be set when the task is created/i.test(changeRepeat),
+      `Unexpected error: ${changeRepeat}`
+    );
+
+    // Subtasks: add two, complete one by text, remove one by id.
+    const addOne = toolText(
+      await manageTaskHandler({
+        action: "add_subtask",
+        task_list: listName,
+        task_id: taskId,
+        subtask: "first step",
+      }),
+      "manage_task add_subtask"
+    );
+    const subtaskId = addOne.match(/Subtask id: (\S+)/)?.[1];
+    assert(subtaskId, `no subtask id in the output: ${addOne}`);
+    toolText(
+      await manageTaskHandler({
+        action: "add_subtask",
+        task_list: listName,
+        task_id: taskId,
+        subtask: "second step",
+      }),
+      "manage_task add_subtask (2)"
+    );
+
+    const completed = toolText(
+      await manageTaskHandler({
+        action: "complete_subtask",
+        task_list: listName,
+        task_id: taskId,
+        subtask: "first step",
+      }),
+      "manage_task complete_subtask"
+    );
+    assert(/Subtasks \(1\/2 done\)/.test(completed), `Checklist not rendered: ${completed}`);
+    assert(/\[x\] first step/.test(completed), `Completed item not ticked: ${completed}`);
+
+    const listed = toolText(
+      await listTasksHandler({ task_list: listName, include_subtasks: true }),
+      "list_tasks include_subtasks"
+    );
+    assert(/repeating/.test(listed), `list_tasks does not flag the repeat: ${listed}`);
+    assert(/1\/2 subtasks done/.test(listed), `list_tasks does not count subtasks: ${listed}`);
+    assert(
+      listed.includes(`subtask id: ${subtaskId}`),
+      `list_tasks does not carry subtask ids: ${listed}`
+    );
+
+    const removed = toolText(
+      await manageTaskHandler({
+        action: "remove_subtask",
+        task_list: listName,
+        task_id: taskId,
+        subtask_id: subtaskId,
+      }),
+      "manage_task remove_subtask"
+    );
+    assert(/Subtasks \(0\/1 done\)/.test(removed), `Checklist after removal is wrong: ${removed}`);
+    const remaining = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}/checklistItems`
+    );
+    assert(
+      (remaining?.value ?? []).length === 1 &&
+        remaining.value[0].displayName === "second step",
+      `Graph shows the wrong checklist: ${JSON.stringify(remaining?.value)}`
+    );
+
+    const unknownSubtask = expectError(
+      await manageTaskHandler({
+        action: "complete_subtask",
+        task_list: listName,
+        task_id: taskId,
+        subtask: "no such step",
+      }),
+      "manage_task complete_subtask (unknown)"
+    );
+    assert(/No subtask reading/i.test(unknownSubtask), `Unexpected error: ${unknownSubtask}`);
+
+    // Stopping the repeat is the one recurrence change To Do accepts.
+    const stopped = toolText(
+      await manageTaskHandler({
+        action: "update",
+        task_list: listName,
+        task_id: taskId,
+        clear_recurrence: true,
+      }),
+      "manage_task update (clear_recurrence)"
+    );
+    assert(/Repeat: off/.test(stopped), `Repeat-off not reported: ${stopped}`);
+    const afterStop = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`
+    );
+    assert(!afterStop?.recurrence, `the task still repeats: ${JSON.stringify(afterStop?.recurrence)}`);
+
+    // Renaming keeps the same list (and its tasks).
+    const renameText = toolText(
+      await manageTaskHandler({
+        action: "rename_list",
+        task_list: listName,
+        list_name: renamedList,
+      }),
+      "manage_task rename_list"
+    );
+    assert(renameText.includes(renamedList), `Rename output is wrong: ${renameText}`);
+    const listAfter = await callGraphServer(`/me/todo/lists/${encodeURIComponent(listId)}`);
+    assert(
+      listAfter?.displayName === renamedList,
+      `Graph still shows "${listAfter?.displayName}" after the rename`
+    );
+
+    toolText(
+      await manageTaskHandler({ action: "delete", task_list: renamedList, task_id: taskId }),
+      "manage_task delete"
+    );
+  } finally {
+    // TEST-ONLY raw DELETE: manage_task deliberately cannot delete a list
+    // (deleting one destroys its tasks irrecoverably), so the harness removes
+    // its own list straight through Graph rather than through the tool surface.
+    await callGraphServer(`/me/todo/lists/${encodeURIComponent(listId!)}`, {
+      method: "DELETE",
+    }).catch(() => {});
+  }
+});
+
+// ---- v8b. junk: block and unblock a sender -------------------------------
+
+await test("v8b. manage_senders (block the sender of a real message, then unblock it again)", async () => {
+  assert(latestMessage, "Inbox is empty; no message whose sender could be blocked");
+  const before = await callGraphServer(
+    `/me/messages/${encodeURIComponent(latestMessage.id)}?$select=id,from,parentFolderId`
+  );
+  const senderAddress = before?.from?.emailAddress?.address;
+  assert(senderAddress, "The newest inbox message has no sender address");
+
+  // move_message: false throughout — the block/unblock pair is the thing under
+  // test, and nothing in the mailbox should move because of a test run.
+  let blocked = false;
+  try {
+    const blockText = toolText(
+      await manageSendersHandler({
+        action: "block_sender",
+        message_id: latestMessage.id,
+        move_message: false,
+      }),
+      "manage_senders block_sender"
+    );
+    blocked = true;
+    assert(blockText.includes(senderAddress), `The block did not name the sender: ${blockText}`);
+    assert(/left where it was/i.test(blockText), `The message was moved: ${blockText}`);
+    assert(
+      /cannot read the blocked-senders list back/i.test(blockText),
+      `The output hides the platform limit: ${blockText}`
+    );
+
+    const stillThere = await callGraphServer(
+      `/me/messages/${encodeURIComponent(latestMessage.id)}?$select=id,parentFolderId`
+    );
+    assert(
+      stillThere.parentFolderId === before.parentFolderId,
+      "block_sender moved the message even though move_message was false"
+    );
+
+    const unblockText = toolText(
+      await manageSendersHandler({
+        action: "unblock_sender",
+        message_id: latestMessage.id,
+        move_message: false,
+      }),
+      "manage_senders unblock_sender"
+    );
+    blocked = false;
+    assert(
+      unblockText.includes(senderAddress) && /delivered normally again/i.test(unblockText),
+      `Unexpected unblock output: ${unblockText}`
+    );
+
+    // A draft has no sender, so there is nothing to block: say so, don't guess.
+    const draftText = toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} junk guard`,
+        body: "Sender-block guard probe. Safe to delete.",
+      }),
+      "create_draft (junk guard)"
+    );
+    const draftId = extractDraftId(draftText);
+    try {
+      const refused = expectError(
+        await manageSendersHandler({ action: "block_sender", message_id: draftId }),
+        "manage_senders block_sender (draft)"
+      );
+      assert(/no sender address/i.test(refused), `Unexpected draft refusal: ${refused}`);
+    } finally {
+      await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => {});
+    }
+  } finally {
+    // Never leave a real correspondent blocked because a test failed halfway.
+    if (blocked) {
+      await manageSendersHandler({
+        action: "unblock_sender",
+        message_id: latestMessage.id,
+        move_message: false,
+      });
+    }
+  }
+});
+
+// ---- v8c. focused inbox overrides ----------------------------------------
+
+const FOCUS_TEST_SENDER = "mcp-test-focus@example.com";
+
+await test("v8c. mailbox_settings focus override (set → visible in get → clear → gone)", async () => {
+  const setText = toolText(
+    await mailboxSettingsHandler({
+      action: "set_focus_override",
+      sender: FOCUS_TEST_SENDER,
+      classify_as: "other",
+    }),
+    "mailbox_settings set_focus_override"
+  );
+  assert(/→ other/.test(setText), `Unexpected set output: ${setText}`);
+
+  try {
+    const getText = toolText(
+      await mailboxSettingsHandler({ action: "get" }),
+      "mailbox_settings get"
+    );
+    assert(
+      getText.includes(`${FOCUS_TEST_SENDER} → other`),
+      `The override is not in the settings read-out: ${getText}`
+    );
+
+    // Setting the same sender again updates the one override rather than
+    // colliding with it (Graph refuses a duplicate).
+    const again = toolText(
+      await mailboxSettingsHandler({
+        action: "set_focus_override",
+        sender: FOCUS_TEST_SENDER,
+        classify_as: "focused",
+      }),
+      "mailbox_settings set_focus_override (again)"
+    );
+    assert(/updated/i.test(again) && /was other/.test(again), `Unexpected re-set output: ${again}`);
+    const overrides = await callGraphServer("/me/inferenceClassification/overrides?$top=100");
+    const mine = (overrides?.value ?? []).filter(
+      (o: any) => o.senderEmailAddress?.address === FOCUS_TEST_SENDER
+    );
+    assert(mine.length === 1, `Graph holds ${mine.length} overrides for the test sender`);
+    assert(mine[0].classifyAs === "focused", `The override was not updated: ${mine[0].classifyAs}`);
+  } finally {
+    await mailboxSettingsHandler({
+      action: "clear_focus_override",
+      sender: FOCUS_TEST_SENDER,
+    });
+  }
+
+  const gone = expectError(
+    await mailboxSettingsHandler({ action: "clear_focus_override", sender: FOCUS_TEST_SENDER }),
+    "mailbox_settings clear_focus_override (twice)"
+  );
+  assert(/no Focused-Inbox override/i.test(gone), `Unexpected error: ${gone}`);
+});
+
+// ---- v8d. working hours --------------------------------------------------
+
+await test("v8d. mailbox_settings working hours (save → set → verify → restore exactly)", async () => {
+  const before = await callGraphServer("/me/mailboxSettings?$select=workingHours");
+  state.savedWorkingHours = before?.workingHours;
+  assert(state.savedWorkingHours, "Could not read the current workingHours");
+
+  const getText = toolText(await mailboxSettingsHandler({ action: "get" }), "mailbox_settings get");
+  assert(/Working hours: /.test(getText), `Working hours missing from get: ${getText}`);
+
+  try {
+    const setText = toolText(
+      await mailboxSettingsHandler({
+        action: "set_working_hours",
+        days: ["tuesday", "thursday"],
+        start_time: "10:15",
+        end_time: "16:45",
+      }),
+      "mailbox_settings set_working_hours"
+    );
+    assert(
+      /After: +tuesday, thursday 10:15–16:45/.test(setText),
+      `Unexpected set output: ${setText}`
+    );
+    assert(/visible to anyone who schedules/i.test(setText), `No visibility warning: ${setText}`);
+
+    const applied = (await callGraphServer("/me/mailboxSettings?$select=workingHours"))
+      ?.workingHours;
+    assert(
+      JSON.stringify(applied.daysOfWeek) === JSON.stringify(["tuesday", "thursday"]) &&
+        applied.startTime.startsWith("10:15") &&
+        applied.endTime.startsWith("16:45"),
+      `Graph shows different working hours: ${JSON.stringify(applied)}`
+    );
+
+    // A day that ends before it starts is refused rather than sent to Graph.
+    const backwards = expectError(
+      await mailboxSettingsHandler({
+        action: "set_working_hours",
+        start_time: "18:00",
+        end_time: "09:00",
+      }),
+      "mailbox_settings set_working_hours (backwards)"
+    );
+    assert(/must be later than/i.test(backwards), `Unexpected error: ${backwards}`);
+    const empty = expectError(
+      await mailboxSettingsHandler({ action: "set_working_hours" }),
+      "mailbox_settings set_working_hours (nothing to change)"
+    );
+    assert(/at least one of days/i.test(empty), `Unexpected error: ${empty}`);
+  } finally {
+    await callGraphServer("/me/mailboxSettings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workingHours: state.savedWorkingHours }),
+    });
+  }
+
+  const restored = (await callGraphServer("/me/mailboxSettings?$select=workingHours"))
+    ?.workingHours;
+  assert(
+    JSON.stringify(restored) === JSON.stringify(state.savedWorkingHours),
+    `Working hours not restored exactly: ${JSON.stringify(restored)}`
+  );
+});
+
+// ---- v8e. message forensics: internet headers ----------------------------
+
+await test("v8e. read_message include_headers (auth results, delivery chain, reply-to check)", async () => {
+  assert(latestMessage, "Inbox is empty; no message whose headers could be read");
+  const text = toolText(
+    await readMessageHandler({
+      message_id: latestMessage.id,
+      include_headers: true,
+      include_attachments_list: false,
+    }),
+    "read_message include_headers"
+  );
+
+  assert(/\nInternet headers:/.test(text), `No header section: ${text.slice(-400)}`);
+  assert(
+    /Authentication-Results: (SPF|DKIM|DMARC)/.test(text),
+    `No Authentication-Results verdict — inbox mail should carry one: ${text.slice(-800)}`
+  );
+  assert(
+    /Received chain \(\d+ hop\(s\), oldest first/.test(text),
+    `No Received chain: ${text.slice(-800)}`
+  );
+  // Compact rendering, not raw headers: every hop is one "from … by …" line.
+  const hops = text.match(/^ {4}\d+\. from .+ by /gm) ?? [];
+  assert(hops.length >= 1, `The delivery chain is not compactly rendered: ${text.slice(-800)}`);
+  assert(/ {2}Reply-To: /.test(text), `No reply-to verdict: ${text.slice(-800)}`);
+
+  // Without the flag the answer stays as small as it was.
+  const plain = toolText(
+    await readMessageHandler({ message_id: latestMessage.id, include_attachments_list: false }),
+    "read_message (no headers)"
+  );
+  assert(!/Internet headers:/.test(plain), "Headers leaked into the default read_message output");
+
+  // A draft has no internet headers at all: say so rather than inventing any.
+  const draftText = toolText(
+    await createDraftHandler({
+      to: [ownAddress],
+      subject: `${TEST_PREFIX} header probe`,
+      body: "Header-rendering probe. Safe to delete.",
+    }),
+    "create_draft (header probe)"
+  );
+  const draftId = extractDraftId(draftText);
+  try {
+    const draftHeaders = toolText(
+      await readMessageHandler({
+        message_id: draftId,
+        include_headers: true,
+        include_attachments_list: false,
+      }),
+      "read_message include_headers (draft)"
+    );
+    assert(
+      /\(none — Microsoft Graph carries internet headers only/.test(draftHeaders),
+      `A draft's empty header set is not explained: ${draftHeaders.slice(-400)}`
+    );
+  } finally {
+    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}/permanentDelete`, {
+      method: "POST",
+    }).catch(() => {});
+  }
+});
+
+// ---- v8f. EML export (local transport) -----------------------------------
+
+await test("v8f. export_message (saves a .eml to disk that parses as RFC 822)", async () => {
+  assert(latestMessage, "Inbox is empty; no message to export");
+  const text = toolText(
+    await exportMessageHandler({ message_id: latestMessage.id }),
+    "export_message"
+  );
+  const savedPath = text.match(/Saved to: (.+)$/m)?.[1];
+  assert(savedPath, `No saved path in the output: ${text}`);
+  assert(savedPath.endsWith(".eml"), `The export is not a .eml: ${savedPath}`);
+  assert(!/Download: /.test(text), `The local server handed out a link: ${text}`);
+  state.exportedEmlPath = savedPath;
+
+  const raw = await fs.readFile(savedPath, "utf8");
+  // RFC 822 shape: a header block of "Name: value" lines, then a blank line,
+  // then the body — and the headers Graph reported for the same message.
+  const separator = raw.indexOf("\r\n\r\n");
+  assert(separator > 0, "No header/body separator in the exported MIME");
+  const headerBlock = raw.slice(0, separator);
+  const headerNames = headerBlock
+    .split("\r\n")
+    .filter((line) => /^[!-9;-~]+:/.test(line))
+    .map((line) => line.slice(0, line.indexOf(":")).toLowerCase());
+  for (const required of ["from", "to", "subject", "date", "received"]) {
+    assert(headerNames.includes(required), `The exported MIME has no ${required} header`);
+  }
+  assert(raw.length > separator + 4, "The exported MIME has no body");
+
+  const graphView = await callGraphServer(
+    `/me/messages/${encodeURIComponent(latestMessage.id)}?$select=internetMessageId`
+  );
+  assert(
+    !graphView.internetMessageId || raw.includes(graphView.internetMessageId),
+    "The exported MIME is not this message (Message-ID does not match)"
+  );
+
+  const missing = expectError(
+    await exportMessageHandler({ message_id: "AAAAnotarealmessageid=" }),
+    "export_message (bad id)"
+  );
+  assert(/No message /.test(missing), `Unexpected error: ${missing}`);
+
+  await fs.rm(savedPath, { force: true });
+  state.exportedEmlPath = undefined;
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -2246,17 +2788,20 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "create_draft",
       "create_event",
       "create_folder",
+      "export_message",
       "get_attachment",
       "get_mailbox_activity",
       "list_calendars",
       "list_events",
       "list_folders",
       "list_tasks",
+      "mailbox_settings",
       "manage_categories",
       "manage_contact",
       "manage_event",
       "manage_message",
       "manage_rules",
+      "manage_senders",
       "manage_task",
       "read_message",
       "read_thread",
@@ -2265,7 +2810,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 24, `Expected 24 tools, got ${tools.length}`);
+    assert(tools.length === 27, `Expected 27 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -2374,6 +2919,8 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   await purgeTestCategories();
   await purgeTestCalendars();
   await purgeTestTasks();
+  await purgeTestTaskLists();
+  await purgeTestFocusOverrides();
 
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject,parentFolderId`
@@ -2455,6 +3002,13 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   );
 
   const taskLists = await callGraphServer("/me/todo/lists?$top=100");
+  const testLists = (taskLists?.value ?? []).filter((l: any) =>
+    String(l.displayName ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(
+    testLists.length === 0,
+    `Leftover test To Do lists: ${JSON.stringify(testLists.map((l: any) => l.displayName))}`
+  );
   for (const list of taskLists?.value ?? []) {
     const tasks = await callGraphServer(
       `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100`
@@ -2493,7 +3047,38 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
     state.tempDir = undefined;
   }
 
-  const settings = await callGraphServer("/me/mailboxSettings?$select=automaticRepliesSetting");
+  // Focused-Inbox overrides: the harness only ever creates its own test sender's.
+  const overrides = await callGraphServer("/me/inferenceClassification/overrides?$top=100");
+  const testOverrides = (overrides?.value ?? []).filter((o: any) =>
+    String(o.senderEmailAddress?.address ?? "").startsWith("mcp-test-")
+  );
+  assert(
+    testOverrides.length === 0,
+    `Leftover test Focused-Inbox overrides: ${JSON.stringify(testOverrides)}`
+  );
+
+  // Exported .eml files: the export test removes its own, and nothing else in
+  // the local download directory may carry a test artifact.
+  if (state.exportedEmlPath) {
+    await fs.rm(state.exportedEmlPath, { force: true });
+    state.exportedEmlPath = undefined;
+  }
+  const downloads = await fs.readdir(SAVE_DIR).catch(() => [] as string[]);
+  const testDownloads = downloads.filter((name) => name.startsWith(TEST_PREFIX));
+  assert(
+    testDownloads.length === 0,
+    `Leftover test files in ${SAVE_DIR}: ${testDownloads.join(", ")}`
+  );
+
+  const settings = await callGraphServer(
+    "/me/mailboxSettings?$select=automaticRepliesSetting,workingHours"
+  );
+  if (state.savedWorkingHours) {
+    assert(
+      JSON.stringify(settings?.workingHours) === JSON.stringify(state.savedWorkingHours),
+      `Working hours were not restored exactly: ${JSON.stringify(settings?.workingHours)}`
+    );
+  }
   const current = settings?.automaticRepliesSetting;
   assert(
     !String(current?.internalReplyMessage ?? "").includes(TEST_PREFIX),
