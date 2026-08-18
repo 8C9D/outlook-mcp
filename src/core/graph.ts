@@ -26,11 +26,16 @@ export class GraphError extends Error {
   }
 }
 
-export async function callGraphWithToken(
+/**
+ * One Graph request, with the transport-level 429 retry, returning the raw
+ * Response. Callers decide how to read the body: JSON for the entity endpoints,
+ * bytes for the ones that answer with a file (a message's MIME $value).
+ */
+async function graphFetch(
   getToken: () => Promise<string>,
   path: string,
   init?: RequestInit
-): Promise<any> {
+): Promise<Response> {
   const token = await getToken();
   graphRequestLog.push({ method: (init?.method ?? "GET").toUpperCase(), path });
   const doFetch = () =>
@@ -62,9 +67,33 @@ export async function callGraphWithToken(
   if (!response.ok) {
     throw new GraphError(response.status, response.statusText, path, await response.text());
   }
+  return response;
+}
+
+export async function callGraphWithToken(
+  getToken: () => Promise<string>,
+  path: string,
+  init?: RequestInit
+): Promise<any> {
+  const response = await graphFetch(getToken, path, init);
   if (response.status === 204) return null;
   const text = await response.text();
   return text ? JSON.parse(text) : null;
+}
+
+/** The bytes of a Graph endpoint that answers with a file, plus its content type. */
+export type GraphBytes = { bytes: Uint8Array; contentType: string };
+
+export async function callGraphBytesWithToken(
+  getToken: () => Promise<string>,
+  path: string,
+  init?: RequestInit
+): Promise<GraphBytes> {
+  const response = await graphFetch(getToken, path, init);
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    contentType: response.headers.get("content-type") ?? "application/octet-stream",
+  };
 }
 
 /**
@@ -74,4 +103,12 @@ export async function callGraphWithToken(
  */
 export async function callGraphServer(path: string, init?: RequestInit): Promise<any> {
   return callGraphWithToken(getAccessTokenSilent, path, init);
+}
+
+/** Server-mode Graph call for an endpoint that answers with a file rather than JSON. */
+export async function callGraphServerBytes(
+  path: string,
+  init?: RequestInit
+): Promise<GraphBytes> {
+  return callGraphBytesWithToken(getAccessTokenSilent, path, init);
 }
