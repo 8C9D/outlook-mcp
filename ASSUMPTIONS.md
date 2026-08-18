@@ -121,3 +121,8 @@ Recorded while executing the "v2 full-parity tool surface" task on 2026-08-18.
 - auto_reply restore PATCHes back the exact saved `automaticRepliesSetting` object (not just "clear"), and the final sweep re-checks status and that no "[MCP TEST]" text remains in the reply messages.
 - Deleted test contacts are soft-deleted (policy: no purge in the tool surface); the sweep asserts they no longer appear under `/me/contacts`. Graph exposes no supported purge for contacts' Deleted Items, so the recoverable copy in trash is accepted as clean.
 - purgeTestFolders also checks `deleteditems`' child folders so a soft-deleted test folder can't linger.
+
+### Phase B completion (2026-08-18)
+- The device-code sign-in again required Microsoft's "Verify your email" challenge; the user completed the verification and the consent screen themselves (the automation entered the device code only). Mitigation for the unseen consent screen: the granted scopes were verified afterwards from the cached token's target — exactly User.Read, Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, Contacts.ReadWrite, MailboxSettings.ReadWrite (+ implicit openid/profile) — matching Phase A.
+- Silent acquisition confirmed: `npm run verify` completed all three checks with no sign-in prompt immediately after login.
+- Full harness: 13/13 PASS on the first run, including the final artifact sweep and exact auto-reply restoration.
