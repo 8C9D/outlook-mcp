@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { GraphError, callGraphServer } from "../graph.js";
+import { callGraphServer } from "../graph.js";
 import { ToolResult, errorResult, runTool, textResult } from "./common.js";
 
 export const manageMessageSchema = {
@@ -26,54 +26,97 @@ const manageMessageArgs = z.object(manageMessageSchema);
 export const manageMessageDescription =
   "Act on up to 20 email messages: move, archive, delete (soft — moves to Deleted Items), mark read/unread, or flag/unflag. Returns a per-message success/failure list; moved messages get a NEW message id (reported in the output). Before calling with delete or move, state to the user exactly which messages (subjects/senders) will be affected. Deletion is never permanent from this tool — messages remain recoverable in Deleted Items.";
 
-async function applyAction(
-  id: string,
+/** One Graph JSON-batch request item for a single message id. */
+function batchRequest(
+  itemId: string,
+  messageId: string,
   action: string,
   destinationFolder: string | undefined
-): Promise<string> {
-  const base = `/me/messages/${encodeURIComponent(id)}`;
-  const patch = (body: object) =>
-    callGraphServer(base, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  const move = async (destinationId: string) => {
-    const moved = await callGraphServer(`${base}/move`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ destinationId }),
-    });
-    return moved?.id as string | undefined;
-  };
-
+): object {
+  const base = `/me/messages/${encodeURIComponent(messageId)}`;
+  const json = { "Content-Type": "application/json" };
   switch (action) {
-    case "move": {
-      const newId = await move(destinationFolder!);
-      return `moved to ${destinationFolder}${newId ? ` (new id: ${newId})` : ""}`;
-    }
-    case "archive": {
-      const newId = await move("archive");
-      return `archived${newId ? ` (new id: ${newId})` : ""}`;
-    }
+    case "move":
+      return {
+        id: itemId,
+        method: "POST",
+        url: `${base}/move`,
+        headers: json,
+        body: { destinationId: destinationFolder },
+      };
+    case "archive":
+      return {
+        id: itemId,
+        method: "POST",
+        url: `${base}/move`,
+        headers: json,
+        body: { destinationId: "archive" },
+      };
     case "delete":
-      await callGraphServer(base, { method: "DELETE" });
-      return "deleted (moved to Deleted Items)";
+      return { id: itemId, method: "DELETE", url: base };
     case "mark_read":
-      await patch({ isRead: true });
-      return "marked read";
+      return { id: itemId, method: "PATCH", url: base, headers: json, body: { isRead: true } };
     case "mark_unread":
-      await patch({ isRead: false });
-      return "marked unread";
+      return { id: itemId, method: "PATCH", url: base, headers: json, body: { isRead: false } };
     case "flag":
-      await patch({ flag: { flagStatus: "flagged" } });
-      return "flagged";
+      return {
+        id: itemId,
+        method: "PATCH",
+        url: base,
+        headers: json,
+        body: { flag: { flagStatus: "flagged" } },
+      };
     case "unflag":
-      await patch({ flag: { flagStatus: "notFlagged" } });
-      return "unflagged";
+      return {
+        id: itemId,
+        method: "PATCH",
+        url: base,
+        headers: json,
+        body: { flag: { flagStatus: "notFlagged" } },
+      };
     default:
       throw new Error(`Unknown action ${action}`);
   }
+}
+
+function describeSuccess(action: string, destinationFolder: string | undefined, body: any): string {
+  const newId = body?.id as string | undefined;
+  switch (action) {
+    case "move":
+      return `moved to ${destinationFolder}${newId ? ` (new id: ${newId})` : ""}`;
+    case "archive":
+      return `archived${newId ? ` (new id: ${newId})` : ""}`;
+    case "delete":
+      return "deleted (moved to Deleted Items)";
+    case "mark_read":
+      return "marked read";
+    case "mark_unread":
+      return "marked unread";
+    case "flag":
+      return "flagged";
+    case "unflag":
+      return "unflagged";
+    default:
+      return "done";
+  }
+}
+
+function describeFailure(status: number, body: any): string {
+  const code = body?.error?.code;
+  const message = body?.error?.message;
+  return `HTTP ${status} ${code ?? ""}: ${message ?? "(no error detail from Graph)"}`;
+}
+
+/** POST one JSON batch and return its per-item responses keyed by item id. */
+async function postBatch(requests: object[]): Promise<Map<string, any>> {
+  const result = await callGraphServer("/$batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requests }),
+  });
+  const byId = new Map<string, any>();
+  for (const response of result?.responses ?? []) byId.set(String(response.id), response);
+  return byId;
 }
 
 export async function manageMessageHandler(
@@ -85,26 +128,63 @@ export async function manageMessageHandler(
       return errorResult('Action "move" requires destination_folder.');
     }
 
+    // All ids go out in ONE Graph JSON batch ($batch caps at 20 requests,
+    // matching the schema's max). Each item succeeds or fails independently.
+    const requests = message_ids.map((id, i) =>
+      batchRequest(String(i), id, action, destination_folder)
+    );
+    let responses = await postBatch(requests);
+
+    // Individual items can be throttled (429) even when the batch itself
+    // succeeds. Retry just those items once, after the longest Retry-After.
+    const throttled = message_ids
+      .map((_, i) => String(i))
+      .filter((itemId) => responses.get(itemId)?.status === 429);
+    if (throttled.length > 0) {
+      const waitSeconds = Math.min(
+        Math.max(
+          ...throttled.map((itemId) => {
+            const headers = responses.get(itemId)?.headers ?? {};
+            const key = Object.keys(headers).find((k) => k.toLowerCase() === "retry-after");
+            const retryAfter = Number(key ? headers[key] : "2");
+            return Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 2;
+          })
+        ),
+        60
+      );
+      console.error(
+        `Graph throttled ${throttled.length} batch item(s) (429); retrying once after ${waitSeconds}s.`
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+      const retryResponses = await postBatch(
+        throttled.map((itemId) =>
+          batchRequest(itemId, message_ids[Number(itemId)]!, action, destination_folder)
+        )
+      );
+      for (const [itemId, response] of retryResponses) responses.set(itemId, response);
+    }
+
     const lines: string[] = [];
     let failures = 0;
-    for (const id of message_ids) {
-      try {
-        const outcome = await applyAction(id, action, destination_folder);
-        lines.push(`OK      ${id}: ${outcome}`);
-      } catch (err) {
+    message_ids.forEach((id, i) => {
+      const response = responses.get(String(i));
+      if (!response) {
         failures++;
-        let reason = err instanceof Error ? err.message : String(err);
-        if (err instanceof GraphError) {
-          try {
-            const parsed = JSON.parse(err.body);
-            reason = `HTTP ${err.status} ${parsed?.error?.code ?? ""}: ${parsed?.error?.message ?? err.statusText}`;
-          } catch {
-            reason = `HTTP ${err.status} ${err.statusText}`;
-          }
-        }
-        lines.push(`FAILED  ${id}: ${reason}`);
+        lines.push(`FAILED  ${id}: no response for this item in the Graph batch reply`);
+        return;
       }
-    }
+      if (response.status >= 200 && response.status < 300) {
+        lines.push(`OK      ${id}: ${describeSuccess(action, destination_folder, response.body)}`);
+      } else if (response.status === 429) {
+        failures++;
+        lines.push(
+          `FAILED  ${id}: still throttled (HTTP 429) after one retry — wait a minute and retry this id.`
+        );
+      } else {
+        failures++;
+        lines.push(`FAILED  ${id}: ${describeFailure(response.status, response.body)}`);
+      }
+    });
 
     const summary = `${message_ids.length - failures}/${message_ids.length} message(s) ${action} succeeded${failures ? `, ${failures} failed` : ""}.`;
     const result = `${summary}\n\n${lines.join("\n")}`;

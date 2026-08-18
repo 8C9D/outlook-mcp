@@ -2,6 +2,14 @@ import { getAccessToken, getAccessTokenSilent } from "./auth.js";
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
+/**
+ * In-process log of Graph requests: one entry per Graph call (method + path;
+ * the transport-level 429 retry does not add a second entry). Used by the test
+ * harness to assert request shapes (e.g. that manage_message issued a single
+ * /$batch call); not read in server mode.
+ */
+export const graphRequestLog: { method: string; path: string }[] = [];
+
 /** A non-2xx response from Microsoft Graph, carrying the status and error body. */
 export class GraphError extends Error {
   constructor(
@@ -21,6 +29,7 @@ async function callGraphWithToken(
   init?: RequestInit
 ): Promise<any> {
   const token = await getToken();
+  graphRequestLog.push({ method: (init?.method ?? "GET").toUpperCase(), path });
   const doFetch = () =>
     fetch(path.startsWith("https://") ? path : GRAPH_BASE + path, {
       ...init,

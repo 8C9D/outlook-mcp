@@ -1,6 +1,6 @@
 {
   "name": "outlook-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, calendar, contacts, auto-reply; sending only via explicit two-step draft-then-send).",
