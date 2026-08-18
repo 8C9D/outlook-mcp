@@ -1,9 +1,9 @@
 {
   "name": "outlook-mcp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
-  "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, inbox rules, categories, calendar, contacts, Microsoft To Do tasks, auto-reply, delta 'what changed' checks and pushed change notifications; sending only via explicit two-step draft-then-send).",
+  "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, inbox rules, categories, calendar, contacts, Microsoft To Do tasks with subtasks, auto-reply, working hours and Focused-Inbox overrides, junk-sender blocking, MIME (.eml) export, delta 'what changed' checks and pushed change notifications; sending only via explicit two-step draft-then-send).",
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "verify": "tsx src/verify.ts",
