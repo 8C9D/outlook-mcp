@@ -1,6 +1,3 @@
-import { promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
 import {
@@ -12,6 +9,7 @@ import {
 import { getStateStore } from "../core/state.js";
 import { ToolResult, errorResult, formatLocal, runTool, textResult } from "./common.js";
 import { formatSize } from "./read-message.js";
+import { saveToDownloads } from "./save-local.js";
 
 export const getAttachmentSchema = {
   message_id: z.string().min(1).describe("The id of the message the attachment belongs to."),
@@ -35,28 +33,7 @@ const getAttachmentArgs = z.object(getAttachmentSchema);
 export const getAttachmentDescription =
   "Download one attachment of a message. Small text attachments (text/* or JSON under 50 KB) are returned inline on both servers. Everything else depends on where this server runs: the local (stdio) server saves the file to ~/Downloads/outlook-mcp-attachments/ and returns the path, while the hosted server has no filesystem and instead returns a single-mailbox, sign-in-required download link that expires within 15 minutes. Get attachment ids from read_message.";
 
-const SAVE_DIR = path.join(os.homedir(), "Downloads", "outlook-mcp-attachments");
 const INLINE_LIMIT = 50 * 1024;
-
-/** Strip path separators/control chars so an attachment name cannot escape SAVE_DIR. */
-function sanitizeFilename(name: string): string {
-  const cleaned = name.replace(/[/\\:\0-\x1f]/g, "_").replace(/^\.+/, "_").trim();
-  return cleaned || "attachment";
-}
-
-/** Return a path in SAVE_DIR that does not collide with an existing file. */
-async function collisionFreePath(filename: string): Promise<string> {
-  const ext = path.extname(filename);
-  const stem = filename.slice(0, filename.length - ext.length);
-  for (let i = 0; ; i++) {
-    const candidate = path.join(SAVE_DIR, i === 0 ? filename : `${stem} (${i})${ext}`);
-    try {
-      await fs.access(candidate);
-    } catch {
-      return candidate;
-    }
-  }
-}
 
 export async function getAttachmentHandler(
   input: z.input<typeof getAttachmentArgs>
@@ -124,9 +101,7 @@ export async function getAttachmentHandler(
       );
     }
 
-    await fs.mkdir(SAVE_DIR, { recursive: true });
-    const savePath = await collisionFreePath(sanitizeFilename(name));
-    await fs.writeFile(savePath, buffer);
+    const savePath = await saveToDownloads(name, buffer);
 
     return textResult(
       `Attachment saved.\n` +
