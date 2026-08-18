@@ -123,3 +123,77 @@ authorized — the expected human-dependency pause, not a gate violation.
 - KV eventual consistency handled with bounded polling in two remote tests.
 - The claude.ai connector itself is NOT yet added — that is an interactive
   user step (documented in the README).
+
+## Batch 4 — Remote-native features (v0.6.0) — PASSED
+
+**Front-loaded auth (orchestrator).** None needed beyond confirming wrangler
+was still authenticated (`wrangler whoami` OK).
+
+**Shipped (subagent C).**
+- `check_new_mail` (22nd tool): Graph delta queries per folder. First call (or
+  `reset: true`) records a position and lists nothing; later calls return only
+  added/changed/removed messages exactly once. Position stored in Workers KV
+  remotely and a 0600 `.mcp-state.json` locally (gitignored). Works on both
+  transports.
+- Graph change notifications: public Worker `/notifications` route handles the
+  validation handshake and clientState-checked deliveries into a capped
+  (50-entry) KV ring buffer; always answers 202 (no secret-guessing oracle,
+  no Graph retry storms). A Workers cron (`17 */6 * * *`) renews the inbox
+  subscription before Graph's ~4230-minute cap and re-creates it if lapsed; a
+  request-time backstop (`ctx.waitUntil`) also runs the renewal check so the
+  subscription bootstraps after deploy and lapses cannot linger.
+- `get_mailbox_activity` (23rd tool): reads the ring buffer — pushed activity
+  without polling Graph. Remote-only; on stdio it returns a clear isError
+  pointing at `check_new_mail`.
+- MCP resources on BOTH transports: `outlook://mail/folders` and
+  `outlook://mail/inbox/recent` (no SDK limitation encountered).
+- Notable findings: `$deltatoken=latest` is OneDrive-only; carrying
+  `Prefer: odata.maxpagesize` on every delta hop (Graph drops it from
+  nextLink) cut the 1006-message inbox baseline from 92 requests/10.8 s to
+  3 requests/0.85 s; consumer accounts do support message subscriptions
+  (proven live before wiring).
+
+**Gate review (orchestrator, re-run independently).**
+- Local harness **28/28** (delta lifecycle, handshake, ingest, cron renewal
+  handler, remote-only guard, resources); remote suite **20/20** including the
+  live webhook end-to-end (send-to-self → notification lands in
+  `get_mailbox_activity`), KV delta persistence, and the subscription check —
+  subscription `95f07422-d465-455d-b03f-14d098692d93` on
+  `/me/mailFolders('inbox')/messages`, expiry 2026-08-21T17:31:56Z (~70 h
+  out); cron `17 */6 * * *` in the committed wrangler.jsonc and deployed.
+- `npm run typecheck` (both tsconfigs) clean; dist rebuilt; stdio smoke from
+  `cwd=/tmp`: `outlook 0.6.0`, **23 tools / 2 prompts / 2 resources**, stdout
+  entirely valid JSON-RPC.
+- Sweeps clean: zero `[MCP TEST]` artifacts locally; KV holds only the
+  refresh/access tokens, `sub:mail`, and an empty ring buffer. No secrets in
+  the tree (clientState lives only in KV, rotates with the subscription);
+  `.mcp-state.json` gitignored; version **0.6.0**; tree clean.
+
+**Commits.** `059f4cd` (surface), `f4cbabc` (local harness), `81577f1`
+(remote suite), `71ff882` (docs).
+
+**Assumptions / deviations of consequence.** Request-time subscription
+backstop added beyond the brief (rationale above). Ring-buffer writes are
+read-modify-write without a lock — fine at single-user scale; a Durable
+Object would fix it at scale but was deliberately avoided in Batch 3.
+
+## Final state
+
+- **Version 0.6.0** — 23 tools, 2 prompts, 2 resources, two transports.
+- Local: `node dist/server.js` (Claude Desktop), MSAL + disk cache.
+- Remote: **https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp** —
+  OAuth-gated (single-user allowlist), tokens in Workers KV with refresh
+  rotation, live inbox webhook subscription with cron renewal.
+- All four gates passed with the orchestrator re-running every check.
+- Run totals: local harness 19/19 → 28/28; remote suite 0 → 20/20.
+
+### The user's remaining manual steps
+
+1. **Cmd+Q and reopen Claude Desktop** so it picks up the new local tools
+   (23 tools / 2 prompts / 2 resources over stdio).
+2. **Add the remote server as a claude.ai custom connector** following
+   README → "Adding it to claude.ai as a custom connector": Settings →
+   Connectors → Add custom connector →
+   `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`, then complete
+   the Microsoft device-code sign-in when the authorize page asks (only the
+   allowlisted account can finish it).
