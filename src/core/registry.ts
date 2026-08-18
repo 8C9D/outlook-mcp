@@ -67,6 +67,21 @@ import {
 } from "../tools/manage-contact.js";
 import { autoReplyDescription, autoReplyHandler, autoReplySchema } from "../tools/auto-reply.js";
 import {
+  mailboxSettingsDescription,
+  mailboxSettingsHandler,
+  mailboxSettingsSchema,
+} from "../tools/mailbox-settings.js";
+import {
+  manageSendersDescription,
+  manageSendersHandler,
+  manageSendersSchema,
+} from "../tools/manage-senders.js";
+import {
+  exportMessageDescription,
+  exportMessageHandler,
+  exportMessageSchema,
+} from "../tools/export-message.js";
+import {
   addAttachmentDescription,
   addAttachmentHandler,
   addAttachmentSchema,
@@ -135,6 +150,12 @@ export const TOOLS: ToolDefinition[] = [
     description: getAttachmentDescription,
     inputSchema: getAttachmentSchema,
     handler: getAttachmentHandler,
+  },
+  {
+    name: "export_message",
+    description: exportMessageDescription,
+    inputSchema: exportMessageSchema,
+    handler: exportMessageHandler,
   },
   {
     name: "create_draft",
@@ -209,6 +230,12 @@ export const TOOLS: ToolDefinition[] = [
     handler: autoReplyHandler,
   },
   {
+    name: "mailbox_settings",
+    description: mailboxSettingsDescription,
+    inputSchema: mailboxSettingsSchema,
+    handler: mailboxSettingsHandler,
+  },
+  {
     name: "add_attachment",
     description: addAttachmentDescription,
     inputSchema: addAttachmentSchema,
@@ -219,6 +246,12 @@ export const TOOLS: ToolDefinition[] = [
     description: manageRulesDescription,
     inputSchema: manageRulesSchema,
     handler: manageRulesHandler,
+  },
+  {
+    name: "manage_senders",
+    description: manageSendersDescription,
+    inputSchema: manageSendersSchema,
+    handler: manageSendersHandler,
   },
   {
     name: "create_folder",
