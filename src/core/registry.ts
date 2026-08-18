@@ -1,6 +1,6 @@
-// The tool and prompt surface, shared verbatim by both transports. The stdio
-// entry point and the Cloudflare Worker each build an McpServer and hand it to
-// registerAll, so the two hosts can never drift in what they expose.
+// The tool, prompt and resource surface, shared verbatim by both transports.
+// The stdio entry point and the Cloudflare Worker each build an McpServer and
+// hand it to registerAll, so the two hosts can never drift in what they expose.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { searchMailDescription, searchMailHandler, searchMailSchema } from "../tools/search-mail.js";
 import { readThreadDescription, readThreadHandler, readThreadSchema } from "../tools/read-thread.js";
@@ -83,7 +83,18 @@ import {
 } from "../tools/manage-categories.js";
 import { listTasksDescription, listTasksHandler, listTasksSchema } from "../tools/list-tasks.js";
 import { manageTaskDescription, manageTaskHandler, manageTaskSchema } from "../tools/manage-task.js";
+import {
+  checkNewMailDescription,
+  checkNewMailHandler,
+  checkNewMailSchema,
+} from "../tools/check-new-mail.js";
+import {
+  getMailboxActivityDescription,
+  getMailboxActivityHandler,
+  getMailboxActivitySchema,
+} from "../tools/get-mailbox-activity.js";
 import { registerPrompts } from "./prompts.js";
+import { registerResources } from "./resources.js";
 import type { ZodRawShape } from "zod";
 import type { ToolResult } from "../tools/common.js";
 
@@ -222,6 +233,18 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: manageTaskSchema,
     handler: manageTaskHandler,
   },
+  {
+    name: "check_new_mail",
+    description: checkNewMailDescription,
+    inputSchema: checkNewMailSchema,
+    handler: checkNewMailHandler,
+  },
+  {
+    name: "get_mailbox_activity",
+    description: getMailboxActivityDescription,
+    inputSchema: getMailboxActivitySchema,
+    handler: getMailboxActivityHandler,
+  },
 ];
 
 /** Register every tool and prompt on a freshly constructed McpServer. */
@@ -234,6 +257,7 @@ export function registerAll(server: McpServer): void {
     );
   }
   registerPrompts(server);
+  registerResources(server);
 }
 
 /** Build the fully-populated MCP server for either transport. */

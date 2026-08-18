@@ -16,4 +16,10 @@ export interface Env {
   ALLOWED_MS_USER_ID: string;
   /** Graph /me `userPrincipalName`/`mail` of that same account (second accepted match). */
   ALLOWED_MS_UPN: string;
+  /**
+   * Public origin of this Worker (wrangler var, not a secret). Graph is told to
+   * deliver change notifications to `${PUBLIC_BASE_URL}/notifications`, so it
+   * has to match the deployed hostname exactly.
+   */
+  PUBLIC_BASE_URL?: string;
 }

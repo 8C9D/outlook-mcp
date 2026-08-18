@@ -1,4 +1,5 @@
 import { AuthRequiredError } from "../core/token.js";
+import { StateUnavailableError } from "../core/state.js";
 import { GraphError, callGraphServer } from "../core/graph.js";
 
 export const TIMEZONE = "America/Toronto";
@@ -38,6 +39,7 @@ export async function runTool(fn: () => Promise<ToolResult>): Promise<ToolResult
     return await fn();
   } catch (err) {
     if (err instanceof AuthRequiredError) return errorResult(err.message);
+    if (err instanceof StateUnavailableError) return errorResult(err.message);
     if (err instanceof ToolInputError) return errorResult(err.message);
     if (err instanceof GraphError) {
       let detail = err.body;

@@ -11,12 +11,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { installMsalTokenProvider } from "./auth.js";
 import { createMcpServer } from "./core/registry.js";
 import { PROJECT_ROOT } from "./project-root.js";
+import { installFileStateStore } from "./state-file.js";
 
 const { version } = JSON.parse(
   readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf8")
 ) as { version: string };
 
 installMsalTokenProvider();
+// check_new_mail's delta position lives in a gitignored JSON file here; on the
+// Worker the same keys are KV entries.
+installFileStateStore();
 
 const server = createMcpServer(version);
 
