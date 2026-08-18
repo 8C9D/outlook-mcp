@@ -168,3 +168,130 @@ Recorded while executing the "v3 batch 1 — daily-use sharpening" task on 2026-
 
 ### Docs/versioning
 - Version 0.3.0; README tool table now 17 tools, with a dedicated "Inbox rules" section (future-mail warning + no-forwarding rationale) and manage_rules added to the keep-per-call-approval list in the security model.
+
+## v4 batch 2
+
+Recorded while executing the "v4 batch 2" task on 2026-08-18 (subagent A). The Tasks.ReadWrite scope
+and its re-consent had already landed (commit 85b4a3d); no auth, Entra, or Claude Desktop config was
+touched in this batch.
+
+### Live API shapes verified before writing code
+- `/me/todo/lists` returns exactly one list on this account: "Tasks", `wellknownListName: "defaultList"`.
+- **Graph normalises To Do dates to UTC on write** (a due date of `2026-08-20T00:00:00` America/Toronto
+  comes back as `2026-08-20T04:00:00Z`), which would break naive date grouping. Reads therefore send
+  `Prefer: outlook.timezone="America/Toronto"` — verified to work on `/me/todo`, returning local
+  wall-clock — so grouping is a plain string comparison against `torontoToday()`, matching the calendar
+  tools' existing approach rather than inventing a second date convention.
+- `$filter=status ne 'completed'` and `$filter` on `/me/todo/lists` displayName both work, so the
+  open-tasks default is server-side and list lookup by name needs no client scan of every list.
+- The mailbox's six existing categories are all Graph presets, confirming the `preset0`–`preset24`
+  palette is the real (and only) colour vocabulary.
+
+### create_folder
+- **Duplicate detection is client-side and case-insensitive.** Graph would answer `ErrorFolderExists`,
+  but that error does not carry the existing folder's id, and the task wanted the id named. The handler
+  lists the siblings first and reports the clash with its id; the Graph error is still caught as a
+  fallback (lost race, or a hidden folder the sibling scan cannot see) with a message pointing at
+  `list_folders`. Case-insensitive because Outlook itself treats sibling names that way.
+- Uniqueness is per level: the same name is allowed again one level deeper, and the harness asserts it.
+- The parent is resolved with its own GET before creating, so a bad `parent_folder` reports as such
+  instead of surfacing as a confusing failure on the create call.
+- **Deliberately no delete_folder tool.** It was not in the brief, and folder deletion in Graph takes
+  the folder's whole message subtree with it — that belongs in its own batch with its own guards. The
+  harness deletes its test folders through a test-only `permanentDelete`, as the earlier batches do.
+
+### Shared `isNotFound` helper (bug found by live testing)
+- Graph answers an unknown-but-well-formed id with 404 but an **unparseable** id with
+  `400 ErrorInvalidIdMalformed`. The existing 404-only checks therefore leaked a raw
+  "Microsoft Graph error (HTTP 400 …) ErrorInvalidIdMalformed" to the model for the common case of a
+  made-up folder id. `isNotFound(err)` in common.ts now covers both, and `create_folder`,
+  `manage_rules` (move target and rule id), and `manage_task` all use it.
+- `ToolInputError` was added to common.ts for caller-fixable problems raised from shared helpers
+  (`resolveTaskList`); `runTool` surfaces its message verbatim rather than under the "Tool failed:"
+  prefix reserved for unexpected faults.
+
+### manage_rules — update and exceptions
+- `update` is a real PATCH: the harness asserts the rule keeps both its **id** and its **sequence**
+  (evaluation position), which delete-and-recreate could not do.
+- `conditions`, `exceptions`, and `actions` are each replaced wholesale when passed and left untouched
+  when omitted — a partial update cannot silently drop a rule's actions (asserted in the harness).
+- Guards carried over from create apply to update: passing `conditions: {}` is rejected (a rule with no
+  conditions matches ALL mail), and passing `actions: {}` is rejected. `exceptions: {}` **is** allowed
+  and clears them — an empty exception set is safe, an empty condition set is not.
+- `enabled` is update-only in spirit but also honoured on create (`isEnabled: enabled ?? true`), so a
+  rule can be created parked.
+- Graph **uppercases `senderContains` values** on storage (`boss` → `BOSS`) while preserving
+  `subjectContains`; harness assertions on rule summaries are case-insensitive because of this.
+- Still no forwarding: `forwardTo` / `forwardAsAttachmentTo` / `redirectTo` appear only in the read-side
+  list summary that flags foreign rules, never in a write path.
+
+### Categories
+- `manage_categories delete` takes `category_id` (from `list`), not a name, matching how `manage_rules`
+  and `manage_contact` take ids. It pre-checks existence so deleting a stale id gives a readable error.
+- Deleting a category **does not** strip it from messages already carrying it (Graph behaviour) — those
+  keep the name without a colour. Stated in the tool description and the README rather than papered over
+  by hunting down and rewriting every affected message.
+- `manage_message categorize` **validates names against the master list before writing**: Graph happily
+  accepts unknown category names on a message, which would leave colourless orphan labels behind. Names
+  are matched case-insensitively and written back with the master list's exact spelling (harness asserts
+  this round-trip).
+- Replace-not-append is stated in both the action description and the tool description, and the empty
+  array is the documented way to uncategorize — so there is no separate "uncategorize" action to keep in
+  sync.
+
+### Microsoft To Do
+- **`manage_task delete` is the only irreversible operation in the whole tool surface.** To Do has no
+  recoverable deleted-items store. The tool description says so explicitly, points at `complete` for the
+  non-destructive case, and the handler reads the task's title before deleting so the confirmation names
+  what was destroyed. README's soft-delete policy and security-model sections both carry the caveat.
+- **`$select` is not supported on a single To Do task** — `GET …/tasks/{id}?$select=title` returns
+  `400 invalidRequest` (found by live testing; the delete path originally used it). Single-task reads are
+  now unprojected.
+- `resolveTaskList` does one GET of all lists and matches id first, then display name case-insensitively.
+  For a personal account with a handful of lists this is cheaper than a speculative GET-by-id, and an
+  unknown name can report the available lists instead of a bare 404.
+- Task ids are scoped to their list, so `task_list` must name the task's own list for
+  complete/reopen/update/delete; the description says this, and a mismatch reports "No task … pass
+  task_list if it lives in another list" rather than a raw 404.
+- `due_within_days` **keeps overdue tasks** (they are more urgent than the window, not less) and **drops
+  tasks with no due date** (they have no date to be within the window). Both are stated in the input
+  description. `due_within_days: 0` means "due today or earlier".
+- Neither `due_date` nor `reminder` can be *cleared* through `update` — only set. Clearing needs a
+  distinct sentinel (empty string or null) that muddies the schema for a rare case; deferred rather than
+  guessed at.
+- `linked_message_id` copies a **reference** (subject, sender, received time, `webLink`) into the task
+  notes, never the message body, and never modifies the message. A user-supplied `body` is kept first,
+  with the linked block appended after a blank line.
+- Setting `reminder` also sets `isReminderOn: true`; a reminder that is stored but switched off would be
+  a silent no-op.
+
+### Prompts
+- Both prompts are **zero-argument**. Every MCP client renders argument-less prompts identically, and
+  anything a prompt might have parameterised (a time window, a folder) is something the user can say in
+  the very next turn. `registerPrompt` is used with `title` + `description` so pickers show useful text.
+- `triage_inbox` is explicitly propose-only: it lists the tools it may call, names the writing tools it
+  must **not** call during triage, and requires the user to name which proposals to apply. It reads the
+  existing rules **before** proposing any, so proposals extend the user's rule set instead of duplicating
+  or shadowing it (the reason `manage_rules list` comes second in its sequence, not last).
+- `morning_brief` is honest about a real gap: `search_mail`'s listing carries no read/unread flag, so the
+  prompt tells the model to call `read_message` when read state actually matters instead of asserting
+  something it cannot see. Adding an unread filter to `search_mail` was out of this batch's scope.
+
+### Harness (v4 tests)
+- 23 tests total (19 before this batch). New: v4a create_folder, v4b manage_rules update, v4c categories
+  + categorize, v4d task lifecycle; the stdio test now also exercises `prompts/list` **and**
+  `prompts/get` for both prompts, asserting each renders a >200-char message naming the tools it drives —
+  registration alone would not catch an empty or truncated prompt body.
+- v4d builds its task from `latestMessage` (a genuinely received message) rather than a draft, because a
+  draft has no sender and no useful `webLink` — the linked-note assertions would have been vacuous.
+- The final sweep gained category and task purges plus assertions, and now also walks **one level of
+  subfolders** under every top-level folder, since `create_folder` can nest and the old root-only scan
+  would have missed a stray child.
+- Test artifacts stay under the existing `[MCP TEST]` prefix so one sweep covers every batch. Full run:
+  23/23 PASS.
+
+### Docs/versioning
+- Version 0.4.0. README: 21-tool table, a "Microsoft To Do notes" subsection, a "Prompts" section, an
+  update/exceptions paragraph under "Inbox rules", `Tasks.ReadWrite` added to the setup scope list, the
+  soft-delete policy narrowed to *mailbox* deletes with the To Do exception called out, and `manage_task`
+  added to both the keep-per-call-approval list and a dedicated security-model bullet.
