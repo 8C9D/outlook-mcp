@@ -293,3 +293,55 @@ race were deleted live via `DELETE /subscriptions/{id}`, keeping
    `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`, then complete
    the Microsoft device-code sign-in when the authorize page asks (only the
    allowlisted account can finish it).
+
+---
+
+# Extension run 2 — Batches A–D (orchestrated)
+
+Baseline re-verified before Batch A: local 29/29; remote 20/20 with a real
+interactive sign-in. Getting the baseline green surfaced pre-existing drift:
+`ms:refresh_token` was missing from KV (r12), fixed with `npm run seed:kv`
+exactly as the suite prescribes; rotation confirmed on the next run.
+
+## Batch A — Remote parity and calendar completeness (v0.7.0) — PASSED
+
+**Shipped.**
+- `add_attachment` now takes exactly one of `file_path` (stdio only; the
+  hosted server refuses it by name with the two alternatives), `url`
+  (https-only, streamed with an abort past 25 MB so a lying Content-Length
+  cannot make the Worker buffer more), or `content_base64` (≤ 3 MB decoded).
+- `get_attachment` on the hosted server: text-like content inline (same
+  thresholds as local); binary parked in KV under a 256-bit id and served by
+  an authenticated `/mcp/download/<id>` route — dual expiry (exact
+  `expiresAt` enforced on read + KV TTL as GC), max 15 minutes, 18 MB cap
+  (KV 25 MB value limit ÷ base64 expansion). Local behavior unchanged.
+- **Bug found and fixed before the gate**: a root-level `/download/` route
+  was refused for *authenticated* callers too — workers-oauth-provider binds
+  the token audience to `…/mcp` and matches on path boundaries, so no
+  legitimate token could ever open it. Route moved under `/mcp/download/`,
+  proven against a real workerd runtime (anon 401, bogus 401, valid 200,
+  unissued/malformed/backdated 404).
+- Recurring events: `recurrence` on create_event/manage_event
+  (daily/weekly/monthly/yearly, interval, weekdays, until xor count);
+  manage_event resolves occurrence vs seriesMaster ids and honors
+  `scope: this_event_only | entire_series`; descriptions state the
+  attendee-notification consequences of series edits.
+- `reminder_minutes` on create/update (−1 = off); `calendar` (name or id) on
+  create_event/list_events; **`list_calendars` shipped as the 24th tool**
+  (decision recorded in ASSUMPTIONS: distinct question, list_folders
+  precedent, gives `calendar` a discoverable vocabulary).
+- Live consumer-account probes before coding: numbered weekly recurrence,
+  occurrence PATCH/DELETE, seriesMaster PATCH, reminders, secondary
+  calendars, cross-calendar event resolution — all supported; nothing
+  shipped as graceful absence.
+
+**Gate review (orchestrator, all re-run).**
+- `npm run typecheck` clean; working tree clean; 6 commits (fb07dec…42dcfd2).
+- Local harness **34/34** (was 29; +v7a–v7e), sweep green (now also purges
+  test calendars and events in every calendar), auto-reply restored, stdio
+  smoke expects 24 tools.
+- Remote suite **22/22** with a real device-code sign-in — including the
+  first authenticated run of r18 (attach-by-URL on the Worker, file_path
+  refused) and r19 (download link round-trip, bearer-gated, dies at expiry).
+- TTL route: r3 extended headless-runnable — anonymous and bogus bearers
+  get 401, never bytes. 25 MB and draft-only guards regression-checked (v3e).
