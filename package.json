@@ -5,22 +5,29 @@
   "type": "module",
   "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, inbox rules, categories, calendar, contacts, Microsoft To Do tasks, auto-reply; sending only via explicit two-step draft-then-send).",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "verify": "tsx src/verify.ts",
     "login": "tsx src/login.ts",
     "serve": "tsx src/server.ts",
     "build": "tsc -p tsconfig.build.json",
-    "test:tools": "tsx src/test-tools.ts"
+    "test:tools": "tsx src/test-tools.ts",
+    "cf-types": "wrangler types",
+    "seed:kv": "tsx src/scripts/seed-kv.ts",
+    "deploy": "wrangler deploy",
+    "test:remote": "tsx src/test-remote.ts"
   },
   "dependencies": {
     "@azure/msal-node": "^2.16.2",
+    "@cloudflare/workers-oauth-provider": "^0.10.3",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "dotenv": "^16.4.5",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260818.1",
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "wrangler": "^4.124.0"
   }
 }

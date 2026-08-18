@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 .token-cache.json
+.dev.vars
+.wrangler/
