@@ -22,4 +22,12 @@ export interface Env {
    * has to match the deployed hostname exactly.
    */
   PUBLIC_BASE_URL?: string;
+  /**
+   * Exactly "true" enables the non-interactive POST-with-ms_access_token path
+   * on /authorize. Deliberately unset on the deployed Worker (neither a var in
+   * wrangler.jsonc nor a secret), so production only ever authorizes through
+   * the interactive device-code flow; local `wrangler dev` runs turn it on via
+   * the gitignored `.dev.vars`. Remote test r5 asserts production refuses it.
+   */
+  ALLOW_DIRECT_AUTHORIZE?: string;
 }

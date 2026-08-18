@@ -29,4 +29,10 @@
   //   MS_CLIENT_ID       Application (client) ID of the Entra app registration
   //   ALLOWED_MS_USER_ID Graph /me id of the one account allowed to authorize
   //   ALLOWED_MS_UPN     that account's userPrincipalName / mail
+  //
+  // ALLOW_DIRECT_AUTHORIZE ("true" enables POST /authorize with a caller-held
+  // Microsoft access token) is deliberately NOT set here and NOT a deployed
+  // secret: production only authorizes through the interactive device-code
+  // flow. Local `wrangler dev` runs enable it via the gitignored .dev.vars.
+  // Remote test r5 asserts the deployed Worker refuses the direct path.
 }
