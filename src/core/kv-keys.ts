@@ -21,3 +21,11 @@ export const STATE_SUBSCRIPTION = "sub:mail";
 
 /** The capped ring buffer of received change notifications, newest first. */
 export const STATE_ACTIVITY = "activity:mail";
+
+/** Prefix of the short-lived attachment downloads get_attachment hands out. */
+export const DOWNLOAD_PREFIX = "dl:";
+
+/** One pending attachment download, keyed by its unguessable id. */
+export function downloadKey(id: string): string {
+  return DOWNLOAD_PREFIX + id;
+}

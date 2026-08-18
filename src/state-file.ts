@@ -13,7 +13,19 @@ import { setDefaultStateStore, type StateStore } from "./core/state.js";
 
 export const STATE_FILE = path.join(PROJECT_ROOT, ".mcp-state.json");
 
-type StateDocument = Record<string, string>;
+/**
+ * Entries are plain strings; a value written with a TTL is wrapped instead, so
+ * the expiry survives a restart. Both shapes are read back transparently.
+ */
+type StateEntry = string | { value: string; expiresAt: number };
+type StateDocument = Record<string, StateEntry>;
+
+/** The live value of an entry, or null when it is absent or expired. */
+function liveValue(entry: StateEntry | undefined): string | null {
+  if (entry === undefined) return null;
+  if (typeof entry === "string") return entry;
+  return entry.expiresAt > Date.now() ? entry.value : null;
+}
 
 async function readDocument(file: string): Promise<StateDocument> {
   try {
@@ -42,6 +54,10 @@ export function createFileStateStore(file: string = STATE_FILE): StateStore {
 
   async function mutate(change: (doc: StateDocument) => void): Promise<void> {
     const doc = await readDocument(file);
+    // Rewriting the whole file anyway, so drop anything that has expired.
+    for (const [key, entry] of Object.entries(doc)) {
+      if (liveValue(entry) === null) delete doc[key];
+    }
     change(doc);
     await fs.writeFile(file, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
   }
@@ -49,10 +65,13 @@ export function createFileStateStore(file: string = STATE_FILE): StateStore {
   return {
     mode: "local",
     async get(key) {
-      return serialise(async () => (await readDocument(file))[key] ?? null);
+      return serialise(async () => liveValue((await readDocument(file))[key]));
     },
-    async put(key, value) {
-      return serialise(() => mutate((doc) => void (doc[key] = value)));
+    async put(key, value, options) {
+      const entry: StateEntry = options?.ttlSeconds
+        ? { value, expiresAt: Date.now() + options.ttlSeconds * 1000 }
+        : value;
+      return serialise(() => mutate((doc) => void (doc[key] = entry)));
     },
     async delete(key) {
       return serialise(() => mutate((doc) => void delete doc[key]));

@@ -17,11 +17,28 @@ import { AsyncLocalStorage } from "node:async_hooks";
  */
 export type StateMode = "local" | "remote";
 
+/** Options for a single write. */
+export type PutOptions = {
+  /**
+   * Drop the entry after this many seconds. Best-effort garbage collection, not
+   * a security boundary: KV enforces it server-side (with a 60 s minimum), the
+   * other stores approximate it, and callers that care about the deadline must
+   * also record it inside the value (see core/downloads.js).
+   */
+  ttlSeconds?: number;
+};
+
 /** A tiny string keyed store. Values are JSON documents written by the caller. */
 export interface StateStore {
   readonly mode: StateMode;
+  /**
+   * Public origin of this server, when it has one (the Worker's PUBLIC_BASE_URL).
+   * Alongside `mode` because it answers the same question — what kind of host is
+   * this running on — for features that have to hand out a URL to themselves.
+   */
+  readonly publicBaseUrl?: string;
   get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
+  put(key: string, value: string, options?: PutOptions): Promise<void>;
   delete(key: string): Promise<void>;
 }
 
@@ -78,15 +95,28 @@ export async function writeJson(store: StateStore, key: string, value: unknown):
 }
 
 /** An in-process store. Used by the test harness; never by a running server. */
-export function createMemoryStateStore(mode: StateMode = "remote"): StateStore {
-  const map = new Map<string, string>();
+export function createMemoryStateStore(
+  mode: StateMode = "remote",
+  publicBaseUrl?: string
+): StateStore {
+  const map = new Map<string, { value: string; expiresAt?: number }>();
   return {
     mode,
+    publicBaseUrl,
     async get(key) {
-      return map.get(key) ?? null;
+      const entry = map.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt !== undefined && entry.expiresAt <= Date.now()) {
+        map.delete(key);
+        return null;
+      }
+      return entry.value;
     },
-    async put(key, value) {
-      map.set(key, value);
+    async put(key, value, options) {
+      map.set(key, {
+        value,
+        ...(options?.ttlSeconds ? { expiresAt: Date.now() + options.ttlSeconds * 1000 } : {}),
+      });
     },
     async delete(key) {
       map.delete(key);

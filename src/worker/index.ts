@@ -1,7 +1,8 @@
-// Cloudflare Worker entry point: the same 23 tools, 2 prompts and 2 resources
+// Cloudflare Worker entry point: the same 24 tools, 2 prompts and 2 resources
 // as the stdio server, served over MCP Streamable HTTP and gated by OAuth,
-// plus the two things only a hosted server can do — receive Graph change
-// notifications and keep their subscription alive on a schedule.
+// plus the three things only a hosted server can do — receive Graph change
+// notifications, keep their subscription alive on a schedule, and hand out
+// short-lived authenticated links to attachment bytes it cannot save to disk.
 //
 // OAuthProvider owns the whole authorization-server surface — discovery
 // metadata, dynamic client registration, PKCE, the token endpoint, bearer
@@ -12,7 +13,9 @@
 // It exposes only a fetch handler, so the cron trigger is wired by wrapping it
 // rather than exporting it directly.
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { DOWNLOAD_ROUTE_PREFIX } from "../core/downloads.js";
 import { defaultHandler } from "./authorize.js";
+import { downloadHandler } from "./download.js";
 import { mcpHandler } from "./mcp-handler.js";
 import { keepSubscriptionAlive } from "./notifications.js";
 import type { Env } from "./env.js";
@@ -20,9 +23,23 @@ import type { Env } from "./env.js";
 /** The only scope this server issues; the mailbox permissions are fixed at consent time. */
 const SCOPES_SUPPORTED = ["outlook"];
 
+/**
+ * Both protected routes behind one handler: the MCP endpoint, and the
+ * attachment downloads get_attachment hands out. Listing /download/ as an
+ * apiRoute is what puts it behind the same bearer check as /mcp — a link with
+ * no token gets OAuthProvider's 401, not the file.
+ */
+const apiHandler = {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return new URL(request.url).pathname.startsWith(DOWNLOAD_ROUTE_PREFIX)
+      ? downloadHandler.fetch(request, env, ctx)
+      : mcpHandler.fetch(request, env, ctx);
+  },
+};
+
 const oauthProvider = new OAuthProvider<Env>({
-  apiRoute: "/mcp",
-  apiHandler: mcpHandler,
+  apiRoute: ["/mcp", DOWNLOAD_ROUTE_PREFIX],
+  apiHandler,
   defaultHandler,
 
   authorizeEndpoint: "/authorize",
