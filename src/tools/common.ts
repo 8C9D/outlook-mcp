@@ -18,6 +18,18 @@ export function errorResult(text: string): ToolResult {
 }
 
 /**
+ * A caller-fixable problem with the tool's input (an unknown name, a missing
+ * prerequisite). runTool surfaces the message verbatim, without the "Tool failed"
+ * prefix reserved for unexpected faults.
+ */
+export class ToolInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ToolInputError";
+  }
+}
+
+/**
  * Run a tool handler, converting every failure into an isError tool result so
  * the server process never crashes on a tool call.
  */
@@ -26,6 +38,7 @@ export async function runTool(fn: () => Promise<ToolResult>): Promise<ToolResult
     return await fn();
   } catch (err) {
     if (err instanceof AuthRequiredError) return errorResult(err.message);
+    if (err instanceof ToolInputError) return errorResult(err.message);
     if (err instanceof GraphError) {
       let detail = err.body;
       try {
@@ -40,6 +53,18 @@ export async function runTool(fn: () => Promise<ToolResult>): Promise<ToolResult
     }
     return errorResult(`Tool failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * True when a Graph failure means "there is no such item". Graph answers a
+ * well-formed but unknown id with 404, and an id it cannot even parse with
+ * 400 ErrorInvalidIdMalformed; both mean the same thing to a caller.
+ */
+export function isNotFound(err: unknown): boolean {
+  return (
+    err instanceof GraphError &&
+    (err.status === 404 || (err.status === 400 && /ErrorInvalidIdMalformed/i.test(err.body)))
+  );
 }
 
 /** GET a Graph collection, following @odata.nextLink until `cap` items are collected. */

@@ -70,6 +70,19 @@ import {
   manageRulesHandler,
   manageRulesSchema,
 } from "./tools/manage-rules.js";
+import {
+  createFolderDescription,
+  createFolderHandler,
+  createFolderSchema,
+} from "./tools/create-folder.js";
+import {
+  manageCategoriesDescription,
+  manageCategoriesHandler,
+  manageCategoriesSchema,
+} from "./tools/manage-categories.js";
+import { listTasksDescription, listTasksHandler, listTasksSchema } from "./tools/list-tasks.js";
+import { manageTaskDescription, manageTaskHandler, manageTaskSchema } from "./tools/manage-task.js";
+import { registerPrompts } from "./prompts.js";
 import { PROJECT_ROOT } from "./project-root.js";
 
 const { version } = JSON.parse(
@@ -163,6 +176,28 @@ server.registerTool(
   { description: manageRulesDescription, inputSchema: manageRulesSchema },
   manageRulesHandler
 );
+server.registerTool(
+  "create_folder",
+  { description: createFolderDescription, inputSchema: createFolderSchema },
+  createFolderHandler
+);
+server.registerTool(
+  "manage_categories",
+  { description: manageCategoriesDescription, inputSchema: manageCategoriesSchema },
+  manageCategoriesHandler
+);
+server.registerTool(
+  "list_tasks",
+  { description: listTasksDescription, inputSchema: listTasksSchema },
+  listTasksHandler
+);
+server.registerTool(
+  "manage_task",
+  { description: manageTaskDescription, inputSchema: manageTaskSchema },
+  manageTaskHandler
+);
+
+registerPrompts(server);
 
 await server.connect(new StdioServerTransport());
 console.error(`outlook MCP server v${version} ready (stdio).`);
