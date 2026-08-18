@@ -82,3 +82,42 @@ Recorded while executing the "harden for headless launch and wire into Claude De
 - **Config edit**: existing `claude_desktop_config.json` (1590 bytes, no `mcpServers` key, mode 0600) was backed up to `claude_desktop_config.json.bak-20260818-084934` (same directory), then the `mcpServers.outlook` block was inserted surgically at the top of the object. Verified: the result parses as JSON, and stripping the six inserted lines reproduces the backup byte-for-byte; file mode remains 0600.
 - **dist/ stays gitignored**: the build is reproducible via `npm run build`; committing artifacts wasn't requested. Consequence: after a fresh clone or `git clean`, `npm run build` must be re-run before Claude Desktop can start the server.
 - **No `env` block in the config**: the server locates `.env` itself (section 1), so none is needed — matching the task's instruction.
+
+## v2 full parity
+
+Recorded while executing the "v2 full-parity tool surface" task on 2026-08-18.
+
+### Phase A (portal)
+- The three new delegated permissions were added in the portal via Claude in Chrome; the saved list was verified to be exactly: Calendars.ReadWrite, Contacts.ReadWrite, Mail.Read, Mail.ReadWrite, Mail.Send, MailboxSettings.ReadWrite, offline_access, User.Read ("Successfully saved permissions for outlook-mcp").
+- The portal's own warning ("users will have to consent even if they've already done so previously") confirms Phase B's re-consent requirement.
+
+### Phase B (re-consent)
+- The scope list lives only in `src/auth.ts` (`SCOPES`); `src/login.ts` reuses it via `getAccessToken`, so one edit covers "auth.ts and the login script".
+- `.token-cache.json` was deleted before login, exactly as specified.
+- The device-code sign-in again hit Microsoft's "Verify your email" account-security challenge (code sent to the recovery Gmail), as in v1. Per policy the automation does not complete identity-verification challenges — the user completes that step; the consent screen is verified before approval per the task spec (or, if the user approves it themselves, the granted scopes are verified afterwards from the token).
+
+### Tool-count discrepancy in the spec
+- Phase E says "old five + new nine", but Phase D defines ten new tools (read_message, get_attachment, update_draft, send_draft, manage_message, list_folders, manage_event, search_contacts, manage_contact, auto_reply). All ten were implemented; the stdio test asserts the real 15-tool list.
+
+### Design decisions
+- **create_draft forward mode**: `to` is allowed (and usually wanted) with `forward_message_id`; `subject` is not (it comes from the original). `reply_all` is rejected outside reply mode. Reply/forward bodies are built exactly like v1 replies: createReply/createReplyAll/createForward, re-fetch the quoted body as text, PATCH the user's text above it.
+- **send_draft** verifies `isDraft` via Graph before POST `/me/messages/{id}/send`, and also rejects drafts with no To recipients (Graph would 400 anyway; the tool gives a clearer message). Output notes the message id changes on send.
+- **update_draft** verifies `isDraft` before PATCHing; an empty `cc: []` clears the CC list (documented in the schema).
+- **manage_message** loops per id with per-id try/catch; the result lists OK/FAILED per message. The overall result is `isError` only when every message failed. Moves report the new message id Graph assigns.
+- **list_folders** shows two levels (top + children) and notes deeper subfolders exist without walking them; an `include_hidden` flag exists mostly so the schema is non-empty (MCP clients handle empty schemas inconsistently).
+- **manage_event cancel** picks the Graph call by role and attendee count: organizer with attendees → POST `/cancel` (notifies attendees); organizer without attendees → DELETE (soft, to Deleted Items — Graph's `/cancel` is meaningless without attendees); attendee → POST `/decline` with sendResponse. This matches the spec's "attendee's cancel is a decline".
+- **search_contacts** uses `startswith` $filter on displayName/givenName/surname (ORed). Graph's contacts `$search` is inconsistently supported on consumer accounts; prefix filtering is reliable and enough for name lookup.
+- **manage_contact** stores `phones` as `businessPhones` (Graph's general-purpose phone list); update semantics are replace-not-append, same as draft recipients.
+- **auto_reply set** uses `alwaysEnabled` when no window is given and `scheduled` with America/Toronto datetimes when both start and end are given (providing only one is an error). `externalAudience` is set to `all` so the external message actually reaches strangers; get strips HTML tags from stored messages for readable output.
+- **get_attachment** only downloads `fileAttachment`s (item/reference attachments have no content bytes → clear isError). Filenames are sanitized (no path separators/control chars) and collision-suffixed " (1)", " (2)", … in `~/Downloads/outlook-mcp-attachments/`.
+- **read_message** truncates bodies at 10 000 chars (single-message reads warrant more than read_thread's 2 000-per-message cap).
+- **Version bumped to 0.2.0**; package description updated (it claimed "never sends mail").
+
+### Harness decisions (Phase E)
+- v1 tests for search_mail/read_thread/list_events are kept (renamed v1a/v1b/v1d); v1's standalone create_draft test is superseded by the draft-lifecycle test (create → update → send), which exercises create_draft's new-message mode end-to-end.
+- The received test message is located by exact-subject $filter polling (5 s interval, 60 s cap) rather than $search, which has indexing lag.
+- Test c reuses the received copy from test b (per the spec's ordering), and its cleanup soft-deletes both the received and sent copies via manage_message, then permanently deletes the test folder (test-only purge).
+- An extra test (b2) asserts send_draft refuses a non-draft id — the guardrail the design leans on.
+- auto_reply restore PATCHes back the exact saved `automaticRepliesSetting` object (not just "clear"), and the final sweep re-checks status and that no "[MCP TEST]" text remains in the reply messages.
+- Deleted test contacts are soft-deleted (policy: no purge in the tool surface); the sweep asserts they no longer appear under `/me/contacts`. Graph exposes no supported purge for contacts' Deleted Items, so the recoverable copy in trash is accepted as clean.
+- purgeTestFolders also checks `deleteditems`' child folders so a soft-deleted test folder can't linger.
