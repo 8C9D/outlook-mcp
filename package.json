@@ -1,0 +1,20 @@
+{
+  "name": "outlook-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Foundation for an MCP server connecting Claude to a personal Outlook account via Microsoft Graph (auth + verification only; no MCP tools yet).",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx src/verify.ts"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.16.2",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
