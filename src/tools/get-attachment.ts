@@ -3,7 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
-import { ToolResult, errorResult, runTool, textResult } from "./common.js";
+import {
+  DOWNLOAD_MAX_BYTES,
+  DOWNLOAD_TTL_DEFAULT_MINUTES,
+  DOWNLOAD_TTL_MAX_MINUTES,
+  storeDownload,
+} from "../core/downloads.js";
+import { getStateStore } from "../core/state.js";
+import { ToolResult, errorResult, formatLocal, runTool, textResult } from "./common.js";
 import { formatSize } from "./read-message.js";
 
 export const getAttachmentSchema = {
@@ -12,12 +19,21 @@ export const getAttachmentSchema = {
     .string()
     .min(1)
     .describe("The attachment id (from read_message's attachment inventory)."),
+  link_ttl_minutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(DOWNLOAD_TTL_MAX_MINUTES)
+    .default(DOWNLOAD_TTL_DEFAULT_MINUTES)
+    .describe(
+      `Hosted server only: how long the download link stays valid, in minutes (default ${DOWNLOAD_TTL_DEFAULT_MINUTES}, max ${DOWNLOAD_TTL_MAX_MINUTES}). Ignored by the local server, which saves the file to disk instead.`
+    ),
 };
 
 const getAttachmentArgs = z.object(getAttachmentSchema);
 
 export const getAttachmentDescription =
-  "Download one attachment of a message to ~/Downloads/outlook-mcp-attachments/ and return the saved file path and size. For small text attachments (text/* or JSON under 50 KB) the content is also returned inline. Get attachment ids from read_message.";
+  "Download one attachment of a message. Small text attachments (text/* or JSON under 50 KB) are returned inline on both servers. Everything else depends on where this server runs: the local (stdio) server saves the file to ~/Downloads/outlook-mcp-attachments/ and returns the path, while the hosted server has no filesystem and instead returns a single-mailbox, sign-in-required download link that expires within 15 minutes. Get attachment ids from read_message.";
 
 const SAVE_DIR = path.join(os.homedir(), "Downloads", "outlook-mcp-attachments");
 const INLINE_LIMIT = 50 * 1024;
@@ -46,7 +62,7 @@ export async function getAttachmentHandler(
   input: z.input<typeof getAttachmentArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { message_id, attachment_id } = getAttachmentArgs.parse(input);
+    const { message_id, attachment_id, link_ttl_minutes } = getAttachmentArgs.parse(input);
     const att = await callGraphServer(
       `/me/messages/${encodeURIComponent(message_id)}/attachments/${encodeURIComponent(attachment_id)}`
     );
@@ -61,16 +77,56 @@ export async function getAttachmentHandler(
     }
 
     const buffer = Buffer.from(att.contentBytes, "base64");
-    await fs.mkdir(SAVE_DIR, { recursive: true });
-    const savePath = await collisionFreePath(sanitizeFilename(att.name ?? "attachment"));
-    await fs.writeFile(savePath, buffer);
-
+    const name: string = att.name || "attachment";
     const contentType: string = att.contentType ?? "application/octet-stream";
     const textLike = /^text\//i.test(contentType) || /^application\/json\b/i.test(contentType);
-    let inline = "";
-    if (textLike && buffer.length < INLINE_LIMIT) {
-      inline = `\n\nContent (${contentType}):\n${buffer.toString("utf8")}`;
+    const inline =
+      textLike && buffer.length < INLINE_LIMIT
+        ? `\n\nContent (${contentType}):\n${buffer.toString("utf8")}`
+        : "";
+
+    const store = getStateStore();
+    if (store?.mode === "remote") {
+      const head =
+        `Attachment retrieved.\n` +
+        `Name: ${name}\n` +
+        `Type: ${contentType}\n` +
+        `Size: ${formatSize(buffer.length)}`;
+      // Text small enough to read is answered in full; a link to it would be
+      // strictly worse for the model and would cost a KV write.
+      if (inline) return textResult(`${head}\nDelivered inline (this server has no filesystem).${inline}`);
+
+      if (buffer.length > DOWNLOAD_MAX_BYTES) {
+        return errorResult(
+          `${name} is ${formatSize(buffer.length)}, too large for this server to hand over ` +
+            `(limit ${formatSize(DOWNLOAD_MAX_BYTES)}). Open it in Outlook, or fetch it from the ` +
+            "local stdio server, which saves attachments straight to disk."
+        );
+      }
+
+      const parked = await storeDownload(
+        store,
+        { name, contentType, base64: att.contentBytes, size: buffer.length },
+        link_ttl_minutes
+      );
+      if (!parked.url) {
+        return errorResult(
+          "This server does not know its own public URL, so it cannot hand out a download link. " +
+            "Set PUBLIC_BASE_URL and redeploy."
+        );
+      }
+      return textResult(
+        `${head}\n` +
+          `Download: ${parked.url}\n` +
+          `Link expires: ${formatLocal(parked.expiresAt)} (in ${link_ttl_minutes} min)\n` +
+          "The link needs the same sign-in as this connector — it is useless to anyone else, and " +
+          "it stops working when it expires. Fetch it again for a fresh link."
+      );
     }
+
+    await fs.mkdir(SAVE_DIR, { recursive: true });
+    const savePath = await collisionFreePath(sanitizeFilename(name));
+    await fs.writeFile(savePath, buffer);
 
     return textResult(
       `Attachment saved.\n` +
