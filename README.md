@@ -9,6 +9,14 @@ connector. All datetimes are America/Toronto unless a caller supplies an explici
 > the Microsoft app registration, which is the only genuinely fiddly part, and the three sign-in errors
 > it is easy to hit. If an install is misbehaving, `npm run doctor` says which part and what to do.
 
+**Security model in one paragraph.** Mailbox content is treated as untrusted input (an email can try
+to prompt-inject the model), and the design answers structurally: nothing sends except by naming an
+already-existing, reviewable draft (no tool composes-and-sends); mailbox deletes are soft; inbox rules
+cannot forward; the hosted endpoint accepts exactly one Microsoft identity, interactively only; and
+the single autonomous LLM path (opt-in auto-filing) is fenced off in code so it cannot send, delete or
+reply. No secrets ever enter this repository. The reasoning is in
+[Security model](#security-model) and [Security model in detail](#security-model-in-detail).
+
 ## What it does
 
 | Area | Tools | What you get |
