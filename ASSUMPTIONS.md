@@ -1146,3 +1146,118 @@ read from KV (which is exactly what Graph does, minus the wait):
   human approving each call.
 - `wrangler.jsonc`: `ANTHROPIC_API_KEY` documented in the secrets comment, and the two digest cron
   schedules documented alongside the upkeep one.
+
+## v10 batch D — annotations, a doctor, and docs a stranger can follow
+
+### The annotation scheme, and the judgment calls in it
+Every tool now declares **all four** MCP hints. Stating them all was itself a decision: the protocol's
+defaults for an absent hint are "not read-only, destructive, not idempotent, open-world", which is
+wrong for the thirteen read-only tools and misleading for most of the rest. One rule defines each hint
+(the rules are in `core/registry.ts`, the resulting table in the README):
+
+- **`readOnlyHint`** — changes nothing: not the mailbox, not the server's own state, not local disk.
+- **`destructiveHint`** — can remove or overwrite something the user would miss, or do something
+  outward that cannot be taken back.
+- **`idempotentHint`** — a repeat leaves the same state (set-shaped) rather than creating, appending or
+  sending again.
+- **`openWorldHint`** — the call, or the setting it establishes, moves data between this mailbox and
+  parties outside it.
+
+The calls that could reasonably have gone the other way, and why they went this way:
+
+- **`openWorldHint` is not "talks to a remote API".** Under that reading all twenty-nine tools are
+  open-world and the hint tells a caller nothing. The line drawn instead is the *mailbox boundary*,
+  which makes the hint discriminating: seven tools have it, twenty-two do not.
+- **The hint covers the setting a call establishes, not only the call.** `auto_reply` writes a mailbox
+  setting and sends nothing — but the reply it turns on is delivered to everyone who writes to the
+  account, so it is open-world. `manage_auto_filing` is open-world by the same rule: the switch commits
+  the server to sending subjects and body excerpts to the Anthropic API. The alternative (hint the HTTP
+  call only) would have marked the two tools that reach the outside world hardest as closed.
+- **`manage_rules` is destructive but NOT open-world**, and that is only true because forwarding
+  actions were deliberately left out of the tool in v3. If a rule could forward, this hint would have
+  to flip. Worth stating: it is the one annotation that depends on an earlier design decision holding.
+- **Soft deletes still count as destructive.** `manage_message` is destructive even though its delete
+  is soft: the mail leaves where it was and comes back with a new id.
+- **`idempotentHint` is read as PUT-shaped vs POST-shaped, not as "does a repeat error?"** By the
+  letter of the spec, `create_folder` is idempotent — a duplicate name is refused and the environment
+  is unchanged — and so, more alarmingly, is `send_draft`, whose second call finds no draft to send.
+  Both are annotated **not** idempotent, because a caller reading the hint is asking "is retrying
+  safe?", and for a create-or-send the honest answer is "it will not do what you meant".
+- **Three tools are not read-only although they look it.** `check_new_mail` advances the stored delta
+  position on every successful call — which is exactly the feature. `get_attachment` and
+  `export_message` write a file to `~/Downloads` on stdio and a short-lived download record to KV on
+  the Worker, with collision-safe names, so a repeat leaves a second copy and neither is idempotent.
+  The cost is real: a client that auto-approves read-only tools will now prompt for `check_new_mail`.
+  Accepted — the alternative is a hint that lies about a state change.
+- **`manage_senders` is neither destructive nor open-world, and is idempotent.** Blocking is undone by
+  unblocking and blocking twice is the same state; the junk list never leaves the mailbox. Recorded as
+  a judgment call because its default `move_message: true` does move the message to Junk — reversibly,
+  by the opposite action, which is why it did not tip the destructive hint.
+
+The table is frozen twice on purpose: in `core/registry.ts` and again in the harness (`v10a`). A hint
+cannot drift without someone changing it in both places deliberately.
+
+### Getting the hints onto both wires — and what could not be tested headlessly
+`registerTool`'s config gained `annotations`, so both transports carry them for free: they build the
+same server from `registerAll`. Asserting it took three places:
+
+- `v10a` checks the registry itself, plus the rules (a read-only tool may not claim to be destructive)
+  and the two tools the safety story rests on.
+- The stdio smoke test now compares the annotations that **actually came over the wire** against the
+  same frozen table, so a serialization change cannot silently drop them.
+- `r9` gained a per-tool comparison of the deployed `tools/list` against the local registry.
+
+`r9` is `testAuthed`, and it cannot be otherwise: `/mcp` requires a bearer, production mints one only
+through an interactive device-code sign-in, and there is deliberately no unauthenticated MCP surface to
+read a tool list from. **So a headless run cannot verify the deployed annotations directly.** What it
+can do is verify it is looking at the right build: `/health` now reports `version`, and the new
+unauthenticated `r26` fails if the deployed Worker is not running this checkout's version. Headless
+therefore proves "the deployed build is the one whose registry carries these hints", and the authed
+`r9` proves the hints themselves. Serving the version anonymously is not a disclosure decision worth
+agonizing over — `/health` still says nothing about the mailbox or whether anyone is authorized.
+
+### `npm run doctor`
+Four stages, in the order a broken install fails: environment (no network, no credentials), the
+sign-in cached on disk, a live probe, and the deployed Worker. `--env-only` runs the first stage alone
+— that is the stage a fresh clone can pass, and the one the batch's fresh-clone dry run exercises.
+Exit code 1 if any check FAILs; WARN never fails the run.
+
+- **Graph access tokens for a personal Microsoft account are not JWTs.** The first implementation
+  decoded the `scp` claim to list granted scopes and got nothing back, because an MSA Graph token is an
+  opaque compact ticket, not a JWT. The scope check now reads MSAL's own
+  `AuthenticationResult.scopes`, which is authoritative, free, and works. (It reports `openid` and
+  `profile` alongside the eight requested scopes; `missingScopes` therefore checks containment, not
+  equality.) `auth.ts` gained `getGrantedScopes()` for this.
+- **Two Graph probes, not one.** `/me` needs only `User.Read`, so it cannot tell a fully-consented
+  sign-in from one that was granted the profile scope and nothing else. Reading the inbox folder is
+  what proves the mail scopes were really consented to.
+- **Translations, not error numbers.** `AADSTS70002` → public client flows are off; `AADSTS50020` and
+  `AADSTS700016` → the app's audience excludes personal Microsoft accounts; a plain Graph `403` → the
+  permission is missing from the registration, and re-running `npm run login` is required because
+  consent is granted per scope at sign-in. These are the three failures this project actually hit, and
+  an unexplained AADSTS number sends a stranger to a search engine.
+- The deployment stage can only WARN: a local-only install has no Worker, and a Worker one version
+  behind still works.
+- The module is importable — the CLI runs only when `process.argv[1]` is this file — so `v10b` asserts
+  the environment stage passes here, that each translation still fires, that a 404 is *not* explained
+  as a permission problem, and the scope arithmetic.
+
+### `package.json` and `core/version.ts`
+The v9 notes claimed the harness asserted these two stay in sync. It did not. `v10b` now does, and the
+stdio smoke test additionally asserts the version the server reports over `initialize` is the same one.
+
+### Docs
+- **`SETUP.md`** is new: zero to working, for someone who has never seen the repo. The Entra
+  registration gets the detail it needs — personal-accounts audience, `allowPublicClient`, the eight
+  delegated permissions, and a table mapping each AADSTS number to the setting that is wrong — then
+  install and login, client configuration, and the optional Worker deploy and claude.ai connector as
+  clearly-marked optional sections. The README's setup sections shrank to pointers so the two cannot
+  drift; what stayed in the README is the reference material (the `seed:kv` caveat, the
+  `ALLOW_DIRECT_AUTHORIZE` warning, the `resourceMetadata` exact-match requirement).
+- **README restructured for a reader who has not seen it before**: an eight-row feature table by area,
+  the security model promoted to the top as five structural claims (each linking to its full section,
+  which was renamed "Security model in detail"), an architecture sketch, a cost statement in the
+  overview, and the new **Tool annotations** section carrying the rules, the full table and the six
+  calls worth explaining. Stale counts fixed throughout (23/27 tools → 29), and the version-labelled
+  prose ("new in v8", "v9 adds") de-versioned — a stranger does not know what v8 was.
+- `package.json` and `src/core/version.ts` → **0.10.0**.

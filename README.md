@@ -1,26 +1,83 @@
 # outlook-mcp
 
-An MCP server that connects Claude to a personal Microsoft (outlook.com) account via Microsoft Graph.
-v9 serves **twenty-nine tools, two prompts and two resources** over **two transports** — the local
-stdio server and a remote Cloudflare Worker (see [Remote deployment](#remote-deployment)) — covering mail (search, read, compose, send,
-manage, categorize), attachments (read and add), folders (list and create), inbox rules, categories,
-calendar (list calendars and events, create, update, cancel, respond), contacts, Microsoft To Do
-tasks, auto-reply settings, **incremental "what changed" checks** and **push notifications** for
-arriving mail (see [Knowing what is new](#knowing-what-is-new)), attachments that work on both
-transports plus **repeating events, reminders and multiple calendars** (see
-[Attachments on both transports](#attachments-on-both-transports) and
-[Repeating events](#repeating-events)), and — new in v8 — **subtasks and repeating tasks**,
-**working hours and Focused-Inbox overrides**, **blocking a junk sender**, and **message forensics**:
-internet headers rendered for a phishing check plus a `.eml` export of the raw MIME (see
-[Microsoft To Do notes](#microsoft-to-do-notes), [Mailbox settings](#mailbox-settings),
-[Junk senders](#junk-senders-what-graph-will-and-will-not-do) and
-[Message forensics](#message-forensics)). New in v9: two **opt-in LLM features** on the hosted server —
-auto-filing of arriving mail into your existing folders, and a morning brief left as a draft. **Both ship
-disabled**; see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff)
-for what they cost, how the mail is treated as untrusted input, and how to turn them on and off. All
-datetimes are handled in America/Toronto unless a caller supplies an explicit UTC offset.
+An MCP server that connects Claude to a **personal** Microsoft (outlook.com) mailbox through Microsoft
+Graph. Twenty-nine tools, two prompts and two resources, served from one shared registry over **two
+transports**: a local stdio server, and a Cloudflare Worker that claude.ai can use as a custom
+connector. All datetimes are America/Toronto unless a caller supplies an explicit UTC offset.
 
-## Tools (v9)
+> **New here?** [**SETUP.md**](SETUP.md) goes from an empty directory to a working server — including
+> the Microsoft app registration, which is the only genuinely fiddly part, and the three sign-in errors
+> it is easy to hit. If an install is misbehaving, `npm run doctor` says which part and what to do.
+
+## What it does
+
+| Area | Tools | What you get |
+| --- | --- | --- |
+| **Read mail** | `search_mail`, `read_thread`, `read_message`, `check_new_mail`, `get_mailbox_activity` | full-text search or newest-first listing, whole conversations, one message with its attachment inventory and forensic headers, and two ways to ask "what's new" — a delta query anywhere, or Graph's pushed notifications on the hosted server |
+| **Write mail** | `create_draft`, `update_draft`, `add_attachment`, `send_draft` | compose, reply, forward and attach — and send **only** by naming an existing draft, never in one call ([why](#two-step-send-by-design)) |
+| **Organize** | `manage_message`, `list_folders`, `create_folder`, `manage_categories`, `manage_rules`, `manage_senders` | batch move/archive/delete/flag/categorize in one Graph round-trip, the folder tree, the category master list, inbox rules with exceptions (and deliberately no forwarding action), and junk-sender blocking |
+| **Calendar** | `list_calendars`, `list_events`, `create_event`, `manage_event` | multiple calendars, repeating events and reminders, single-occurrence or whole-series edits, and invitation responses |
+| **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts, out-of-office, working hours, Focused-Inbox overrides |
+| **Tasks** | `list_tasks`, `manage_task` | Microsoft To Do with subtasks, repeat rules, task lists, and mail turned into a task |
+| **Evidence** | `export_message`, `get_attachment` | attachment bytes and a message's raw `.eml` — saved to disk on stdio, handed out as an expiring sign-in-required link on the hosted server |
+| **Optional LLM** | `manage_auto_filing`, `get_auto_filing_log` | auto-filing of arriving mail into your existing folders, and a morning brief left as a draft. **Both ship disabled**, both cost money, both are audited ([what they cost](#what-it-costs)) |
+
+Every tool carries MCP [annotation hints](#tool-annotations) so a client can tell a read from a write,
+a reversible act from an irreversible one, and a call that stays inside the mailbox from one that
+reaches other people.
+
+**What it costs to run.** Nothing, apart from a Cloudflare account for the optional hosted server (the
+free plan is enough). The only spend is the two optional LLM features, which call the Anthropic API on
+your mail: about **$1–2 a month** at ordinary volumes, capped, and **off unless you turn them on** —
+see [What it costs](#what-it-costs) for the measured numbers and the ceiling.
+
+## Security model
+
+With send, delete and settings tools available, **mailbox content is untrusted input**: an email can
+contain text that tries to instruct the model into sending, deleting or forwarding things (prompt
+injection). The design answers that structurally rather than by asking a model to be careful:
+
+- **Sending is two-step and no tool composes-and-sends.** `/me/sendMail` is never called. The complete
+  message exists as a reviewable draft before anything can leave ([detail](#two-step-send-by-design)).
+- **Mailbox deletes are soft.** Messages, events and contacts go to Deleted Items and stay
+  recoverable; nothing in the tool surface purges. The single exception — `manage_task` delete — is
+  permanent because To Do has no recoverable store, and says so loudly ([detail](#soft-delete-policy)).
+- **Inbox rules cannot forward.** Rules act on all future mail with no per-message approval, so their
+  action list is restricted to move, mark read and soft delete ([detail](#inbox-rules-manage_rules)).
+- **The hosted endpoint is single-user and interactive-only.** Nothing anonymous reaches `/mcp`, only
+  one Microsoft identity can authorize it, and the non-interactive authorize path is disabled in
+  production ([detail](#single-user-allowlist)).
+- **The auto-filing path cannot send, delete or reply — structurally.** It is the one place a model
+  reads untrusted mail *and* acts without a human approving each call, so its capability is fenced off
+  in code, not in a prompt ([detail](#mail-is-untrusted-input-and-the-design-says-so-in-four-places)).
+
+The full reasoning, including what third parties can observe and which approvals to keep on, is in
+[Security model in detail](#security-model-in-detail).
+
+## Architecture
+
+```
+                    src/core/registry.ts  ── one table of 29 tools, 2 prompts, 2 resources
+                              │
+        ┌─────────────────────┴─────────────────────┐
+   src/server.ts                            src/worker/index.ts
+   stdio transport                          Cloudflare Worker, Streamable HTTP
+   MSAL + .token-cache.json                 OAuth (workers-oauth-provider) + tokens in KV
+   state in .mcp-state.json                 state in KV, /notifications, cron triggers
+        └─────────────────────┬─────────────────────┘
+                              │
+                     src/tools/* (29 handlers)
+                              │
+                       src/core/graph.ts  ──►  Microsoft Graph
+```
+
+Both entry points build the *same* `McpServer` from `createMcpServer()`, so the two hosts cannot drift
+— the remote suite asserts the deployed tool list and its annotations equal the local registry. The
+tool layer never knows where its Graph token or its state comes from: `core/token.ts` and
+`core/state.ts` hold indirections each host installs (MSAL and a file locally, KV on the Worker).
+[More detail](#architecture-in-detail), including why the Worker needs no Durable Objects.
+
+## Tools (v10)
 
 | Tool | What it does |
 | --- | --- |
@@ -42,7 +99,7 @@ datetimes are handled in America/Toronto unless a caller supplies an explicit UT
 | `manage_event` | Update / cancel / respond (accept, decline, tentative), on a single event, **one occurrence** of a repeating event, or the **entire series** (`scope`). Also sets `reminder_minutes` (`-1` turns the reminder off) and replaces the `recurrence` rule. Updates and cancellations on events with attendees notify them — series-wide edits notify about every occurrence. |
 | `search_contacts` | Search saved contacts by name prefix; returns name, emails, phones, contact id. |
 | `manage_contact` | Create / update / delete (soft) a saved contact. |
-| `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). Unchanged in v8 — `mailbox_settings` covers the *other* settings rather than absorbing this one. |
+| `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). `mailbox_settings` covers the *other* settings rather than absorbing this one. |
 | `mailbox_settings` | Get the mailbox's time zone, working hours, Focused-Inbox overrides and auto-reply status; set working hours (`days`, `start_time`, `end_time`); pin a sender to the Focused or Other tab, or clear that override. |
 | `manage_senders` | Block / unblock the sender of a given message (Graph `markAsJunk` / `markAsNotJunk`). Message-scoped, and the blocked/safe lists **cannot be read back** — see [Junk senders](#junk-senders-what-graph-will-and-will-not-do). |
 | `manage_rules` | List / create / **update (in place)** / delete inbox rules (conditions and **exceptions**: from/sender/subject/body; actions: move, mark read, soft delete). **Rules act automatically on all future incoming mail** — see below. |
@@ -53,6 +110,76 @@ datetimes are handled in America/Toronto unless a caller supplies an explicit UT
 | `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
 | `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, and extra never-classify subject patterns. **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
 | `get_auto_filing_log` | The audit trail of what the classifier actually did: every message it moved and why, and every message it deliberately left alone and why — low confidence, a protected subject, a discarded model answer, the budget cap. The last 100 decisions, newest first. **Remote only.** |
+
+## Tool annotations
+
+Every tool states **all four** MCP annotation hints, on both transports, rather than leaving them to
+the protocol's defaults — which are "destructive and open-world unless told otherwise" and would be
+wrong here far more often than right. One rule defines each hint, so twenty-nine tools cannot drift
+into twenty-nine readings of the same word:
+
+- **`readOnlyHint`** — the call changes nothing: not the mailbox, not the server's own state, not the
+  local disk.
+- **`destructiveHint`** — the call can remove or overwrite something you would miss, or do something
+  outward that cannot be taken back. A *soft* delete still counts: the mail leaves where it was.
+- **`idempotentHint`** — a repeat with the same arguments leaves the same state (set-shaped), rather
+  than creating, appending or sending a second time.
+- **`openWorldHint`** — the call, or the setting it establishes, moves data between this mailbox and
+  parties outside it. Reaching Microsoft Graph is *not* itself open-world; every tool here does that,
+  so treating it as the test would make the hint say nothing.
+
+| Tool | read-only | destructive | idempotent | open-world |
+| --- | --- | --- | --- | --- |
+| `search_mail` | **yes** | — | **yes** | — |
+| `read_thread` | **yes** | — | **yes** | — |
+| `read_message` | **yes** | — | **yes** | — |
+| `export_message` | — | — | — | — |
+| `get_attachment` | — | — | — | — |
+| `create_draft` | — | — | — | — |
+| `update_draft` | — | — | **yes** | — |
+| `send_draft` | — | **yes** | — | **yes** |
+| `manage_message` | — | **yes** | — | — |
+| `list_folders` | **yes** | — | **yes** | — |
+| `create_folder` | — | — | — | — |
+| `list_calendars` | **yes** | — | **yes** | — |
+| `list_events` | **yes** | — | **yes** | — |
+| `create_event` | — | — | — | **yes** |
+| `manage_event` | — | **yes** | — | **yes** |
+| `search_contacts` | **yes** | — | **yes** | — |
+| `manage_contact` | — | **yes** | — | — |
+| `auto_reply` | — | — | **yes** | **yes** |
+| `mailbox_settings` | — | — | **yes** | — |
+| `manage_senders` | — | — | **yes** | — |
+| `add_attachment` | — | — | — | **yes** |
+| `manage_rules` | — | **yes** | — | — |
+| `manage_categories` | — | **yes** | — | — |
+| `list_tasks` | **yes** | — | **yes** | — |
+| `manage_task` | — | **yes** | — | — |
+| `check_new_mail` | — | — | — | — |
+| `get_mailbox_activity` | **yes** | — | **yes** | — |
+| `manage_auto_filing` | — | — | — | **yes** |
+| `get_auto_filing_log` | **yes** | — | **yes** | — |
+
+The calls worth explaining:
+
+- **`send_draft` is the only thing flagged both destructive and open-world.** Mail that has left cannot
+  be recalled, and the draft is no longer a draft.
+- **`manage_rules` is destructive but not open-world** — precisely because forwarding actions are
+  deliberately absent. A rule can soft-delete future mail, but it cannot send any of it anywhere.
+- **`check_new_mail` is not read-only.** Every successful call advances the stored delta position,
+  which is exactly why a repeat does not report the same changes twice.
+- **`get_attachment` and `export_message` are not read-only either** — on stdio they write a file to
+  `~/Downloads`, on the hosted server a short-lived download record to KV. Collision-safe naming means
+  a repeat leaves a second copy, so neither is idempotent.
+- **`auto_reply` is open-world though the call itself sends nothing.** The reply it establishes is
+  delivered to everyone who writes to the account; the same reasoning marks `manage_auto_filing`,
+  whose switch commits the server to sending mail excerpts to the Anthropic API.
+- **`manage_senders` is neither destructive nor open-world:** blocking is undone by unblocking, and the
+  junk list never leaves the mailbox.
+
+These are hints, not a security boundary — the MCP spec is explicit that a client must not make trust
+decisions on annotations from an untrusted server. Here they exist so a client you *do* trust can
+prompt proportionately: reads without ceremony, the seven destructive tools with a real look.
 
 ## Inbox rules (`manage_rules`)
 
@@ -93,12 +220,12 @@ Tasks live in Microsoft To Do (Graph `/me/todo`), reached with the `Tasks.ReadWr
   An unknown name fails with the available list names rather than a bare 404. For `complete`, `reopen`,
   `update`, and `delete`, `task_list` must be the list the task actually lives in — task ids are scoped
   to their list.
-- **Subtasks (v8).** `manage_task` `add_subtask` / `complete_subtask` / `remove_subtask` drive Graph's
+- **Subtasks.** `manage_task` `add_subtask` / `complete_subtask` / `remove_subtask` drive Graph's
   `checklistItems`. An item can be named by `subtask_id` or by its exact text; every subtask call
   answers with the whole checklist, ticked boxes and ids, so the next call needs no lookup.
   `list_tasks` shows a `1/3 subtasks done` tally, and `include_subtasks` prints the items themselves.
   Removing a subtask is permanent, like deleting a task.
-- **Repeating tasks (v8).** `recurrence` on `create` takes the same vocabulary as `create_event`
+- **Repeating tasks.** `recurrence` on `create` takes the same vocabulary as `create_event`
   (`frequency`, `interval`, `weekdays`, `day_of_month`, `month`, `until`/`count`). Two Graph
   behaviours shape the tool: a repeating task **must** have a `due_date` (Graph refuses otherwise),
   and Microsoft To Do **rejects every recurrence change after creation** — a PATCH carrying a
@@ -313,7 +440,7 @@ cron trigger that keeps the subscription alive.
 
 ## LLM mail intelligence (what it costs and how to turn it on/off)
 
-v9 adds two features that call a language model on your mail. **Both ship disabled.** Nothing is
+Two features call a language model on your mail. **Both ship disabled.** Nothing is
 classified, moved, drafted or paid for until you turn them on, and either can be turned off again in
 one tool call that takes effect on the very next message.
 
@@ -443,7 +570,7 @@ offers no way to delete a To Do *list*: that would destroy every task in it at o
 `permanentDelete` helper strictly for cleaning up its own `[MCP TEST]` artifacts — it is not part of the
 tool surface.)
 
-## Security model
+## Security model in detail
 
 With send, delete, and settings tools enabled, **treat mailbox content as untrusted input**: an email
 can contain text that tries to instruct the model into sending, deleting, or forwarding things
@@ -503,17 +630,31 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 
 ## Setup
 
-1. `npm install`
-2. Create `.env` with `AZURE_CLIENT_ID=<Application (client) ID of the outlook-mcp Entra app registration>`
-   (registration: personal Microsoft accounts, public client flows enabled, delegated permissions
-   Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, Contacts.ReadWrite,
-   MailboxSettings.ReadWrite, Tasks.ReadWrite, User.Read, offline_access).
-3. `npm run login` — one-time interactive device-code sign-in.
-4. `npm run serve` — start the MCP server on stdio (this is what an MCP client will launch).
+The full walkthrough — Entra app registration and its two easy-to-miss settings, install, sign-in,
+client configuration, and the optional hosted deployment — is in [**SETUP.md**](SETUP.md). The short
+version, once the app registration exists:
+
+```bash
+npm install
+printf 'AZURE_CLIENT_ID=%s\n' "<Application (client) ID>" > .env
+npm run login     # one-time interactive device-code sign-in
+npm run doctor    # every check should say PASS
+npm run serve     # the stdio server an MCP client launches
+```
+
+`npm run doctor` is the diagnosis tool: it checks the environment, the sign-in cached on disk, the
+scopes that sign-in actually carries and a live `/me` probe, and translates the Microsoft errors a
+misconfigured app registration produces (`AADSTS70002`, `AADSTS50020`, a plain `403`) into the setting
+that is wrong. `npm run doctor -- --env-only` is the part that needs neither network nor credentials —
+what a fresh clone can run.
 
 ## Scripts
 
 - `npm run login` — interactive device-code sign-in; caches tokens and exits.
+- `npm run doctor` — diagnose an install: environment and config, the sign-in on disk, the granted
+  scopes and a live Graph probe, and whether the deployed Worker is running this checkout's version.
+  Prints PASS/WARN/FAIL per check with the fix, including translations of the Microsoft sign-in errors
+  a misconfigured app registration produces. `-- --env-only` runs the stage that needs no credentials.
 - `npm run serve` — run the MCP server (stdio; stdout is protocol-only, logs go to stderr).
 - `npm run test:tools` — live test harness: exercises the tools against the real account (including a
   full delta-query lifecycle) plus unit tests of the webhook handshake, notification ingest and
@@ -536,7 +677,7 @@ from the local cache (`.token-cache.json`, mode 0600, gitignored).
 
 ## Remote deployment
 
-The same 27 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 29 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
@@ -544,7 +685,7 @@ and hand out short-lived authenticated links to attachment bytes it has nowhere 
 
 **Deployed endpoint:** `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
 
-### Architecture
+### Architecture in detail
 
 Everything transport-independent lives under `src/core/`: `registry.ts` (the tool, prompt and
 resource table), `graph.ts` (the Graph transport), `prompts.ts`, `resources.ts`, `token.ts`,
@@ -555,7 +696,7 @@ deployed tool list equals the local registry.
 ```
 src/core/*            transport-agnostic: registry, Graph calls, prompts, resources,
                       token + state indirection, notification and subscription logic
-src/tools/*           the 23 tool handlers (unchanged by transport)
+src/tools/*           the 29 tool handlers (unchanged by transport)
 src/server.ts         stdio entry  -> MSAL + .token-cache.json, state in .mcp-state.json
 src/worker/index.ts   Worker entry -> OAuth + tokens and state in KV, /notifications, cron
 ```
@@ -651,44 +792,26 @@ cron "17 */6 * * *"  --> create / renew the subscription       get_mailbox_activ
 
 ### Setting it up from scratch
 
-```bash
-npx wrangler kv namespace create OUTLOOK_KV   # ids go in wrangler.jsonc
-npx wrangler kv namespace create OAUTH_KV
-npm run deploy                                 # prints the workers.dev URL
+Step by step in [SETUP.md §4](SETUP.md#4-optional-deploy-the-hosted-server): two KV namespaces, the
+`PUBLIC_BASE_URL` var, three secrets, `npm run deploy`, `npm run seed:kv`, `npm run test:remote`.
+Three things about it are worth repeating here, because getting them wrong fails in confusing ways:
 
-# Secrets — never committed. The client id is not really secret, but .env is
-# gitignored and it stays out of the repo for consistency.
-printf '%s' "<Entra application (client) id>"   | npx wrangler secret put MS_CLIENT_ID
-printf '%s' "<Graph /me id>"                    | npx wrangler secret put ALLOWED_MS_USER_ID
-printf '%s' "<userPrincipalName / mail>"        | npx wrangler secret put ALLOWED_MS_UPN
-# Do NOT set ALLOW_DIRECT_AUTHORIZE on the deployed Worker — leaving it unset
-# is what keeps the non-interactive authorize path disabled in production.
-
-npm run seed:kv        # pushes the refresh token into KV; prints the two allowlist values
-npm run test:remote    # 20 live checks against the deployed endpoint
-```
-
-`npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local cache is
-stale. It hands the token to wrangler through a `0600` temp file rather than argv, and prints only a
-SHA-256 fingerprint. Re-run it only after a fresh `npm run login` — at any other time it would
-overwrite the Worker's rotated token with an older one.
-
-If `resourceMetadata.resource` in `src/worker/index.ts` does not exactly match the URL pasted into
-the client (path included), RFC 9728 discovery fails; update it if the Worker is ever renamed.
+- `npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local cache is
+  stale. It hands the token to wrangler through a `0600` temp file rather than argv, and prints only a
+  SHA-256 fingerprint. Re-run it **only** after a fresh `npm run login` — at any other time it would
+  overwrite the Worker's rotated token with an older one.
+- **Do not** set `ALLOW_DIRECT_AUTHORIZE` on the deployed Worker. Leaving it unset is what keeps the
+  non-interactive authorize path disabled in production.
+- If `resourceMetadata.resource` in `src/worker/index.ts` does not exactly match the URL pasted into
+  the client (path included), RFC 9728 discovery fails; update it if the Worker is ever renamed.
 
 ### Adding it to claude.ai as a custom connector
 
-1. In claude.ai, open **Settings → Connectors** (Team/Enterprise: **Organization settings →
-   Connectors**, added by an owner).
-2. Click **Add custom connector**.
-3. Paste the full URL **including the path**: `https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp`
-4. Leave the OAuth Client ID and Secret fields **empty** — the server supports dynamic client
-   registration, so Claude registers itself.
-5. Click **Add**, then **Connect**. A browser tab opens on the Worker's `/authorize` page showing a
-   device code.
-6. In another tab open the link shown on that page (`microsoft.com/devicelogin`), enter the code, and
-   sign in **as arthur.yuhao.zhang@outlook.com**. Any other account is rejected.
-7. The `/authorize` page polls, then returns to claude.ai. The connector's 27 tools, 2 prompts and 2 resources are now available.
+The steps are in [SETUP.md §5](SETUP.md#5-optional-add-it-to-claudeai-as-a-custom-connector). Two
+things decide whether it works: paste the URL **including the `/mcp` path**, and leave the OAuth Client
+ID and Secret fields **empty** — the server supports dynamic client registration, so Claude registers
+itself. Authorization then runs Microsoft's device-code flow on the Worker's `/authorize` page, and
+only the allowlisted account can complete it.
 
 ### Rotating and revoking access
 
@@ -729,7 +852,7 @@ runtime. The server resolves its own project root from its module location, so i
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.
 - **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether
-  it started; in a chat, the tools icon lists its twenty-three tools when connected, and the prompt
+  it started; in a chat, the tools icon lists its twenty-nine tools when connected, and the prompt
   picker offers `triage_inbox` and `morning_brief`.
 - **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and
   `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.
