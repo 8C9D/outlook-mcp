@@ -31,11 +31,16 @@ import { AnthropicError, callAnthropic, LLM_MODEL } from "./anthropic.js";
 import {
   appendAudit,
   auditSubject,
+  extractAddress,
+  findPreference,
+  isNeverFileFolder,
   isProtectedSubject,
   readLlmConfig,
+  readPreferences,
   recordFeatureError,
   reserveApiCall,
   type AuditEntry,
+  type FilingPreference,
 } from "./auto-filing.js";
 import type { StateStore } from "./state.js";
 
@@ -52,17 +57,31 @@ export type MailFacts = {
   bodyPreview: string;
   categories: string[];
   parentFolderId?: string;
+  /**
+   * Stable across moves (a move mints a new message id — verified live), which
+   * is what lets the correction reconciler re-find a message the user moved.
+   */
+  conversationId?: string;
 };
 
 /**
- * Everything the classifier may do to the mailbox. Five methods, two of them
- * mutating. Declared here rather than imported so this module depends on
- * nothing that can reach Graph — see point 1 above.
+ * Everything the classifier may do to the mailbox. Seven methods, STILL only
+ * two of them mutating (move and categorize) — the feedback loop added
+ * getFolder and findByConversation, both reads. Declared here rather than
+ * imported so this module depends on nothing that can reach Graph — see
+ * point 1 above.
  */
 export type ClassifierMailbox = {
   listFilingFolders(): Promise<FilingFolder[]>;
   listCategories(): Promise<string[]>;
   readMessage(messageId: string): Promise<MailFacts | null>;
+  /** One folder by id (its plain displayName), or null when it is gone. */
+  getFolder(folderId: string): Promise<FilingFolder | null>;
+  /**
+   * Every message in one conversation (bounded). How the correction reconciler
+   * re-finds a filed message after the user's own move minted it a new id.
+   */
+  findByConversation(conversationId: string): Promise<MailFacts[]>;
   /** Returns the message's NEW id, which a Graph move always mints. */
   move(messageId: string, folderId: string): Promise<string>;
   /** REPLACES the message's categories, exactly as manage_message does. */
@@ -174,13 +193,29 @@ export async function classifyAndFile(
     }
 
     const subject = auditSubject(message.subject);
+    const sender = extractAddress(message.from) ?? undefined;
     const protectedBy = isProtectedSubject(message.subject, config.skipPatterns);
     if (protectedBy) {
-      // Note this BEFORE any model call: protected mail is never sent anywhere.
+      // Note this BEFORE any model call OR preference lookup: protected mail is
+      // never sent anywhere and never moved — the skip list outranks any
+      // learned preference, so a correction can never override it.
       return log(
         { action: "none", reason: `skipped: subject matches protected pattern "${protectedBy}"` },
-        { subject }
+        { subject, ...(sender ? { sender } : {}) }
       );
+    }
+
+    // Learned preferences come BEFORE the model: a hit files (or deliberately
+    // leaves) the message with NO Anthropic call and no budget spend. The
+    // target is re-validated on every hit — the folder must still exist and
+    // must not be one of the never-file destinations — so a stale or unsafe
+    // preference falls through to the model instead of acting.
+    if (sender) {
+      const preference = findPreference(await readPreferences(context.store), sender);
+      if (preference) {
+        const applied = await applyPreference(context, message, messageId, preference, sender, subject, log);
+        if (applied) return applied;
+      }
     }
 
     const budget = await reserveApiCall(context.store, config.dailyCallCap, context.today);
@@ -224,8 +259,10 @@ export async function classifyAndFile(
     const decision = parseDecision(reply.text, folders, categories, config.threshold);
     const audit: Partial<AuditEntry> = {
       subject,
+      ...(sender ? { sender } : {}),
       model: reply.model,
       usage: reply.usage,
+      source: "llm",
     };
 
     if (!decision.ok) {
@@ -270,7 +307,15 @@ export async function classifyAndFile(
         confidence,
         ...(newMessageId ? { newMessageId } : {}),
       },
-      audit
+      {
+        ...audit,
+        // A move's folder id, post-move id and conversation id are what the
+        // correction reconciler needs to notice the user re-filing this
+        // message later (the conversation id survives moves; message ids do not).
+        ...(didMove && folder ? { folderId: folder.id } : {}),
+        ...(newMessageId ? { newMessageId } : {}),
+        ...(didMove && message.conversationId ? { conversationId: message.conversationId } : {}),
+      }
     );
   } catch (err) {
     // Anything unexpected (a Graph failure on the move, a KV blip) still lands
@@ -280,6 +325,65 @@ export async function classifyAndFile(
     await recordFeatureError(context.store, "filing", reason, now());
     return log({ action: "none", reason });
   }
+}
+
+/**
+ * Act on a learned preference, or return null to fall through to the model
+ * (target folder gone, or on the never-file list). Preference decisions are
+ * audited with source "preference" and NO model/usage fields — the audit log
+ * is how the no-API-call fast path is proven.
+ */
+async function applyPreference(
+  context: ClassifyContext,
+  message: MailFacts,
+  messageId: string,
+  preference: FilingPreference,
+  sender: string,
+  subject: string,
+  log: (outcome: ClassifyOutcome, extra?: Partial<AuditEntry>) => Promise<ClassifyOutcome>
+): Promise<ClassifyOutcome | null> {
+  const target = await context.mailbox.getFolder(preference.folderId);
+  // A deleted target, or one that somehow names a never-file destination,
+  // must not act; the model decides instead.
+  if (!target || isNeverFileFolder(target.displayName)) return null;
+
+  const learned = `learned from ${preference.corrections} correction${preference.corrections === 1 ? "" : "s"}`;
+  const base: Partial<AuditEntry> = { subject, sender, source: "preference" };
+
+  if (target.displayName.trim().toLowerCase() === "inbox") {
+    return log(
+      {
+        action: "none",
+        reason: `preference: leave mail from ${sender} in the Inbox (${learned}); no model call`,
+      },
+      base
+    );
+  }
+  if (message.parentFolderId === target.id) {
+    return log(
+      {
+        action: "none",
+        reason: `preference: already in ${target.displayName} (${learned}); no model call`,
+        folder: target.displayName,
+      },
+      { ...base, folderId: target.id }
+    );
+  }
+  const newMessageId = await context.mailbox.move(messageId, target.id);
+  return log(
+    {
+      action: "moved",
+      reason: `filed by preference for ${sender} (${learned}); no model call`,
+      folder: target.displayName,
+      newMessageId,
+    },
+    {
+      ...base,
+      folderId: target.id,
+      newMessageId,
+      ...(message.conversationId ? { conversationId: message.conversationId } : {}),
+    }
+  );
 }
 
 /** Cut a string to `limit` characters, marking that it was cut. */

@@ -7,7 +7,34 @@ import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
 import { HEALTH_CHECKS, readHealthReport } from "../core/health.js";
 import { requireStateStore } from "../core/state.js";
-import { ToolResult, formatLocal, runTool, textResult } from "./common.js";
+import { ToolResult, formatLocal, runTool, structuredResult } from "./common.js";
+
+/** Permissive machine-readable health report; every field optional. */
+export const getHealthOutputSchema = {
+  mode: z.enum(["remote", "local"]).optional(),
+  hasReport: z
+    .boolean()
+    .optional()
+    .describe("Remote only: false while the daily cron has not completed yet."),
+  healthy: z.boolean().optional(),
+  checkedAt: z.string().optional(),
+  checks: z
+    .array(
+      z.looseObject({
+        name: z.string().optional(),
+        ok: z.boolean().optional(),
+        detail: z.string().optional(),
+        failingSince: z.string().optional(),
+      })
+    )
+    .optional(),
+  alertDraftId: z.string().optional(),
+  alertError: z.string().optional(),
+  remoteOnlyChecks: z
+    .array(z.string())
+    .optional()
+    .describe("Local only: the checks that exist only on the hosted server."),
+};
 
 export const getHealthSchema = {
   include_details: z
@@ -42,10 +69,11 @@ export async function getHealthHandler(input: z.input<typeof getHealthArgs>): Pr
     if (store.mode === "remote") {
       const report = await readHealthReport(store);
       if (!report) {
-        return textResult(
+        return structuredResult(
           "No health report yet: the daily health cron (13:37 UTC) has not completed since " +
             "this feature was deployed. Check again after it has run, or see `wrangler tail` " +
-            "if it never appears."
+            "if it never appears.",
+          { mode: "remote", hasReport: false }
         );
       }
       const lines = [
@@ -66,20 +94,36 @@ export async function getHealthHandler(input: z.input<typeof getHealthArgs>): Pr
       if (report.alertError) {
         lines.push("", `The alert draft could not be created: ${report.alertError}`);
       }
-      return textResult(lines.join("\n"));
+      return structuredResult(lines.join("\n"), {
+        mode: "remote",
+        hasReport: true,
+        healthy: report.healthy,
+        checkedAt: report.at,
+        checks: report.checks.map((check) => ({
+          name: check.name,
+          ok: check.ok,
+          ...(include_details ? { detail: check.detail } : {}),
+          ...(check.failingSince ? { failingSince: check.failingSince } : {}),
+        })),
+        ...(report.alertDraftId ? { alertDraftId: report.alertDraftId } : {}),
+        ...(report.alertError ? { alertError: report.alertError } : {}),
+      });
     }
 
     // Local stdio server: run what can honestly be checked from here.
     const lines: string[] = ["Local server health (checked live, just now):", ""];
+    const localChecks: Record<string, unknown>[] = [];
     let healthy = true;
     const local = async (name: string, fn: () => Promise<string>) => {
       try {
         const detail = await fn();
         lines.push(include_details ? `OK    ${name} — ${detail}` : `OK    ${name}`);
+        localChecks.push({ name, ok: true, ...(include_details ? { detail } : {}) });
       } catch (err) {
         healthy = false;
         const detail = err instanceof Error ? err.message : String(err);
         lines.push(`FAIL  ${name} — ${detail.split("\n")[0]}`);
+        localChecks.push({ name, ok: false, detail: detail.split("\n")[0] });
       }
     };
 
@@ -97,6 +141,11 @@ export async function getHealthHandler(input: z.input<typeof getHealthArgs>): Pr
 
     lines.push("", healthy ? "Both local checks pass." : "Run `npm run doctor` for a diagnosis.");
     lines.push("", REMOTE_ONLY_NOTE);
-    return textResult(lines.join("\n"));
+    return structuredResult(lines.join("\n"), {
+      mode: "local",
+      healthy,
+      checks: localChecks,
+      remoteOnlyChecks: [...HEALTH_CHECKS],
+    });
   });
 }

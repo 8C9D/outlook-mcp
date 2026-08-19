@@ -2,7 +2,12 @@
 // The stdio entry point and the Cloudflare Worker each build an McpServer and
 // hand it to registerAll, so the two hosts can never drift in what they expose.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { searchMailDescription, searchMailHandler, searchMailSchema } from "../tools/search-mail.js";
+import {
+  searchMailDescription,
+  searchMailHandler,
+  searchMailOutputSchema,
+  searchMailSchema,
+} from "../tools/search-mail.js";
 import { readThreadDescription, readThreadHandler, readThreadSchema } from "../tools/read-thread.js";
 import {
   readMessageDescription,
@@ -33,11 +38,13 @@ import {
 import {
   listFoldersDescription,
   listFoldersHandler,
+  listFoldersOutputSchema,
   listFoldersSchema,
 } from "../tools/list-folders.js";
 import {
   listEventsDescription,
   listEventsHandler,
+  listEventsOutputSchema,
   listEventsSchema,
 } from "../tools/list-events.js";
 import {
@@ -97,11 +104,21 @@ import {
   createFolderSchema,
 } from "../tools/create-folder.js";
 import {
+  deleteFolderDescription,
+  deleteFolderHandler,
+  deleteFolderSchema,
+} from "../tools/delete-folder.js";
+import {
   manageCategoriesDescription,
   manageCategoriesHandler,
   manageCategoriesSchema,
 } from "../tools/manage-categories.js";
-import { listTasksDescription, listTasksHandler, listTasksSchema } from "../tools/list-tasks.js";
+import {
+  listTasksDescription,
+  listTasksHandler,
+  listTasksOutputSchema,
+  listTasksSchema,
+} from "../tools/list-tasks.js";
 import { manageTaskDescription, manageTaskHandler, manageTaskSchema } from "../tools/manage-task.js";
 import {
   checkNewMailDescription,
@@ -123,7 +140,12 @@ import {
   manageAutoFilingHandler,
   manageAutoFilingSchema,
 } from "../tools/manage-auto-filing.js";
-import { getHealthDescription, getHealthHandler, getHealthSchema } from "../tools/get-health.js";
+import {
+  getHealthDescription,
+  getHealthHandler,
+  getHealthOutputSchema,
+  getHealthSchema,
+} from "../tools/get-health.js";
 import { registerPrompts } from "./prompts.js";
 import { registerResources } from "./resources.js";
 import type { ZodRawShape } from "zod";
@@ -134,6 +156,15 @@ type ToolDefinition = {
   name: string;
   description: string;
   inputSchema: ZodRawShape;
+  /**
+   * MCP structured-content schema, on the tools whose answers clients want to
+   * render (search results, listings, health). Declaring it obliges the
+   * handler to return structuredContent on EVERY success path — the SDK
+   * enforces that — so it is added tool by tool, deliberately. Schemas are
+   * permissive (all fields optional, unknown keys tolerated) so they can never
+   * fail a call that used to work.
+   */
+  outputSchema?: ZodRawShape;
   /** All four hints, always — see the rules below. */
   annotations: Required<Omit<ToolAnnotations, "title">>;
   handler: (input: any) => Promise<ToolResult>;
@@ -172,6 +203,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "search_mail",
     description: searchMailDescription,
     inputSchema: searchMailSchema,
+    outputSchema: searchMailOutputSchema,
     annotations: READ_ONLY,
     handler: searchMailHandler,
   },
@@ -243,6 +275,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "list_folders",
     description: listFoldersDescription,
     inputSchema: listFoldersSchema,
+    outputSchema: listFoldersOutputSchema,
     annotations: READ_ONLY,
     handler: listFoldersHandler,
   },
@@ -250,6 +283,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "list_events",
     description: listEventsDescription,
     inputSchema: listEventsSchema,
+    outputSchema: listEventsOutputSchema,
     annotations: READ_ONLY,
     handler: listEventsHandler,
   },
@@ -345,6 +379,17 @@ export const TOOLS: ToolDefinition[] = [
     handler: createFolderHandler,
   },
   {
+    name: "delete_folder",
+    description: deleteFolderDescription,
+    inputSchema: deleteFolderSchema,
+    // Soft (the folder is MOVED to Deleted Items — a raw Graph DELETE would be
+    // permanent on a personal account and is never issued), but soft deletes
+    // still count as destructive: the folder and, with force, its messages
+    // leave where they were.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    handler: deleteFolderHandler,
+  },
+  {
     name: "manage_categories",
     description: manageCategoriesDescription,
     inputSchema: manageCategoriesSchema,
@@ -357,6 +402,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "list_tasks",
     description: listTasksDescription,
     inputSchema: listTasksSchema,
+    outputSchema: listTasksOutputSchema,
     annotations: READ_ONLY,
     handler: listTasksHandler,
   },
@@ -405,6 +451,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "get_health",
     description: getHealthDescription,
     inputSchema: getHealthSchema,
+    outputSchema: getHealthOutputSchema,
     // Reads the stored heartbeat (remote) or performs Graph GETs (local); the
     // KV probe and the alert draft belong to the CRON, not to this tool.
     annotations: READ_ONLY,
@@ -420,6 +467,7 @@ export function registerAll(server: McpServer): void {
       {
         description: tool.description,
         inputSchema: tool.inputSchema,
+        ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
         annotations: tool.annotations,
       },
       tool.handler

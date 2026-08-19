@@ -12,12 +12,35 @@
 // Keep this module small enough that both stay easy to read.
 import { callGraphServer } from "./graph.js";
 import { isNeverFileFolder } from "./auto-filing.js";
-import type { ClassifierMailbox, FilingFolder } from "./classifier.js";
+import type { ClassifierMailbox, FilingFolder, MailFacts } from "./classifier.js";
 
 /** How many folders may be offered to the model (and so how long the prompt is). */
 const FOLDER_CAP = 60;
 
-const MESSAGE_SELECT = "id,subject,from,receivedDateTime,bodyPreview,categories,parentFolderId";
+const MESSAGE_SELECT =
+  "id,subject,from,receivedDateTime,bodyPreview,categories,parentFolderId,conversationId";
+
+/** How many messages of one conversation the reconciler will ever look at. */
+const CONVERSATION_CAP = 25;
+
+function toMailFacts(message: any): MailFacts {
+  const address = message?.from?.emailAddress;
+  const from = address?.address
+    ? address.name && address.name !== address.address
+      ? `${address.name} <${address.address}>`
+      : String(address.address)
+    : "(unknown sender)";
+  return {
+    id: String(message.id),
+    subject: String(message.subject ?? ""),
+    from,
+    receivedDateTime: message.receivedDateTime ?? undefined,
+    bodyPreview: String(message.bodyPreview ?? ""),
+    categories: Array.isArray(message.categories) ? message.categories.map(String) : [],
+    parentFolderId: message.parentFolderId ?? undefined,
+    conversationId: message.conversationId ?? undefined,
+  };
+}
 
 /** The live implementation, against whatever Graph token is in scope. */
 export function graphClassifierMailbox(): ClassifierMailbox {
@@ -61,21 +84,28 @@ export function graphClassifierMailbox(): ClassifierMailbox {
         `/me/messages/${encodeURIComponent(messageId)}?$select=${MESSAGE_SELECT}`
       ).catch(() => null);
       if (!message?.id) return null;
-      const address = message?.from?.emailAddress;
-      const from = address?.address
-        ? address.name && address.name !== address.address
-          ? `${address.name} <${address.address}>`
-          : String(address.address)
-        : "(unknown sender)";
-      return {
-        id: String(message.id),
-        subject: String(message.subject ?? ""),
-        from,
-        receivedDateTime: message.receivedDateTime ?? undefined,
-        bodyPreview: String(message.bodyPreview ?? ""),
-        categories: Array.isArray(message.categories) ? message.categories.map(String) : [],
-        parentFolderId: message.parentFolderId ?? undefined,
-      };
+      return toMailFacts(message);
+    },
+
+    async findByConversation(conversationId) {
+      // A read: how the correction reconciler re-finds a filed message after
+      // the user's own move minted it a new id (conversation ids are stable).
+      const escaped = conversationId.replace(/'/g, "''");
+      const data = await callGraphServer(
+        `/me/messages?$filter=${encodeURIComponent(`conversationId eq '${escaped}'`)}` +
+          `&$select=${MESSAGE_SELECT}&$top=${CONVERSATION_CAP}`
+      ).catch(() => null);
+      return ((data?.value ?? []) as any[]).filter((m) => m?.id).map(toMailFacts);
+    },
+
+    async getFolder(folderId) {
+      // A read: the correction reconciler uses it to name the folder a message
+      // ended up in, and the preference fast path to re-validate its target.
+      const folder = await callGraphServer(
+        `/me/mailFolders/${encodeURIComponent(folderId)}?$select=id,displayName`
+      ).catch(() => null);
+      if (!folder?.id || !folder?.displayName) return null;
+      return { id: String(folder.id), displayName: String(folder.displayName) };
     },
 
     async move(messageId, folderId) {

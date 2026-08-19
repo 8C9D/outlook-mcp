@@ -7,7 +7,7 @@ import {
   ToolResult,
   fetchPaged,
   runTool,
-  textResult,
+  structuredResult,
 } from "./common.js";
 import { addDays, torontoToday } from "./list-events.js";
 
@@ -40,6 +40,38 @@ export const listTasksSchema = {
 };
 
 const listTasksArgs = z.object(listTasksSchema);
+
+/** One task in the machine-readable answer; permissive, every field optional. */
+const structuredTask = z.looseObject({
+  title: z.string().optional(),
+  id: z.string().optional(),
+  group: z.enum(["overdue", "today", "upcoming", "no_due_date"]).optional(),
+  due: z.string().optional().describe(`Local ${TIMEZONE} date or date+time.`),
+  reminder: z.string().optional(),
+  repeating: z.boolean().optional(),
+  completed: z.boolean().optional(),
+  subtasksDone: z.number().optional(),
+  subtasksTotal: z.number().optional(),
+  subtasks: z
+    .array(
+      z.looseObject({
+        id: z.string().optional(),
+        title: z.string().optional(),
+        checked: z.boolean().optional(),
+      })
+    )
+    .optional()
+    .describe("Present when include_subtasks is set."),
+});
+
+/** Permissive machine-readable task listing. */
+export const listTasksOutputSchema = {
+  list: z.string().optional().describe("The To Do list's display name."),
+  scope: z.string().optional(),
+  timezone: z.string().optional(),
+  count: z.number().optional(),
+  tasks: z.array(structuredTask).optional(),
+};
 
 export const listTasksDescription =
   "List Microsoft To Do tasks, grouped as overdue / today / upcoming / no due date in America/Toronto local time. Shows each task's title, due date, reminder, repeat rule, subtask progress, and task id (use the id with manage_task). Defaults to open tasks in the default list; set include_completed to also see finished ones, include_subtasks to see each checklist item and its id, or due_within_days to narrow to what is due soon.";
@@ -112,6 +144,7 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       upcoming: [],
       none: [],
     };
+    const structuredTasks: Record<string, unknown>[] = [];
     let shown = 0;
     for (const task of tasks) {
       const due = localDateTime(task.dueDateTime);
@@ -141,10 +174,38 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       const line =
         `  ${task.title || "(untitled)"}${details.length ? ` — ${details.join(" · ")}` : ""}\n` +
         `    id: ${task.id}${subtaskLines}`;
-      if (!dueDate) groups.none.push(line);
-      else if (dueDate < today) groups.overdue.push(line);
-      else if (dueDate === today) groups.today.push(line);
-      else groups.upcoming.push(line);
+      const group = !dueDate
+        ? "none"
+        : dueDate < today
+          ? "overdue"
+          : dueDate === today
+            ? "today"
+            : "upcoming";
+      groups[group].push(line);
+      structuredTasks.push({
+        title: task.title || "(untitled)",
+        id: String(task.id ?? ""),
+        group: group === "none" ? "no_due_date" : group,
+        ...(due ? { due: stamp(due) } : {}),
+        ...(reminder ? { reminder: stamp(reminder) } : {}),
+        ...(task.recurrence ? { repeating: true } : {}),
+        ...(task.status === "completed" ? { completed: true } : {}),
+        ...(subtasks.length
+          ? {
+              subtasksDone: subtasks.filter((s) => s.isChecked).length,
+              subtasksTotal: subtasks.length,
+            }
+          : {}),
+        ...(include_subtasks && subtasks.length
+          ? {
+              subtasks: subtasks.map((s) => ({
+                id: String(s.id ?? ""),
+                title: s.displayName || "(untitled)",
+                checked: Boolean(s.isChecked),
+              })),
+            }
+          : {}),
+      });
     }
 
     const scope = [
@@ -153,8 +214,13 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
     ]
       .filter(Boolean)
       .join(", ");
+    const structuredBase = { list: list.displayName, scope, timezone: TIMEZONE };
     if (shown === 0) {
-      return textResult(`No tasks in "${list.displayName}" (${scope}).`);
+      return structuredResult(`No tasks in "${list.displayName}" (${scope}).`, {
+        ...structuredBase,
+        count: 0,
+        tasks: [],
+      });
     }
 
     const sections: string[] = [];
@@ -168,8 +234,9 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       if (groups[key].length === 0) continue;
       sections.push(`${label} (${groups[key].length}):\n${groups[key].join("\n")}`);
     }
-    return textResult(
-      `${shown} task(s) in "${list.displayName}" — ${scope} (${TIMEZONE}):\n\n${sections.join("\n\n")}`
+    return structuredResult(
+      `${shown} task(s) in "${list.displayName}" — ${scope} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
+      { ...structuredBase, count: shown, tasks: structuredTasks }
     );
   });
 }
