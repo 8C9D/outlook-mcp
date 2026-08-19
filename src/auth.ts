@@ -17,21 +17,40 @@ export { AuthRequiredError };
 // must carry only JSON-RPC in server mode.
 dotenv.config({ path: path.join(PROJECT_ROOT, ".env"), quiet: true });
 
+/**
+ * Multi-instance support: a wrapper script (e.g. run-school.sh) exports its own
+ * AZURE_CLIENT_ID plus OUTLOOK_MCP_AUTHORITY / OUTLOOK_MCP_TOKEN_CACHE /
+ * OUTLOOK_MCP_SCOPES before launch. dotenv never overrides variables that are
+ * already set, so wrapper exports win over .env; with nothing exported the
+ * defaults below preserve the personal-account behavior exactly.
+ */
+
 /** Where MSAL's serialized cache lives. `npm run doctor` reports on this file. */
-export const TOKEN_CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
+export const TOKEN_CACHE_PATH = path.resolve(
+  PROJECT_ROOT,
+  process.env.OUTLOOK_MCP_TOKEN_CACHE ?? ".token-cache.json"
+);
+
+/** Entra authority audience: "consumers" (personal, default) or "organizations". */
+const AUTHORITY =
+  "https://login.microsoftonline.com/" + (process.env.OUTLOOK_MCP_AUTHORITY ?? "consumers");
 
 // offline_access is added by MSAL automatically; openid/profile must not be listed.
-export const SCOPES = [
-  "User.Read",
-  "Mail.Read",
-  "Mail.ReadWrite",
-  "Mail.Send",
-  "Calendars.ReadWrite",
-  "Contacts.ReadWrite",
-  "MailboxSettings.ReadWrite",
-  "Tasks.ReadWrite",
-  "Files.ReadWrite",
-];
+export const SCOPES = process.env.OUTLOOK_MCP_SCOPES
+  ? process.env.OUTLOOK_MCP_SCOPES.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : [
+      "User.Read",
+      "Mail.Read",
+      "Mail.ReadWrite",
+      "Mail.Send",
+      "Calendars.ReadWrite",
+      "Contacts.ReadWrite",
+      "MailboxSettings.ReadWrite",
+      "Tasks.ReadWrite",
+      "Files.ReadWrite",
+    ];
 
 function requireClientId(): string {
   const clientId = process.env.AZURE_CLIENT_ID;
@@ -66,7 +85,7 @@ function getPca(): PublicClientApplication {
   pcaInstance ??= new PublicClientApplication({
     auth: {
       clientId: requireClientId(),
-      authority: "https://login.microsoftonline.com/consumers",
+      authority: AUTHORITY,
     },
     cache: { cachePlugin },
   });

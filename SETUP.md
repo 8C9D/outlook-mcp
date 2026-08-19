@@ -210,6 +210,40 @@ Notes that matter:
   separately if you want the stored tokens gone.
 - **Locally**: delete `.token-cache.json`.
 
+## 7. Second instance for a work/school account (multi-instance)
+
+The stdio server is single-identity per process, but per-instance identity is
+env-selected, so a second account is just a second process with its own env:
+
+| Variable | Personal default | School instance |
+| --- | --- | --- |
+| `AZURE_CLIENT_ID` | from `.env` (`outlook-mcp` app) | `outlook-mcp-school` app (multi-tenant) |
+| `OUTLOOK_MCP_AUTHORITY` | `consumers` | `organizations` |
+| `OUTLOOK_MCP_TOKEN_CACHE` | `.token-cache.json` | `.token-cache.school.json` |
+| `OUTLOOK_MCP_SCOPES` | full built-in list | list minus `Mail.Send`, `Files.ReadWrite` |
+
+`src/auth.ts` reads these at startup; dotenv never overrides already-set
+variables, so a wrapper's exports win over `.env` and the personal instance's
+behavior is untouched when none are set. [`run-school.sh`](run-school.sh) is
+the school wrapper: `./run-school.sh login` for device-code sign-in (school
+account), `./run-school.sh` to serve, `verify`/`doctor` for checks. Register it
+as a second MCP server: `claude mcp add outlook-school -- ~/dev/outlook-mcp/run-school.sh`.
+
+The school registration is a separate multi-tenant app (`outlook-mcp-school`,
+"Accounts in any organizational directory", public client flows on, no
+redirect URI) because the original app is personal-accounts-only. University
+tenants commonly require admin consent for unverified third-party apps — if
+login fails with AADSTS65001, that is the school tenant's policy, not a bug.
+Worker/remote mode, webhooks, KV and the LLM features are personal-instance
+only; the school instance is local stdio only.
+
+Status: an admin-consent request was filed with the school tenant's IT on
+2026-08-19, via Entra's consent-request workflow on the sign-in screen
+("Request approval"; the admin reviews it and the requester is notified by
+email). If/when consent is granted, the remaining steps are
+`./run-school.sh login` followed by
+`claude mcp add outlook-school -- ~/dev/outlook-mcp/run-school.sh`.
+
 ---
 
 Read [README.md](README.md) next: what the tools do, the security model, and what the optional LLM
