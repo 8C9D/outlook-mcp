@@ -39,10 +39,19 @@ import {
   KV_ACCESS_TOKEN,
   KV_REFRESH_TOKEN,
   STATE_ACTIVITY,
+  STATE_LLM_AUDIT,
+  STATE_LLM_CONFIG,
   STATE_SUBSCRIPTION,
   deltaKey,
   downloadKey,
 } from "./core/kv-keys.js";
+import {
+  NEVER_FILE_INTO,
+  readLlmConfig,
+  type AuditEntry,
+  type LlmConfig,
+} from "./core/auto-filing.js";
+import { createMemoryStateStore } from "./core/state.js";
 import { DOWNLOAD_ROUTE_PREFIX } from "./core/downloads.js";
 import type { ActivityEntry } from "./core/notifications.js";
 import { TOOLS } from "./core/registry.js";
@@ -1005,6 +1014,130 @@ await testAuthed("r23. export_message serves a message's MIME through a bearer-g
   }
 });
 
+// -------------------------------------------- v9: the LLM features, off by default
+
+/** What the LLM tests have to put back. */
+const v9: { configBefore?: string | null; auditBefore?: string | null } = {};
+
+await test("r24. the deployed server ships with both LLM features DISABLED", async () => {
+  // The gate criterion: whatever this run does later, the state the Worker was
+  // deployed in must have auto-filing and the digest off. An absent record is
+  // the shipped default and reads back as both off; a present one must say so.
+  v9.configBefore = await kvGet(outlookNs, STATE_LLM_CONFIG);
+  v9.auditBefore = await kvGet(outlookNs, STATE_LLM_AUDIT);
+
+  const config = v9.configBefore ? (JSON.parse(v9.configBefore) as Partial<LlmConfig>) : null;
+  assert(
+    config?.filingEnabled !== true,
+    `auto-filing is ENABLED on the deployed server: ${v9.configBefore}`
+  );
+  assert(
+    config?.digestEnabled !== true,
+    `the morning digest is ENABLED on the deployed server: ${v9.configBefore}`
+  );
+  console.log(
+    `      deployed LLM config: ${v9.configBefore ?? "(absent — the shipped default, both off)"}`
+  );
+
+  // And the code really does default to off, so an absent record cannot mean
+  // anything else.
+  const defaults = await readLlmConfig(createMemoryStateStore("remote"));
+  assert(
+    !defaults.filingEnabled && !defaults.digestEnabled,
+    "readLlmConfig does not default both features off"
+  );
+
+  // Both cron schedules the digest needs are declared, alongside the upkeep one.
+  const wranglerConfig = JSON.parse(
+    (await fs.readFile(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8")).replace(/^\s*\/\/.*$/gm, "")
+  ) as { triggers?: { crons?: string[] } };
+  const crons = wranglerConfig.triggers?.crons ?? [];
+  for (const cron of ["0 11 * * *", "0 12 * * *"]) {
+    assert(crons.includes(cron), `wrangler.jsonc is missing the "${cron}" digest schedule`);
+  }
+});
+
+await testAuthed("r25. end-to-end: auto-filing classifies a notified message, then goes back off", async () => {
+  const before = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+
+  // Turn it on through the tool, exactly as the owner would. The threshold is
+  // lowered for the run because the model is (correctly) more cautious about a
+  // subject carrying an obvious test marker than about real mail.
+  const enabled = await callTool("manage_auto_filing", { action: "enable_filing" });
+  assert(/Auto-filing:\s+ON/.test(enabled), `enable_filing did not report ON:\n${enabled}`);
+  await callTool("manage_auto_filing", { action: "set_threshold", threshold: 0.5 });
+
+  let subject = "";
+  try {
+    subject = `${TEST_PREFIX} Your receipt from Acme Hardware ${randomBytes(4).toString("hex")}`;
+    const createText = await callTool("create_draft", {
+      to: [ownAddress],
+      subject,
+      body:
+        "Thank you for your order #A-8827 at Acme Hardware. Total charged: $41.20 CAD to your " +
+        "Visa ending 4242. This is your receipt; no action is needed.",
+    });
+    const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+    assert(draftId, `could not extract a draft id from: ${createText}`);
+    await callTool("send_draft", { draft_id: draftId });
+
+    // Delivery to self can lag, and a Graph notification lags behind that, so
+    // this waits generously rather than calling a slow delivery a failure.
+    const decision = await poll(
+      "the Worker to classify the notified message",
+      300_000,
+      10_000,
+      async () => {
+        const log = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+        return log.find((entry) => entry.subject?.includes(subject.slice(-8)));
+      }
+    );
+
+    console.log(
+      `      classified as ${decision.action}` +
+        (decision.folder ? ` → ${decision.folder}` : "") +
+        ` (confidence ${decision.confidence ?? "n/a"}, model ${decision.model}): ${decision.reason}`
+    );
+    assert(decision.model?.startsWith("claude-haiku-4-5"), `unexpected model: ${decision.model}`);
+    assert(
+      (decision.usage?.output ?? 0) > 0,
+      `the audit entry records no token usage: ${JSON.stringify(decision)}`
+    );
+    assert(
+      decision.action === "moved" || decision.action === "moved+categorized",
+      `a plain shop receipt was not filed: ${decision.action} — ${decision.reason}`
+    );
+    assert(decision.folder, "a move was audited without naming a folder");
+
+    // The move really happened, and not into a folder the allowlist excludes.
+    const filed = await callGraphServer(
+      `/me/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,parentFolderId`
+    );
+    const inbox = await callGraphServer("/me/mailFolders/inbox?$select=id");
+    const received = (filed?.value ?? []).filter((m: any) => m.parentFolderId !== inbox.id);
+    assert(received.length > 0, "the probe is still in the inbox — no move took place");
+    const folder = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(received[0].parentFolderId)}?$select=displayName`
+    );
+    assert(
+      folder.displayName === decision.folder,
+      `the audit log says ${decision.folder} but the message is in ${folder.displayName}`
+    );
+    assert(
+      !NEVER_FILE_INTO.includes(String(folder.displayName).toLowerCase()),
+      `the classifier filed into ${folder.displayName}, which is on the never-file list`
+    );
+
+    // The tool surfaces the same decision to a reader.
+    const logText = await callTool("get_auto_filing_log", { limit: 5 });
+    assert(logText.includes(decision.folder!), `get_auto_filing_log does not show the move:\n${logText}`);
+  } finally {
+    // Off again, whatever happened above.
+    const disabled = await callTool("manage_auto_filing", { action: "disable_filing" });
+    assert(/Auto-filing:\s+OFF/.test(disabled), `disable_filing did not report OFF:\n${disabled}`);
+  }
+});
+
 await test("r20. cleanup: the probe message, its notifications and the delta position are gone", async () => {
   // The mail itself: both copies, permanently (the tools only soft-delete).
   const messages = await callGraphServer(
@@ -1050,6 +1183,38 @@ await test("r20. cleanup: the probe message, its notifications and the delta pos
   } else {
     await kvDelete(outlookNs, deltaKey("inbox"));
   }
+
+  // The LLM state: the config back to exactly what was deployed (usually
+  // absent), the audit log back to what predates this run, and the day's
+  // budget counter reduced by what this run spent. The deployed server must
+  // end this run in the state the gate asserts: both features disabled.
+  if (v9.configBefore) {
+    await kvPut(outlookNs, STATE_LLM_CONFIG, v9.configBefore);
+  } else {
+    await kvDelete(outlookNs, STATE_LLM_CONFIG);
+  }
+  if (v9.auditBefore) {
+    await kvPut(outlookNs, STATE_LLM_AUDIT, v9.auditBefore);
+  } else {
+    await kvDelete(outlookNs, STATE_LLM_AUDIT);
+  }
+
+  const restored = await poll("the LLM config to go back to its deployed state", 60_000, 5_000, async () => {
+    const raw = await kvGet(outlookNs, STATE_LLM_CONFIG);
+    if (!v9.configBefore) return raw === null ? "(absent)" : undefined;
+    return raw === v9.configBefore ? raw : undefined;
+  });
+  const finalConfig = restored === "(absent)" ? null : (JSON.parse(restored) as Partial<LlmConfig>);
+  assert(
+    finalConfig?.filingEnabled !== true && finalConfig?.digestEnabled !== true,
+    `the run left an LLM feature enabled on the deployed server: ${restored}`
+  );
+
+  const leftoverAudit = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+  assert(
+    !leftoverAudit.some((entry) => String(entry.subject ?? "").includes(TEST_PREFIX)),
+    "the audit log still holds entries this run created"
+  );
 });
 
 // ------------------------------------------------------------------- teardown
