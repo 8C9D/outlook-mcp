@@ -20,7 +20,7 @@ connector. All datetimes are America/Toronto unless a caller supplies an explici
 | **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts, out-of-office, working hours, Focused-Inbox overrides |
 | **Tasks** | `list_tasks`, `manage_task` | Microsoft To Do with subtasks, repeat rules, task lists, and mail turned into a task |
 | **Evidence** | `export_message`, `get_attachment` | attachment bytes and a message's raw `.eml` — saved to disk on stdio, handed out as an expiring sign-in-required link on the hosted server |
-| **Optional LLM** | `manage_auto_filing`, `get_auto_filing_log` | auto-filing of arriving mail into your existing folders, and a morning brief left as a draft. **Both ship disabled**, both cost money, both are audited ([what they cost](#what-it-costs)) |
+| **Optional LLM** | `manage_auto_filing`, `get_auto_filing_log` | auto-filing of arriving mail into your existing folders, and a morning brief left as a draft. **Both ship disabled**, both cost money, both are audited ([what they cost](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff)) |
 
 Every tool carries MCP [annotation hints](#tool-annotations) so a client can tell a read from a write,
 a reversible act from an irreversible one, and a call that stays inside the mailbox from one that
@@ -29,7 +29,7 @@ reaches other people.
 **What it costs to run.** Nothing, apart from a Cloudflare account for the optional hosted server (the
 free plan is enough). The only spend is the two optional LLM features, which call the Anthropic API on
 your mail: about **$1–2 a month** at ordinary volumes, capped, and **off unless you turn them on** —
-see [What it costs](#what-it-costs) for the measured numbers and the ceiling.
+see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff) for the measured numbers and the ceiling.
 
 ## Security model
 
