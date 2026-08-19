@@ -30,6 +30,7 @@ export const SCOPES = [
   "Contacts.ReadWrite",
   "MailboxSettings.ReadWrite",
   "Tasks.ReadWrite",
+  "Files.ReadWrite",
 ];
 
 function requireClientId(): string {
