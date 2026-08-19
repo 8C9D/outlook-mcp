@@ -7,11 +7,24 @@
   // node:async_hooks, which nodejs_compat provides on workerd.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // Keeps the Graph change-notification subscription alive. Mail subscriptions
-  // expire after at most 4230 minutes (~2.9 days) and Graph deletes them
-  // silently, so this runs every 6 hours and renews once less than a day is
-  // left — many chances to recover before anything lapses.
-  "triggers": { "crons": ["17 */6 * * *"] },
+  // Two jobs, told apart in the scheduled handler by the America/Toronto hour:
+  //
+  //  "17 */6 * * *"  Keeps the Graph change-notification subscription alive.
+  //                  Mail subscriptions expire after at most 4230 minutes
+  //                  (~2.9 days) and Graph deletes them silently, so this runs
+  //                  every 6 hours and renews once less than a day is left —
+  //                  many chances to recover before anything lapses.
+  //
+  //  "0 11 * * *"    The morning digest, at 07:00 America/Toronto. Cloudflare
+  //  "0 12 * * *"    crons are UTC only and Toronto is UTC-4 in EDT, UTC-5 in
+  //                  EST, so both candidate hours fire year-round and the
+  //                  handler drops whichever one is not 07:00 locally. Nothing
+  //                  drifts across a DST change and nothing needs redeploying;
+  //                  core/digest.js also refuses a second brief for a date it
+  //                  has already covered. The digest ships DISABLED, so on a
+  //                  default deployment these two ticks read one KV key and
+  //                  return.
+  "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *"] },
   "vars": {
     // Public origin of this Worker. Graph is told to deliver notifications to
     // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname.
@@ -29,6 +42,11 @@
   //   MS_CLIENT_ID       Application (client) ID of the Entra app registration
   //   ALLOWED_MS_USER_ID Graph /me id of the one account allowed to authorize
   //   ALLOWED_MS_UPN     that account's userPrincipalName / mail
+  //   ANTHROPIC_API_KEY  key for the two LLM features (auto-filing on the
+  //                      change notification, and the morning digest cron).
+  //                      Both ship DISABLED — see manage_auto_filing and the
+  //                      README's cost section. Local `wrangler dev` runs read
+  //                      it from the gitignored .dev.vars instead.
   //
   // ALLOW_DIRECT_AUTHORIZE ("true" enables POST /authorize with a caller-held
   // Microsoft access token) is deliberately NOT set here and NOT a deployed

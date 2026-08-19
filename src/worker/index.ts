@@ -18,10 +18,15 @@ import { defaultHandler } from "./authorize.js";
 import { downloadHandler } from "./download.js";
 import { mcpHandler } from "./mcp-handler.js";
 import { keepSubscriptionAlive } from "./notifications.js";
+import { draftMorningBrief } from "./llm.js";
+import { torontoHourOf } from "../core/auto-filing.js";
 import type { Env } from "./env.js";
 
 /** The only scope this server issues; the mailbox permissions are fixed at consent time. */
 const SCOPES_SUPPORTED = ["outlook"];
+
+/** The hour, America/Toronto, at which the morning brief is drafted. */
+export const DIGEST_HOUR_TORONTO = 7;
 
 /**
  * Both protected surfaces behind one handler: the MCP endpoint itself, and the
@@ -67,13 +72,36 @@ export default {
     oauthProvider.fetch(request, env, ctx),
 
   /**
-   * Cron trigger (see `triggers.crons` in wrangler.jsonc). Mail subscriptions
-   * expire after ~2.9 days and Graph drops them silently, so this runs far more
-   * often than that and creates, renews or leaves the subscription alone as
-   * needed. A failure must not throw out of the scheduled handler — it would be
-   * retried on the next tick anyway — so it is logged instead.
+   * Cron triggers (see `triggers.crons` in wrangler.jsonc). Two jobs share the
+   * handler and are told apart by the hour America/Toronto is actually on:
+   *
+   *  - Subscription upkeep, every 6 hours. Mail subscriptions expire after ~2.9
+   *    days and Graph drops them silently, so this runs far more often than
+   *    that and creates, renews or leaves the subscription alone as needed.
+   *  - The morning digest, at 07:00 America/Toronto. Cloudflare crons are UTC
+   *    only, and 07:00 Toronto is 11:00 UTC in EDT and 12:00 UTC in EST, so
+   *    BOTH are scheduled and this guard drops the one that is not 07:00 right
+   *    now. That is what keeps the brief at 07:00 local across a DST change
+   *    with no redeploy; core/digest.js additionally refuses to draft a second
+   *    brief for a date it has already covered, so a double fire cannot double
+   *    up either.
+   *
+   * A failure must not throw out of the scheduled handler — it would be retried
+   * on the next tick anyway — so everything is logged instead.
    */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const hour = torontoHourOf(new Date(event.scheduledTime));
+
+    if (hour === DIGEST_HOUR_TORONTO) {
+      ctx.waitUntil(
+        draftMorningBrief(env).then(
+          (outcome) => console.log(`Cron ${event.cron}: morning brief — ${outcome.reason}.`),
+          (err) => console.error(`Cron ${event.cron}: morning brief failed: ${String(err)}`)
+        )
+      );
+      return;
+    }
+
     ctx.waitUntil(
       keepSubscriptionAlive(env).then(
         (result) => console.log(`Cron ${event.cron}: mail subscription ${result.action}.`),
