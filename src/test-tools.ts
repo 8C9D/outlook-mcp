@@ -86,6 +86,15 @@ import { DOWNLOAD_ROUTE_PREFIX, readDownload } from "./core/downloads.js";
 import { createMemoryStateStore, runWithStateStore, writeJson } from "./core/state.js";
 import { installFileStateStore } from "./state-file.js";
 import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
+import { TOOLS } from "./core/registry.js";
+import { VERSION } from "./core/version.js";
+import {
+  FORBIDDEN_HELP,
+  environmentChecks,
+  explain,
+  missingScopes,
+  translateFailure,
+} from "./scripts/doctor.js";
 import type { ToolResult } from "./tools/common.js";
 import { installMsalTokenProvider } from "./auth.js";
 
@@ -3585,6 +3594,169 @@ if (!liveKey) {
   });
 }
 
+// ---- v10a. the annotation hints on every tool ------------------------------
+
+/**
+ * The scheme, frozen: [readOnly, destructive, idempotent, openWorld] per tool.
+ * Duplicating the registry is the point — a hint that changes has to be changed
+ * here too, deliberately, and the rules it must obey are in core/registry.ts.
+ */
+const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]> = {
+  search_mail: [true, false, true, false],
+  read_thread: [true, false, true, false],
+  read_message: [true, false, true, false],
+  get_attachment: [false, false, false, false],
+  export_message: [false, false, false, false],
+  create_draft: [false, false, false, false],
+  update_draft: [false, false, true, false],
+  send_draft: [false, true, false, true],
+  manage_message: [false, true, false, false],
+  list_folders: [true, false, true, false],
+  list_events: [true, false, true, false],
+  list_calendars: [true, false, true, false],
+  create_event: [false, false, false, true],
+  manage_event: [false, true, false, true],
+  search_contacts: [true, false, true, false],
+  manage_contact: [false, true, false, false],
+  auto_reply: [false, false, true, true],
+  mailbox_settings: [false, false, true, false],
+  add_attachment: [false, false, false, true],
+  manage_rules: [false, true, false, false],
+  manage_senders: [false, false, true, false],
+  create_folder: [false, false, false, false],
+  manage_categories: [false, true, false, false],
+  list_tasks: [true, false, true, false],
+  manage_task: [false, true, false, false],
+  check_new_mail: [false, false, false, false],
+  get_mailbox_activity: [true, false, true, false],
+  manage_auto_filing: [false, false, false, true],
+  get_auto_filing_log: [true, false, true, false],
+};
+
+/** The four hints of a tool definition or a tools/list entry, in a fixed order. */
+function hintTuple(annotations: any): unknown[] {
+  return [
+    annotations?.readOnlyHint,
+    annotations?.destructiveHint,
+    annotations?.idempotentHint,
+    annotations?.openWorldHint,
+  ];
+}
+
+await test("v10a. annotations (all four hints on every tool, and the scheme holds together)", async () => {
+  assert(
+    TOOLS.length === Object.keys(EXPECTED_ANNOTATIONS).length,
+    `the registry has ${TOOLS.length} tools, the expected table ${Object.keys(EXPECTED_ANNOTATIONS).length}`
+  );
+
+  for (const tool of TOOLS) {
+    const want = EXPECTED_ANNOTATIONS[tool.name];
+    assert(want, `${tool.name} has no entry in the expected annotation table`);
+    const got = hintTuple(tool.annotations);
+    assert(
+      got.every((hint) => typeof hint === "boolean"),
+      `${tool.name} leaves a hint unset: ${JSON.stringify(tool.annotations)} — every tool states all four`
+    );
+    assert(
+      JSON.stringify(got) === JSON.stringify(want),
+      `${tool.name} is annotated ${JSON.stringify(got)}, expected ${JSON.stringify(want!)} ` +
+        "[readOnly, destructive, idempotent, openWorld]"
+    );
+  }
+
+  // The rules the scheme is built on, asserted rather than trusted.
+  for (const tool of TOOLS) {
+    const { readOnlyHint, destructiveHint, idempotentHint } = tool.annotations;
+    if (readOnlyHint) {
+      assert(
+        !destructiveHint && idempotentHint,
+        `${tool.name} is read-only yet claims destructive=${destructiveHint}, idempotent=${idempotentHint}`
+      );
+    }
+  }
+
+  // The two the whole safety story rests on.
+  const send = TOOLS.find((t) => t.name === "send_draft")!;
+  assert(
+    send.annotations.destructiveHint && send.annotations.openWorldHint,
+    "send_draft must be flagged destructive and open-world — it is the only irreversible outward act"
+  );
+  const rules = TOOLS.find((t) => t.name === "manage_rules")!;
+  assert(
+    rules.annotations.destructiveHint && !rules.annotations.openWorldHint,
+    "manage_rules must be destructive but not open-world — forwarding actions are deliberately absent"
+  );
+
+  // Nothing that writes may pass itself off as a read.
+  const mutating = ["send_draft", "manage_message", "manage_task", "manage_rules", "manage_auto_filing"];
+  for (const name of mutating) {
+    assert(
+      TOOLS.find((t) => t.name === name)!.annotations.readOnlyHint === false,
+      `${name} is annotated read-only`
+    );
+  }
+});
+
+// ---- v10b. the doctor ------------------------------------------------------
+
+await test("v10b. doctor (environment stage passes here, known failures translated, version in sync)", async () => {
+  const checks = await environmentChecks();
+  const failed = checks.filter((c) => c.status === "fail");
+  assert(
+    failed.length === 0,
+    `the doctor's environment stage fails on this machine: ${failed
+      .map((c) => `${c.name} — ${c.detail}`)
+      .join("; ")}`
+  );
+  for (const name of ["node runtime", "dependencies installed", "AZURE_CLIENT_ID"]) {
+    assert(
+      checks.some((c) => c.name === name),
+      `the environment stage no longer checks "${name}"`
+    );
+  }
+
+  // The three failures this project actually hit must keep their translations:
+  // an unexplained AADSTS number sends a stranger to a search engine.
+  assert(
+    /allowPublicClient|public client flows/i.test(translateFailure("AADSTS70002: something") ?? ""),
+    "AADSTS70002 (public client flows) lost its translation"
+  );
+  assert(
+    /personal Microsoft account/i.test(translateFailure("AADSTS50020: something") ?? ""),
+    "AADSTS50020 (account audience) lost its translation"
+  );
+  assert(
+    translateFailure("some unrelated network error") === undefined,
+    "the translator claims to explain an error it does not know"
+  );
+
+  const forbidden = explain(new GraphError(403, "Forbidden", "/me/messages", "{}"));
+  assert(forbidden.includes(FORBIDDEN_HELP), `a plain 403 is not translated: ${forbidden}`);
+  assert(
+    explain(new GraphError(404, "Not Found", "/me/messages/x", "{}")).length > 0 &&
+      !explain(new GraphError(404, "Not Found", "/me/messages/x", "{}")).includes(FORBIDDEN_HELP),
+    "a 404 is being explained as a permission problem"
+  );
+
+  // Scope arithmetic, on which the live check's verdict rests.
+  assert(missingScopes([]).length > 0, "missingScopes reports nothing missing from an empty grant");
+  assert(
+    missingScopes(["user.read", "mail.read"]).includes("Mail.Send"),
+    "missingScopes does not notice Mail.Send is absent"
+  );
+
+  // The Worker has no filesystem and cannot read package.json, so the literal in
+  // core/version.ts must track it.
+  const pkg = JSON.parse(
+    await fs.readFile(path.join(PROJECT_ROOT, "package.json"), "utf8")
+  ) as { version: string; scripts: Record<string, string> };
+  assert(
+    pkg.version === VERSION,
+    `package.json is ${pkg.version} but core/version.ts is ${VERSION}`
+  );
+  assert(pkg.scripts.doctor, "package.json has no doctor script");
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -3636,6 +3808,10 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
 
     const initResponse = await waitForResponse(1);
     assert(initResponse.result?.serverInfo?.name === "outlook", "Server did not identify as 'outlook'");
+    assert(
+      initResponse.result?.serverInfo?.version === VERSION,
+      `Server reports v${initResponse.result?.serverInfo?.version}, core/version.ts says v${VERSION}`
+    );
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
     send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
     const listResponse = await waitForResponse(2);
@@ -3684,6 +3860,14 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
         tool.inputSchema?.type === "object" &&
           Object.keys(tool.inputSchema.properties ?? {}).length > 0,
         `Tool ${tool.name} lacks a valid object input schema`
+      );
+      // The hints have to reach the wire, not just sit in the registry.
+      const expected = EXPECTED_ANNOTATIONS[tool.name];
+      assert(expected, `Tool ${tool.name} is not in the expected annotation table`);
+      assert(
+        JSON.stringify(hintTuple(tool.annotations)) === JSON.stringify(expected),
+        `Tool ${tool.name} came over stdio annotated ${JSON.stringify(tool.annotations)}, ` +
+          `expected ${JSON.stringify(expected!)} [readOnly, destructive, idempotent, openWorld]`
       );
     }
 
