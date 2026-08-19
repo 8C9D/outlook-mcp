@@ -1261,3 +1261,33 @@ stdio smoke test additionally asserts the version the server reports over `initi
   calls worth explaining. Stale counts fixed throughout (23/27 tools → 29), and the version-labelled
   prose ("new in v8", "v9 adds") de-versioned — a stranger does not know what v8 was.
 - `package.json` and `src/core/version.ts` → **0.10.0**.
+
+## Enable-operate-publish run, Batch 1 — the LLM features turned ON (2026-08-19)
+
+- The user explicitly confirmed enabling BOTH auto-filing and the morning digest, accepting the
+  API cost. Enabled by writing `llm:config` to the Worker's KV (the same record
+  `manage_auto_filing` writes) with everything else at the shipped defaults: threshold 0.8,
+  daily call cap 200, no extra skip patterns. `/health` re-checked: still only
+  status/service/version, nothing sensitive.
+- **Digest smoke mechanism**: no local ANTHROPIC_API_KEY exists (the key is a deployed-Worker
+  secret the user put there themselves), so the handler could not be invoked from Node with the
+  real model. Instead a one-off token-gated route (`POST /internal/digest-smoke`, 64-hex
+  random header token) was deployed UNCOMMITTED, called `draftMorningBrief(env)` exactly as the
+  cron does (no force — config and idempotency checks intact), and was reverted and redeployed
+  away within two minutes. Nothing entered git history; the route 404s now. The resulting
+  "Morning brief — 2026-08-19" draft was verified via Graph (isDraft, addressed to the owner)
+  and LEFT in the mailbox as the user's first real digest.
+- **Auto-filing smoke**: one `[MCP TEST]` receipt probe sent-to-self at the DEFAULT 0.8
+  threshold (not tuned, unlike r25 which drops to 0.5); classified `moved → Archive` at
+  confidence 0.85, move verified via Graph, decision in the audit log, then the probe copies
+  permanently deleted and the activity + audit ring buffers swept of test entries.
+- **The remote suite's disabled-state assumptions were retired**: r24 now captures the live
+  config and asserts only that it parses (the shipped-defaults-off assertion stays); r25's
+  cleanup restores the exact captured config instead of calling `disable_filing`; r20 restores
+  the captured config, asserts byte-equality with it, and sweeps `[MCP TEST]` audit entries
+  while KEEPING real decisions made during the run. This exposed a latent bug: the harness's
+  `kvGet` returned wrangler's trailing newline, so a captured value could never round-trip
+  byte-equal through `kvPut` — fixed by stripping the one trailing newline.
+- Live filer during the local suite: its probes were classified but produced no action
+  (below threshold / model chose none), so the local tests are undisturbed by the enabled
+  filer; the two test-marked audit entries were swept afterwards.

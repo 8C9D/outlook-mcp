@@ -634,3 +634,18 @@ reset — e.g. tomorrow):**
   was re-seeded and proven. If claude.ai or phone queries still error, the
   fix is Settings → Connectors → Outlook (personal) → reconnect.
 - Publication remains an open user decision; nothing was published.
+
+## Batch 1 — LLM features enabled (2026-08-19) — PASSED
+
+Auto-filing and the morning digest **enabled 2026-08-19, default threshold**
+(0.8; daily call cap 200), by explicit user confirmation, via `llm:config` in
+the Worker's KV — verified by reading it back and re-checking `/health`.
+Smokes: the digest handler invoked once on the deployed Worker (real model,
+cron semantics intact) drafted "Morning brief — 2026-08-19", verified in the
+mailbox and left there as the first real digest; one `[MCP TEST]` receipt
+probe was classified moved → Archive at confidence 0.85 (≥ the untouched 0.8
+default), the move verified, the decision logged, and the probe cleaned up.
+Auto-filing STAYS enabled. Remote suite made state-aware of an
+enabled-by-choice deployment (r24/r25/r20) and re-run green: remote 26/26
+headless, local 47/47. Review `get_auto_filing_log` after a few days and tune
+the threshold only if the audit shows misfiles.
