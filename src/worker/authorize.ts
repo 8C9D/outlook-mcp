@@ -21,6 +21,7 @@ import {
 } from "./ms-token.js";
 import type { GrantProps } from "./mcp-handler.js";
 import { NOTIFICATIONS_PATH, handleNotifications } from "./notifications.js";
+import { VERSION } from "../core/version.js";
 
 /** Pending device-code authorizations, keyed by an unguessable flow id. */
 const FLOW_PREFIX = "flow:";
@@ -318,8 +319,12 @@ export const defaultHandler = {
       return handleNotifications(request, env, ctx);
     }
     if (url.pathname === "/health") {
-      // Deliberately says nothing about the mailbox or whether anyone is authorized.
-      return json({ status: "ok", service: "outlook-mcp" });
+      // Deliberately says nothing about the mailbox or whether anyone is
+      // authorized. The version is the one thing worth serving anonymously: it
+      // is how a headless check tells whether the deployed build is the one in
+      // the working tree, and so whether its tools/list carries this registry's
+      // annotations.
+      return json({ status: "ok", service: "outlook-mcp", version: VERSION });
     }
     if (url.pathname === "/") {
       return html(

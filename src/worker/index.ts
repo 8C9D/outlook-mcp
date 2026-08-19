@@ -1,8 +1,9 @@
-// Cloudflare Worker entry point: the same 24 tools, 2 prompts and 2 resources
-// as the stdio server, served over MCP Streamable HTTP and gated by OAuth,
-// plus the three things only a hosted server can do — receive Graph change
-// notifications, keep their subscription alive on a schedule, and hand out
-// short-lived authenticated links to attachment bytes it cannot save to disk.
+// Cloudflare Worker entry point: the same tools, prompts and resources as the
+// stdio server (both build from core/registry.js, so neither can drift), served
+// over MCP Streamable HTTP and gated by OAuth, plus the three things only a
+// hosted server can do — receive Graph change notifications, keep their
+// subscription alive on a schedule, and hand out short-lived authenticated
+// links to attachment bytes it cannot save to disk.
 //
 // OAuthProvider owns the whole authorization-server surface — discovery
 // metadata, dynamic client registration, PKCE, the token endpoint, bearer

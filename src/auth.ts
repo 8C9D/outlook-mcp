@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   PublicClientApplication,
+  type AuthenticationResult,
   type ICachePlugin,
   type TokenCacheContext,
 } from "@azure/msal-node";
@@ -16,10 +17,11 @@ export { AuthRequiredError };
 // must carry only JSON-RPC in server mode.
 dotenv.config({ path: path.join(PROJECT_ROOT, ".env"), quiet: true });
 
-const CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
+/** Where MSAL's serialized cache lives. `npm run doctor` reports on this file. */
+export const TOKEN_CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
 
 // offline_access is added by MSAL automatically; openid/profile must not be listed.
-const SCOPES = [
+export const SCOPES = [
   "User.Read",
   "Mail.Read",
   "Mail.ReadWrite",
@@ -44,15 +46,15 @@ function requireClientId(): string {
 const cachePlugin: ICachePlugin = {
   async beforeCacheAccess(context: TokenCacheContext): Promise<void> {
     try {
-      context.tokenCache.deserialize(await fs.readFile(CACHE_PATH, "utf8"));
+      context.tokenCache.deserialize(await fs.readFile(TOKEN_CACHE_PATH, "utf8"));
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   },
   async afterCacheAccess(context: TokenCacheContext): Promise<void> {
     if (context.cacheHasChanged) {
-      await fs.writeFile(CACHE_PATH, context.tokenCache.serialize(), { mode: 0o600 });
-      await fs.chmod(CACHE_PATH, 0o600);
+      await fs.writeFile(TOKEN_CACHE_PATH, context.tokenCache.serialize(), { mode: 0o600 });
+      await fs.chmod(TOKEN_CACHE_PATH, 0o600);
     }
   },
 };
@@ -84,12 +86,35 @@ async function acquireByDeviceCode(pca: PublicClientApplication): Promise<string
   return result.accessToken;
 }
 
-async function acquireSilent(pca: PublicClientApplication): Promise<string | undefined> {
+async function acquireSilentResult(
+  pca: PublicClientApplication
+): Promise<AuthenticationResult | undefined> {
   const accounts = await pca.getTokenCache().getAllAccounts();
   const account = accounts[0];
   if (!account) return undefined;
-  const result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
-  return result?.accessToken ?? undefined;
+  return (await pca.acquireTokenSilent({ account, scopes: SCOPES })) ?? undefined;
+}
+
+async function acquireSilent(pca: PublicClientApplication): Promise<string | undefined> {
+  return (await acquireSilentResult(pca))?.accessToken ?? undefined;
+}
+
+/**
+ * The scopes the cached sign-in actually carries, as MSAL reports them. Graph
+ * access tokens for a personal Microsoft account are not JWTs, so this — not
+ * decoding the token — is the only way to see what was consented to.
+ * Throws AuthRequiredError on the same conditions as getAccessTokenSilent.
+ */
+export async function getGrantedScopes(): Promise<string[]> {
+  const pca = getPca();
+  try {
+    const result = await acquireSilentResult(pca);
+    if (result) return result.scopes ?? [];
+    throw new AuthRequiredError("no cached account");
+  } catch (err) {
+    if (err instanceof AuthRequiredError) throw err;
+    throw new AuthRequiredError(err instanceof Error ? err.message : String(err));
+  }
 }
 
 /**

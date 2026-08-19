@@ -57,6 +57,7 @@ import type { ActivityEntry } from "./core/notifications.js";
 import { TOOLS } from "./core/registry.js";
 import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
 import { SUBSCRIPTION_RESOURCE, type SubscriptionRecord } from "./core/subscriptions.js";
+import { VERSION } from "./core/version.js";
 
 const BASE_URL = process.env.MCP_REMOTE_URL ?? "https://outlook-mcp.arthur-yuhao-zhang.workers.dev";
 const MCP_URL = `${BASE_URL}/mcp`;
@@ -528,20 +529,38 @@ await testAuthed("r8. initialize over Streamable HTTP reports this server", asyn
   );
 });
 
-await testAuthed(`r9. tools/list serves all ${TOOLS.length} tools, identical to the stdio surface`, async () => {
-  assert(bearer, "no bearer token");
-  const result = resultOf(await mcpCall(bearer!, "tools/list"), "tools/list");
-  const remoteNames = (result.tools as { name: string }[]).map((t) => t.name).sort();
-  const localNames = TOOLS.map((t) => t.name).sort();
-  assert(
-    remoteNames.length === localNames.length,
-    `remote has ${remoteNames.length} tools, the registry has ${localNames.length}`
-  );
-  assert(
-    remoteNames.join(",") === localNames.join(","),
-    `tool surfaces differ:\n  remote: ${remoteNames.join(", ")}\n  local:  ${localNames.join(", ")}`
-  );
-});
+await testAuthed(
+  `r9. tools/list serves all ${TOOLS.length} tools, with the same annotations as the stdio surface`,
+  async () => {
+    assert(bearer, "no bearer token");
+    const result = resultOf(await mcpCall(bearer!, "tools/list"), "tools/list");
+    const remote = result.tools as { name: string; annotations?: Record<string, boolean> }[];
+    const remoteNames = remote.map((t) => t.name).sort();
+    const localNames = TOOLS.map((t) => t.name).sort();
+    assert(
+      remoteNames.length === localNames.length,
+      `remote has ${remoteNames.length} tools, the registry has ${localNames.length}`
+    );
+    assert(
+      remoteNames.join(",") === localNames.join(","),
+      `tool surfaces differ:\n  remote: ${remoteNames.join(", ")}\n  local:  ${localNames.join(", ")}`
+    );
+
+    // The annotation hints have to survive the second transport too: a client
+    // that trusts them on stdio must see the same ones over HTTP.
+    const hints = (a: Record<string, boolean> | undefined) =>
+      [a?.readOnlyHint, a?.destructiveHint, a?.idempotentHint, a?.openWorldHint].join(",");
+    for (const tool of TOOLS) {
+      const served = remote.find((t) => t.name === tool.name)!;
+      assert(
+        hints(served.annotations) === hints(tool.annotations),
+        `${tool.name} is annotated [${hints(served.annotations)}] over HTTP, ` +
+          `[${hints(tool.annotations)}] in the registry ` +
+          "(readOnly, destructive, idempotent, openWorld)"
+      );
+    }
+  }
+);
 
 await testAuthed("r10. prompts/list serves both prompts", async () => {
   assert(bearer, "no bearer token");
@@ -1157,6 +1176,24 @@ await testAuthed("r25. end-to-end: auto-filing classifies a notified message, th
     const disabled = await callTool("manage_auto_filing", { action: "disable_filing" });
     assert(/Auto-filing:\s+OFF/.test(disabled), `disable_filing did not report OFF:\n${disabled}`);
   }
+});
+
+// ------------------------------------------------- v10: is the deployment current
+
+// r9 compares the annotations the deployed server actually serves, but tools/list
+// needs a bearer and so cannot run headless. This can: /health names the build's
+// version, so a headless run still fails loudly when the deployed Worker predates
+// the working tree — which is the only way r9 could be passing about stale hints.
+await test("r26. the deployed Worker is running this checkout's version", async () => {
+  const response = await fetch(`${BASE_URL}/health`);
+  assert(response.ok, `GET /health returned HTTP ${response.status}`);
+  const body = (await response.json()) as { status?: string; version?: string };
+  assert(body.status === "ok", `/health reports status ${body.status}`);
+  assert(
+    body.version === VERSION,
+    `the deployed Worker is v${body.version ?? "(unreported)"}, this checkout is v${VERSION} — ` +
+      "run `npm run deploy`"
+  );
 });
 
 await test("r20. cleanup: the probe message, its notifications and the delta position are gone", async () => {
