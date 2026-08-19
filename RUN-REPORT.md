@@ -542,3 +542,95 @@ reset — e.g. tomorrow):**
 4. Strongly recommended after today's sign-in friction: enroll a passkey on
    the Microsoft account (account.live.com → Security) so future device-code
    sign-ins don't depend on throttled email codes.
+
+---
+
+## Batch D — Annotations and adoption polish (v0.10.0) — PASSED (2026-08-19)
+
+**Shipped (commits `fc0e5a0` code, `e9cc95e` docs; deployed as version
+`0369cc43`).**
+- **Every tool carries all four MCP annotation hints on both transports**,
+  applied by one stated rule per hint so 29 tools cannot drift into 29
+  readings: readOnlyHint = changes nothing anywhere (mailbox, server state,
+  local disk); destructiveHint = can remove/overwrite something the user
+  would miss or act outward irreversibly (soft deletes count); idempotentHint
+  = set-shaped repeat, not "repeat doesn't error"; openWorldHint = the call
+  or the setting it establishes moves data across the mailbox boundary
+  (merely reaching Graph is not the test). 13 read-only tools; 7 destructive
+  (send_draft, manage_message, manage_event, manage_contact, manage_rules,
+  manage_categories, manage_task); open-world includes auto_reply and
+  manage_auto_filing because the standing behavior they enable is outward.
+  Non-obvious calls documented in ASSUMPTIONS v10: check_new_mail is NOT
+  read-only (advances the delta position); get_attachment/export_message
+  write a file/KV record; manage_rules is closed-world only because
+  forwarding actions were excluded in v3. Annotations flow through the
+  shared registerAll(), so stdio and Worker are identical by construction.
+- **SETUP.md for a stranger**: zero → working, including the Entra
+  registration pitfalls this project itself hit (personal-accounts audience,
+  allow-public-client-flows), local install/login, optional Workers deploy,
+  claude.ai connector.
+- **`npm run doctor`** (src/scripts/doctor.ts): three stages — environment
+  (no network, runs on a fresh clone via `--env-only`), live mailbox probe
+  (silent token, granted scopes via MSAL's own result — a consumer Graph
+  access token is not a JWT, so there is no scp claim to decode; /me; inbox),
+  deployment. Per-check PASS/WARN/FAIL with fixes, and translations for
+  AADSTS70002, AADSTS50020, AADSTS700016 and plain 403.
+- **README restructured for publication**: feature table, security model
+  (two-step send, soft deletes, no rule forwarding, interactive-only
+  authorize, injection-hardened auto-filing), architecture sketch, cost
+  statement, annotations table. Nothing published — no remotes, no license;
+  that decision stays with the user.
+- `/health` now reports the version (deviation beyond the brief, adopted):
+  tools/list needs a bearer, so a headless run cannot read the deployed
+  annotations — but unauthenticated r26 can now prove the deployed build is
+  this checkout's; authed r9 proves the hints themselves.
+- Tests grown: local v10a (annotation table + rules frozen, wire-level smoke
+  assertion) and v10b (doctor self-test; the package.json↔version.ts sync
+  the v9 notes wrongly claimed was asserted, now actually asserted); remote
+  r9 extended (deployed annotations equal the registry's), r26 added
+  (deployed version, unauthenticated).
+
+**Gate review (orchestrator, re-run independently).**
+- `npm run typecheck` clean. **Doctor 11/11** on this machine (including the
+  live probe: all 8 scopes granted, /me is the allowlisted account, deployed
+  Worker serving v0.10.0).
+- Local harness **47/47** (1 designed SKIP: v9e live-API key). Remote
+  headless **26/26** (14 SKIP needing a bearer). Gate interpretation,
+  recorded per the closeout instruction: Batch D front-loads no auth and the
+  authenticated proof stands from the same-day Batch C closure (25/25 all
+  live against the same deployed Worker lineage), so the Batch D remote
+  re-run is headless by design — a second interactive sign-in was not
+  required.
+- Fresh-clone dry run (orchestrator's own): clone → npm install → typecheck
+  all green; `doctor --env-only` on the bare clone fails ONLY on
+  AZURE_CLIENT_ID with the fix and a SETUP.md pointer (exit 1, as a
+  stranger should see), and passes 4/4 once .env exists. Clone removed.
+- stdio smoke from cwd=/tmp: serverInfo `outlook 0.10.0`, 29 tools, 29 fully
+  annotated, stdout pure JSON-RPC.
+- Review findings: two README links pointed at a nonexistent
+  `#what-it-costs` anchor — fixed in the gate commit. Nothing else.
+
+## Final report — extension run 2, completed (Batches A–D all passed)
+
+- **Version 0.10.0** — 29 tools (all fully annotated), 2 prompts,
+  2 resources, two transports: local stdio (`node dist/server.js`, MSAL disk
+  cache) and https://outlook-mcp.arthur-yuhao-zhang.workers.dev/mcp
+  (Streamable HTTP, OAuth-gated to the owner, interactive-only authorize,
+  tokens in KV with refresh rotation, webhook subscription with cron
+  self-healing, deployed version `0369cc43`).
+- Gates: A, B passed previously; **C closed 2026-08-19** (remote 25/25 all
+  live — the full authenticated surface including the auto-filing
+  end-to-end); **D passed 2026-08-19** (local 47/47, remote headless 26/26,
+  doctor 11/11, fresh-clone dry run, stdio smoke).
+- Suite totals across the run: local 29/29 → 47/47; remote 20/20 → 26 tests
+  (25/25 proven all-live at the C gate; 26/26 headless at the D gate).
+- **Auto-filing and the digest remain DISABLED**: `llm:config` absent from
+  deployed KV (the shipped default, both off), verified after the last
+  suite run. Enable only by choice via `manage_auto_filing`
+  (`enable_filing` / `enable_digest`) after reading README → "LLM mail
+  intelligence (what it costs and how to turn it on/off)".
+- Connector note: the claude.ai↔Worker OAuth grants are independent of
+  Microsoft's tokens and survived the password change; the Microsoft side
+  was re-seeded and proven. If claude.ai or phone queries still error, the
+  fix is Settings → Connectors → Outlook (personal) → reconnect.
+- Publication remains an open user decision; nothing was published.
