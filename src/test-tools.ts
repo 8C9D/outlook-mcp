@@ -5,13 +5,14 @@
 // (messages, drafts, folders, events, calendars, contacts, inbox rules, categories,
 // To Do tasks, temp files) and that mailbox settings (auto-reply) are restored exactly.
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GraphError, callGraphServer, graphRequestLog } from "./core/graph.js";
 import { PROJECT_ROOT } from "./project-root.js";
-import { searchMailHandler } from "./tools/search-mail.js";
+import { searchMailHandler, torontoMidnightUtc } from "./tools/search-mail.js";
+import { deleteFolderHandler } from "./tools/delete-folder.js";
 import { readThreadHandler } from "./tools/read-thread.js";
 import { readMessageHandler } from "./tools/read-message.js";
 import { createDraftHandler } from "./tools/create-draft.js";
@@ -116,6 +117,17 @@ const TEST_STATE_FILE = path.join(
 installFileStateStore(TEST_STATE_FILE);
 
 const TEST_PREFIX = "[MCP TEST]";
+
+/**
+ * Appended to every send-to-self probe subject in THIS suite. The phrase
+ * matches the auto-filer's compiled-in protected-subject list, so the LIVE
+ * deployed filer (the owner runs it enabled) skips these probes before any
+ * model call and can never race the harness by filing them out of the inbox —
+ * which really happened: a "[MCP TEST] v2" probe was filed to another folder
+ * at 0.85 confidence seconds after delivery, and the inbox poll timed out.
+ * Remote-suite probes deliberately do NOT carry this: r25/r29 need filing.
+ */
+const FILER_SHIELD = "verification code probe";
 
 type Outcome = { name: string; passed: boolean; skipped?: boolean; detail?: string };
 const outcomes: Outcome[] = [];
@@ -410,7 +422,12 @@ await test("a. read_message (latest inbox message, attachment inventory)", async
 // ---- b. draft lifecycle: create → update → send → arrive -----------------
 
 await test("b. draft lifecycle (create → update_draft → send_draft → arrives in inbox)", async () => {
-  const subject = `${TEST_PREFIX} v2`;
+  // The shield must actually be on the protected list, or it shields nothing.
+  assert(
+    isProtectedSubject(FILER_SHIELD) !== null,
+    `FILER_SHIELD "${FILER_SHIELD}" no longer matches the protected-subject list`
+  );
+  const subject = `${TEST_PREFIX} v2 ${FILER_SHIELD}`;
   const createText = toolText(
     await createDraftHandler({
       to: [ownAddress],
@@ -1329,7 +1346,7 @@ await test("v4d. task lifecycle (create from a message → complete → reopen �
 // ---- v5a. check_new_mail delta lifecycle ---------------------------------
 
 await test("v5a. check_new_mail delta (baseline → send-to-self → sees exactly it → advances)", async () => {
-  const subject = `${TEST_PREFIX} v5 delta`;
+  const subject = `${TEST_PREFIX} v5 delta ${FILER_SHIELD}`;
 
   const baseline = toolText(
     await checkNewMailHandler({ folder: "inbox", reset: true }),
@@ -2846,17 +2863,44 @@ await test("v9a. classifier boundary (no Graph transport reachable; only move/ca
     `core/digest.ts can reach ${digestForbidden.join(", ")}`
   );
 
-  // 2. The port's surface. Exactly five operations, two of them mutating.
+  // And the correction reconciler (the feedback loop), which lives on the same
+  // side of the line: it acts only through the injected ClassifierMailbox.
+  const correctionsReachable = await transitiveImports("src/core/corrections.ts");
+  const correctionsForbidden = [...correctionsReachable].filter(
+    (file) =>
+      file.startsWith("src/tools/") ||
+      file === "src/core/graph.ts" ||
+      file === "src/core/mail-actions.ts" ||
+      file === "src/core/digest-mailbox.ts"
+  );
+  assert(
+    correctionsForbidden.length === 0,
+    `core/corrections.ts can reach ${correctionsForbidden.join(", ")}`
+  );
+
+  // 2. The port's surface. Exactly seven operations, STILL only two mutating
+  //    (move, categorize) — the feedback loop added getFolder and
+  //    findByConversation, both reads.
   const port = Object.keys({
     listFilingFolders: 0,
     listCategories: 0,
     readMessage: 0,
+    getFolder: 0,
+    findByConversation: 0,
     move: 0,
     categorize: 0,
   } satisfies Record<keyof ClassifierMailbox, number>).sort();
   assert(
     JSON.stringify(port) ===
-      JSON.stringify(["categorize", "listCategories", "listFilingFolders", "move", "readMessage"]),
+      JSON.stringify([
+        "categorize",
+        "findByConversation",
+        "getFolder",
+        "listCategories",
+        "listFilingFolders",
+        "move",
+        "readMessage",
+      ]),
     `ClassifierMailbox exposes ${port.join(", ")}`
   );
 
@@ -2921,6 +2965,14 @@ function fakeMailbox(message: MailFacts, folders: FilingFolder[], categories: st
     async readMessage() {
       calls.push("readMessage");
       return message;
+    },
+    async getFolder(folderId) {
+      calls.push(`getFolder:${folderId}`);
+      return folders.find((f) => f.id === folderId) ?? null;
+    },
+    async findByConversation() {
+      calls.push("findByConversation");
+      return [];
     },
     async move(id, folderId) {
       calls.push(`move:${folderId}`);
@@ -3627,6 +3679,9 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   manage_rules: [false, true, false, false],
   manage_senders: [false, false, true, false],
   create_folder: [false, false, false, false],
+  // Soft (a MOVE into Deleted Items, never Graph's permanent DELETE), but soft
+  // deletes still count as destructive.
+  delete_folder: [false, true, false, false],
   manage_categories: [false, true, false, false],
   list_tasks: [true, false, true, false],
   manage_task: [false, true, false, false],
@@ -3950,6 +4005,247 @@ await test("v11b. rules backup (export → mutate → dry-run diff → apply res
   }
 });
 
+// ---- v12a. search_mail depth: dates, attachments, whole-mailbox scope ------
+
+await test("v12a. search_mail filters (dates, has_attachments, all_folders; get_latest honors them)", async () => {
+  const token = `probe${randomBytes(4).toString("hex")}`;
+  const subject = `${TEST_PREFIX} v12 search ${FILER_SHIELD} ${token}`;
+  const today = torontoToday();
+  const yesterday = addDays(today, -1);
+
+  // A probe WITH an attachment, sent to self so both an inbox and a Sent
+  // Items copy exist — which is what makes all_folders assertable.
+  const createText = toolText(
+    await createDraftHandler({
+      to: [ownAddress],
+      subject,
+      body: "Search-filter probe from the test harness. Safe to delete.",
+    }),
+    "create_draft"
+  );
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `Could not extract draft id from: ${createText}`);
+  toolText(
+    await addAttachmentHandler({
+      draft_id: draftId,
+      content_base64: Buffer.from("search filter probe payload").toString("base64"),
+      attachment_name: "probe.txt",
+    }),
+    "add_attachment"
+  );
+  toolText(await sendDraftHandler({ draft_id: draftId }), "send_draft");
+  await poll("the search probe to arrive", 90000, async () => {
+    const found = await callGraphServer(
+      `/me/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,parentFolderId`
+    );
+    // Both copies: the delivered one (wherever it landed) and Sent Items'.
+    return (found?.value ?? []).length >= 2 ? found.value : undefined;
+  });
+
+  const structuredOf = (result: ToolResult, context: string) => {
+    const text = toolText(result, context);
+    const sc = result.structuredContent as any;
+    assert(sc, `${context} returned no structuredContent`);
+    assert(sc.count === (sc.messages ?? []).length, `${context}: count ${sc.count} != ${sc.messages?.length}`);
+    for (const message of sc.messages ?? []) {
+      assert(text.includes(message.messageId), `${context}: structured id ${message.messageId} missing from text`);
+    }
+    return { text, sc };
+  };
+
+  // get_latest mode (no query) honors all three filters at whole-mailbox scope.
+  const withAtt = structuredOf(
+    await searchMailHandler({ all_folders: true, date_from: today, has_attachments: true, max_results: 25 }),
+    "latest+filters"
+  );
+  assert(withAtt.sc.mode === "latest", `mode is ${withAtt.sc.mode}`);
+  assert(withAtt.sc.scope === "all folders", `scope is ${withAtt.sc.scope}`);
+  assert(
+    withAtt.sc.messages.filter((m: any) => String(m.subject).includes(token)).length >= 2,
+    `all_folders did not surface both probe copies:\n${withAtt.text}`
+  );
+  assert(
+    withAtt.sc.messages.every((m: any) => m.hasAttachments === true),
+    "has_attachments true let an attachment-less message through"
+  );
+  assert(/with attachments/.test(withAtt.text), "the text does not state the attachment filter");
+
+  // has_attachments false excludes the probe.
+  const withoutAtt = structuredOf(
+    await searchMailHandler({ all_folders: true, date_from: today, has_attachments: false, max_results: 25 }),
+    "latest has_attachments=false"
+  );
+  assert(
+    !withoutAtt.sc.messages.some((m: any) => String(m.subject).includes(token)),
+    "has_attachments false still returned the attachment probe"
+  );
+  assert(
+    withoutAtt.sc.messages.every((m: any) => m.hasAttachments === false),
+    "has_attachments false let an attachment through"
+  );
+
+  // A window ending yesterday excludes the probe, and every hit predates
+  // today's Toronto midnight — the exact boundary, not the UTC one.
+  const past = structuredOf(
+    await searchMailHandler({ all_folders: true, date_to: yesterday, max_results: 10 }),
+    "latest date_to=yesterday"
+  );
+  assert(!past.text.includes(token), "a date window ending yesterday still shows today's probe");
+  const todayMidnightUtc = Date.parse(torontoMidnightUtc(today));
+  for (const message of past.sc.messages) {
+    assert(
+      Date.parse(message.receivedDateTime) < todayMidnightUtc,
+      `date_to=${yesterday} returned ${message.receivedDateTime}, past the Toronto boundary`
+    );
+  }
+
+  // Query mode honors the same filters (KQL narrowing + exact post-filter).
+  const found = await poll("the search index to see the probe", 120000, async () => {
+    const result = await searchMailHandler({
+      query: token,
+      all_folders: true,
+      has_attachments: true,
+      max_results: 25,
+    });
+    const sc = result.structuredContent as any;
+    return sc?.messages?.some((m: any) => String(m.subject).includes(token))
+      ? structuredOf(result, "search+filters")
+      : undefined;
+  });
+  assert(found.sc.mode === "search", `mode is ${found.sc.mode}`);
+  assert(
+    found.sc.messages.every((m: any) => m.hasAttachments === true),
+    "query mode let an attachment-less hit through has_attachments true"
+  );
+  const noneInPast = structuredOf(
+    await searchMailHandler({ query: token, all_folders: true, date_to: yesterday, max_results: 25 }),
+    "search date_to=yesterday"
+  );
+  assert(
+    noneInPast.sc.count === 0 && /No messages matching/.test(noneInPast.text),
+    `a query dated before the probe still found it:\n${noneInPast.text}`
+  );
+
+  // Unfiltered folder-scoped latest is unchanged (regression), and an inverted
+  // date range is a caller error.
+  const plain = structuredOf(await searchMailHandler({ max_results: 3 }), "plain latest");
+  assert(plain.sc.mode === "latest" && plain.sc.scope === "inbox", `plain latest: ${JSON.stringify(plain.sc)}`);
+  expectError(
+    await searchMailHandler({ date_from: today, date_to: yesterday }),
+    "search_mail(date_from > date_to)"
+  );
+
+  // Cleanup: both probe copies, permanently.
+  const copies = await callGraphServer(
+    `/me/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id`
+  );
+  for (const message of copies?.value ?? []) {
+    await callGraphServer(`/me/messages/${encodeURIComponent(message.id)}/permanentDelete`, {
+      method: "POST",
+    });
+  }
+});
+
+// ---- v12b. delete_folder: guards, force, and the honest soft delete --------
+
+await test("v12b. delete_folder (well-known refused; non-empty refused; force moves contents; soft delete)", async () => {
+  const deleteditems = await callGraphServer("/me/mailFolders/deleteditems?$select=id");
+
+  // Well-known folders are refused by id, however they are named.
+  const wellKnown = expectError(await deleteFolderHandler({ folder: "inbox" }), "delete_folder(inbox)");
+  assert(/well-known/.test(wellKnown), `Unexpected refusal: ${wellKnown}`);
+
+  // An unknown folder is a caller error, not a Graph stack trace.
+  const missing = expectError(
+    await deleteFolderHandler({ folder: "no-such-folder-xyz" }),
+    "delete_folder(unknown)"
+  );
+  assert(/No folder/.test(missing), `Unexpected unknown-folder text: ${missing}`);
+
+  // Build: parent with a subfolder and two messages inside the parent.
+  const parent = await callGraphServer("/me/mailFolders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: `${TEST_PREFIX} v12 del parent` }),
+  });
+  const child = await callGraphServer(
+    `/me/mailFolders/${encodeURIComponent(parent.id)}/childFolders`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ displayName: `${TEST_PREFIX} v12 del child` }),
+    }
+  );
+  const messageIds: string[] = [];
+  for (const n of [1, 2]) {
+    const message = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(parent.id)}/messages`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          subject: `${TEST_PREFIX} v12 del message ${n}`,
+          body: { contentType: "text", content: "delete_folder force probe" },
+        }),
+      }
+    );
+    messageIds.push(String(message.id));
+  }
+
+  try {
+    // Subfolders always refuse, force or not.
+    const hasChild = expectError(
+      await deleteFolderHandler({ folder: parent.id, force: true }),
+      "delete_folder(parent with subfolder)"
+    );
+    assert(/subfolder/.test(hasChild), `Unexpected subfolder refusal: ${hasChild}`);
+
+    // The empty child soft-deletes: MOVED under Deleted Items, still GETtable.
+    const childText = toolText(await deleteFolderHandler({ folder: child.id }), "delete_folder(child)");
+    assert(/moved to Deleted Items/i.test(childText), `Unexpected output: ${childText}`);
+    const childAfter = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(child.id)}?$select=id,parentFolderId`
+    );
+    assert(childAfter.parentFolderId === deleteditems.id, "the child folder is not under Deleted Items");
+
+    // Non-empty without force: refused, naming the count.
+    const nonEmpty = expectError(
+      await deleteFolderHandler({ folder: parent.id }),
+      "delete_folder(non-empty, no force)"
+    );
+    assert(/2 message\(s\)/.test(nonEmpty) && /force/.test(nonEmpty), `Unexpected refusal: ${nonEmpty}`);
+
+    // With force: the messages land in Deleted Items ITSELF (said so in the
+    // result), and the folder follows as a soft delete.
+    const forced = toolText(
+      await deleteFolderHandler({ folder: parent.id, force: true }),
+      "delete_folder(force)"
+    );
+    assert(
+      /2 message\(s\) were moved into Deleted Items first/.test(forced),
+      `The force result does not state the contents move: ${forced}`
+    );
+    assert(/moved to Deleted Items \(soft delete/.test(forced), `Unexpected force output: ${forced}`);
+    // A move mints new ids, so find the messages by subject rather than by id.
+    const movedMessages = await callGraphServer(
+      `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX} v12 del message')`)}&$select=id,parentFolderId`
+    );
+    assert(
+      (movedMessages?.value ?? []).length === 2 &&
+        movedMessages.value.every((m: any) => m.parentFolderId === deleteditems.id),
+      `The folder's messages are not sitting directly in Deleted Items: ${JSON.stringify(movedMessages?.value)}`
+    );
+    const parentAfter = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(parent.id)}?$select=id,parentFolderId,totalItemCount`
+    );
+    assert(parentAfter.parentFolderId === deleteditems.id, "the parent folder is not under Deleted Items");
+  } finally {
+    // Purge everything this test made (test-only permanent deletes).
+    await purgeTestFolders();
+    await purgeTestMessages();
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -4018,6 +4314,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "create_draft",
       "create_event",
       "create_folder",
+      "delete_folder",
       "export_message",
       "get_attachment",
       "get_auto_filing_log",
@@ -4043,7 +4340,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 30, `Expected 30 tools, got ${tools.length}`);
+    assert(tools.length === 31, `Expected 31 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -4062,6 +4359,51 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
         JSON.stringify(hintTuple(tool.annotations)) === JSON.stringify(expected),
         `Tool ${tool.name} came over stdio annotated ${JSON.stringify(tool.annotations)}, ` +
           `expected ${JSON.stringify(expected!)} [readOnly, destructive, idempotent, openWorld]`
+      );
+    }
+
+    // Structured content: exactly the five reader tools advertise an
+    // outputSchema on the wire, as a JSON-Schema object.
+    const STRUCTURED_TOOLS = ["get_health", "list_events", "list_folders", "list_tasks", "search_mail"];
+    for (const tool of tools) {
+      if (STRUCTURED_TOOLS.includes(tool.name)) {
+        assert(
+          tool.outputSchema?.type === "object" &&
+            Object.keys(tool.outputSchema.properties ?? {}).length > 0,
+          `Tool ${tool.name} does not advertise an object outputSchema over stdio`
+        );
+      } else {
+        assert(
+          tool.outputSchema === undefined,
+          `Tool ${tool.name} unexpectedly advertises an outputSchema`
+        );
+      }
+    }
+
+    // And a real call over the wire returns structuredContent that agrees with
+    // its text (the cached token makes a live search possible here).
+    send({
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: { name: "search_mail", arguments: { max_results: 3 } },
+    });
+    const callResponse = await waitForResponse(30, 60000);
+    const call = callResponse.result;
+    assert(call && call.isError !== true, `search_mail over stdio failed: ${JSON.stringify(call)?.slice(0, 300)}`);
+    const structured = call.structuredContent;
+    assert(structured, "search_mail over stdio returned no structuredContent");
+    assert(structured.mode === "latest", `structured mode is ${structured.mode}`);
+    assert(Array.isArray(structured.messages), "structured messages is not an array");
+    assert(
+      structured.count === structured.messages.length,
+      `structured count ${structured.count} != messages ${structured.messages.length}`
+    );
+    const callText = (call.content ?? []).map((part: any) => part.text ?? "").join("\n");
+    for (const message of structured.messages) {
+      assert(
+        callText.includes(message.messageId),
+        `structured message ${message.messageId} is missing from the text`
       );
     }
 

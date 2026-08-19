@@ -17,16 +17,24 @@ import path from "node:path";
 import { PROJECT_ROOT } from "./project-root.js";
 import {
   DEFAULT_LLM_CONFIG,
+  extractAddress,
+  findPreference,
   isProtectedSubject,
+  isStandingPreference,
   readAuditLog,
   readFeatureErrors,
   readLlmConfig,
+  readPreferences,
   recordFeatureError,
+  removePreference,
   reserveApiCall,
   torontoDateOf,
   torontoHourOf,
+  upsertPreferenceFromCorrection,
   writeLlmConfig,
+  type AuditEntry,
 } from "./core/auto-filing.js";
+import { reconcileCorrections, CONFIRM_AFTER_MS } from "./core/corrections.js";
 import {
   classifyAndFile,
   parseDecision,
@@ -50,7 +58,17 @@ import {
   runHealthCheck,
   type HealthReport,
 } from "./core/health.js";
-import { STATE_LLM_CONFIG, STATE_SUBSCRIPTION } from "./core/kv-keys.js";
+import { STATE_HEALTH, STATE_LLM_AUDIT, STATE_LLM_CONFIG, STATE_SUBSCRIPTION } from "./core/kv-keys.js";
+import { z } from "zod";
+import {
+  buildLatestFilter,
+  buildSearchKql,
+  matchesFilters,
+  torontoMidnightUtc,
+} from "./tools/search-mail.js";
+import { FORCE_MOVE_CAP, deleteFolderRefusal, type FolderFacts } from "./tools/delete-folder.js";
+import { getHealthHandler } from "./tools/get-health.js";
+import { runWithStateStore } from "./core/state.js";
 import { handleNotificationRequest } from "./core/notifications.js";
 import { TOOLS } from "./core/registry.js";
 import {
@@ -460,6 +478,19 @@ function fixtureMailbox() {
         categories: [],
       };
     },
+    async getFolder(folderId): Promise<FilingFolder | null> {
+      const known: Record<string, string> = {
+        "f-receipts": "Receipts",
+        "f-arch": "Archive",
+        "f-inbox": "Inbox",
+        "f-deleted": "Deleted Items",
+        "f-sent": "Sent Items",
+      };
+      return known[folderId] ? { id: folderId, displayName: known[folderId]! } : null;
+    },
+    async findByConversation(): Promise<MailFacts[]> {
+      return [];
+    },
     async move(id, folderId) {
       calls.moved = { id, folder: folderId };
       return "new-id";
@@ -857,7 +888,6 @@ await test("o14. webhook handshake: token echoed verbatim, clientState enforced,
 
 await test("o15. boundary: the classifier's transitive imports cannot reach Graph or the tools", async () => {
   const srcRoot = path.join(PROJECT_ROOT, "src");
-  const start = path.join(srcRoot, "core", "classifier.ts");
   const forbidden = [
     path.join(srcRoot, "core", "graph.ts"),
     path.join(srcRoot, "core", "mail-actions.ts"),
@@ -866,7 +896,12 @@ await test("o15. boundary: the classifier's transitive imports cannot reach Grap
   ];
 
   const seen = new Set<string>();
-  const queue = [start];
+  // The correction reconciler lives inside the same boundary as the classifier:
+  // both act only through the injected ClassifierMailbox port.
+  const queue = [
+    path.join(srcRoot, "core", "classifier.ts"),
+    path.join(srcRoot, "core", "corrections.ts"),
+  ];
   while (queue.length > 0) {
     const file = queue.pop()!;
     if (seen.has(file)) continue;
@@ -890,10 +925,328 @@ await test("o15. boundary: the classifier's transitive imports cannot reach Grap
   assert(seen.size > 1, "the import walk found nothing — the scanner is broken");
 });
 
+// ------------------------------------------- the auto-filer's feedback loop
+
+await test("o18. preferences: matching, the no-model fast path, and the skip list outranking it", async () => {
+  // Address extraction, the key preferences are stored under.
+  assert(extractAddress("Acme <Billing@Acme.COM>") === "billing@acme.com", "angled form failed");
+  assert(extractAddress("shop@example.com") === "shop@example.com", "bare form failed");
+  assert(extractAddress("just a name") === null, "a non-address produced a key");
+  assert(extractAddress(undefined) === null, "undefined produced a key");
+
+  // Upsert semantics: same folder reinforces (toward standing), a different
+  // folder replaces and restarts the count; remove forgets.
+  {
+    const store = createMemoryStateStore("remote");
+    const first = await upsertPreferenceFromCorrection(store, "Shop@Example.com", { id: "f-receipts", name: "Receipts" }, NOW());
+    assert(first.sender === "shop@example.com" && first.corrections === 1, JSON.stringify(first));
+    assert(!isStandingPreference(first), "one correction is already standing");
+    const second = await upsertPreferenceFromCorrection(store, "shop@example.com", { id: "f-receipts", name: "Receipts" }, NOW());
+    assert(second.corrections === 2 && isStandingPreference(second), "repeat did not reinforce");
+    const replaced = await upsertPreferenceFromCorrection(store, "shop@example.com", { id: "f-arch", name: "Archive" }, NOW());
+    assert(replaced.folderId === "f-arch" && replaced.corrections === 1, "a new folder did not replace");
+    assert(findPreference(await readPreferences(store), "SHOP@example.com")?.folderId === "f-arch", "case-insensitive lookup failed");
+    assert(await removePreference(store, "shop@example.com"), "remove reported nothing removed");
+    assert((await readPreferences(store)).length === 0, "preference not removed");
+    assert(!(await removePreference(store, "shop@example.com")), "double remove claimed success");
+  }
+
+  // The fast path: a preference hit files with NO model call and no budget
+  // spend, audited with source "preference" and no model/usage fields.
+  {
+    const store = await enabledStore();
+    await upsertPreferenceFromCorrection(store, "shop@example.com", { id: "f-receipts", name: "Receipts" }, NOW());
+    const { mailbox, calls } = fixtureMailbox();
+    const outcome = await classifyAndFile("m1", {
+      store, mailbox, apiKey: "k", today: TODAY, now: NOW,
+      callModel: async () => { throw new Error("the model was called despite a preference hit"); },
+    });
+    assert(outcome.action === "moved" && calls.moved?.folder === "f-receipts", `${outcome.action}: ${outcome.reason}`);
+    const entry = (await readAuditLog(store))[0]!;
+    assert(entry.source === "preference", `audit source is ${entry.source}`);
+    assert(entry.model === undefined && entry.usage === undefined, "a preference decision recorded model usage");
+    assert(entry.sender === "shop@example.com" && entry.folderId === "f-receipts", JSON.stringify(entry));
+    const { used } = await reserveApiCall(store, 200, TODAY);
+    assert(used === 1, `the preference decision consumed budget (counter at ${used - 1} before this probe)`);
+  }
+
+  // An Inbox preference means "leave this sender's mail alone" — still no model.
+  {
+    const store = await enabledStore();
+    await upsertPreferenceFromCorrection(store, "shop@example.com", { id: "f-inbox", name: "Inbox" }, NOW());
+    const { mailbox, calls } = fixtureMailbox();
+    const outcome = await classifyAndFile("m1", {
+      store, mailbox, apiKey: "k", today: TODAY, now: NOW,
+      callModel: async () => { throw new Error("the model was called despite an inbox preference"); },
+    });
+    assert(outcome.action === "none" && /leave mail from .* in the Inbox/i.test(outcome.reason), outcome.reason);
+    assert(!calls.moved && !calls.categorized, "an inbox preference touched the mailbox");
+    assert((await readAuditLog(store))[0]!.source === "preference", "inbox preference not audited as such");
+  }
+
+  // A stale preference (its folder is gone) falls through to the model.
+  {
+    const store = await enabledStore();
+    await upsertPreferenceFromCorrection(store, "shop@example.com", { id: "f-gone", name: "Gone" }, NOW());
+    const { mailbox, calls } = fixtureMailbox();
+    const outcome = await classifyAndFile("m1", {
+      store, mailbox, apiKey: "k", today: TODAY, now: NOW,
+      callModel: cannedModel('{"folder":"Archive","categories":[],"confidence":0.9,"reason":"r"}'),
+    });
+    assert(outcome.action === "moved" && calls.moved?.folder === "f-arch", "stale preference did not fall through");
+    assert((await readAuditLog(store))[0]!.source === "llm", "the fallback decision is not marked llm");
+  }
+
+  // The OTP/protected skip list outranks any preference: no move, no model.
+  {
+    const store = await enabledStore();
+    await upsertPreferenceFromCorrection(store, "x@example.com", { id: "f-receipts", name: "Receipts" }, NOW());
+    const { mailbox, calls } = fixtureMailbox();
+    mailbox.readMessage = async (id) => ({
+      id, subject: "Your one-time passcode", from: "x@example.com", bodyPreview: "code", categories: [],
+    });
+    const outcome = await classifyAndFile("m1", {
+      store, mailbox, apiKey: "k", today: TODAY, now: NOW,
+      callModel: async () => { throw new Error("a protected subject reached the model"); },
+    });
+    assert(/protected pattern/.test(outcome.reason), outcome.reason);
+    assert(!calls.moved, "a protected subject was moved by a preference");
+  }
+});
+
+await test("o19. corrections: reconciliation detects the user's re-filing and learns from it", async () => {
+  const movedEntry = (overrides: Partial<AuditEntry> = {}): AuditEntry => ({
+    at: new Date(NOW().getTime() - 3600 * 1000).toISOString(), // an hour ago
+    feature: "filing",
+    action: "moved",
+    messageId: "m-old",
+    subject: "Your order receipt",
+    sender: "shop@example.com",
+    folder: "Receipts",
+    folderId: "f-receipts",
+    newMessageId: "m-new",
+    reason: "a receipt",
+    source: "llm",
+    ...overrides,
+  });
+  const withAudit = async (entries: AuditEntry[]): Promise<StateStore> => {
+    const store = createMemoryStateStore("remote");
+    await writeJson(store, STATE_LLM_AUDIT, entries);
+    return store;
+  };
+  const mailboxWhereMessageIs = (parentFolderId: string | null) => {
+    const { mailbox } = fixtureMailbox();
+    mailbox.readMessage = async (id) =>
+      parentFolderId === null
+        ? null
+        : {
+            id, subject: "Your order receipt", from: "shop@example.com",
+            bodyPreview: "x", categories: [], parentFolderId,
+          };
+    return mailbox;
+  };
+
+  // The user moved the filed message to Archive → a correction is learned.
+  {
+    const store = await withAudit([movedEntry()]);
+    const outcome = await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-arch"), now: NOW });
+    assert(outcome.checked === 1 && outcome.corrections === 1, JSON.stringify(outcome));
+    const pref = findPreference(await readPreferences(store), "shop@example.com");
+    assert(pref?.folderId === "f-arch", `learned ${JSON.stringify(pref)}`);
+    const audit = await readAuditLog(store);
+    assert(audit[0]!.action === "correction" && audit[0]!.folder === "Archive", JSON.stringify(audit[0]));
+    assert(audit[1]!.reconciled === "corrected", "the original move was not marked corrected");
+    // A second pass finds nothing left to check.
+    const again = await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-arch"), now: NOW });
+    assert(again.checked === 0, "a corrected entry was re-checked");
+  }
+
+  // Still where the filer put it: watched while young, confirmed once old.
+  {
+    const store = await withAudit([movedEntry()]);
+    await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-receipts"), now: NOW });
+    assert((await readAuditLog(store))[0]!.reconciled === undefined, "a young in-place move was marked");
+    const later = () => new Date(NOW().getTime() + CONFIRM_AFTER_MS + 1000);
+    await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-receipts"), now: later });
+    assert((await readAuditLog(store))[0]!.reconciled === "confirmed", "an old in-place move was not confirmed");
+    assert((await readPreferences(store)).length === 0, "an uncorrected move learned a preference");
+  }
+
+  // Moved to Deleted Items → ignored, nothing learned (a delete is not a filing choice).
+  {
+    const store = await withAudit([movedEntry()]);
+    const outcome = await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-deleted"), now: NOW });
+    assert(outcome.corrections === 0, "a delete taught a preference");
+    assert((await readAuditLog(store))[0]!.reconciled === "ignored", "the deleted case was not marked ignored");
+    assert((await readPreferences(store)).length === 0, "a delete learned a preference");
+  }
+
+  // Message gone entirely → marked gone, nothing learned.
+  {
+    const store = await withAudit([movedEntry()]);
+    await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs(null), now: NOW });
+    assert((await readAuditLog(store))[0]!.reconciled === "gone", "a vanished message was not marked gone");
+  }
+
+  // The realistic correction: the user's move minted the message a NEW id, so
+  // the direct read misses (the old id 404s — verified live) and the message
+  // is re-found through its conversation. The Sent Items copy of self-sent
+  // mail and a different-subject sibling must not be mistaken for it.
+  {
+    const store = await withAudit([movedEntry({ conversationId: "c1" })]);
+    const { mailbox } = fixtureMailbox();
+    mailbox.readMessage = async () => null; // the watched id is dead
+    mailbox.findByConversation = async (conversationId) => {
+      assert(conversationId === "c1", `looked up conversation ${conversationId}`);
+      const base = { from: "shop@example.com", bodyPreview: "x", categories: [] };
+      return [
+        { ...base, id: "m-sent", subject: "Your order receipt", parentFolderId: "f-sent" },
+        { ...base, id: "m-other", subject: "Something else entirely", parentFolderId: "f-receipts" },
+        { ...base, id: "m-corrected", subject: "Your order receipt", parentFolderId: "f-arch" },
+      ];
+    };
+    const outcome = await reconcileCorrections({ store, mailbox, now: NOW });
+    assert(outcome.corrections === 1, `recovery case: ${JSON.stringify(outcome)}`);
+    const pref = findPreference(await readPreferences(store), "shop@example.com");
+    assert(pref?.folderId === "f-arch", `recovery learned ${JSON.stringify(pref)} — the Sent copy must be skipped`);
+    const audit = await readAuditLog(store);
+    assert(audit[0]!.action === "correction" && audit[0]!.messageId === "m-corrected", JSON.stringify(audit[0]));
+  }
+
+  // The loop closes: correction → preference → the next arrival files with no model.
+  {
+    const store = await withAudit([movedEntry()]);
+    await writeLlmConfig(store, { filingEnabled: true });
+    await reconcileCorrections({ store, mailbox: mailboxWhereMessageIs("f-arch"), now: NOW });
+    const { mailbox, calls } = fixtureMailbox();
+    const outcome = await classifyAndFile("m2", {
+      store, mailbox, apiKey: "k", today: TODAY, now: NOW,
+      callModel: async () => { throw new Error("the model was called after a correction was learned"); },
+    });
+    assert(outcome.action === "moved" && calls.moved?.folder === "f-arch", `${outcome.action}: ${outcome.reason}`);
+    const entry = (await readAuditLog(store))[0]!;
+    assert(entry.source === "preference" && entry.usage === undefined, "the closed loop is not on the fast path");
+  }
+});
+
+// --------------------------------------- search building and folder guards
+
+await test("o20. search building: KQL vs $filter rules, Toronto boundaries, exact post-filter", async () => {
+  // Toronto midnight in UTC, across DST (EDT is UTC-4, EST is UTC-5).
+  assert(torontoMidnightUtc("2026-08-19") === "2026-08-19T04:00:00.000Z", "EDT midnight wrong");
+  assert(torontoMidnightUtc("2026-01-19") === "2026-01-19T05:00:00.000Z", "EST midnight wrong");
+
+  // Latest mode ($filter): receivedDateTime clauses lead — Graph refuses
+  // $orderby=receivedDateTime otherwise (InefficientFilter, verified live) —
+  // and an attachments-only filter gets the sentinel date clause.
+  assert(buildLatestFilter({}) === undefined, "an unfiltered call built a filter");
+  assert(
+    buildLatestFilter({ dateFrom: "2026-08-19", hasAttachments: true }) ===
+      "receivedDateTime ge 2026-08-19T04:00:00.000Z and hasAttachments eq true",
+    `got: ${buildLatestFilter({ dateFrom: "2026-08-19", hasAttachments: true })}`
+  );
+  assert(
+    buildLatestFilter({ hasAttachments: false }) ===
+      "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq false",
+    "attachments-only filter lacks the sentinel receivedDateTime clause"
+  );
+  assert(
+    buildLatestFilter({ dateTo: "2026-08-19" }) === "receivedDateTime lt 2026-08-20T04:00:00.000Z",
+    "date_to is not exclusive-next-day"
+  );
+
+  // Search mode (KQL inside $search — $filter is refused next to $search,
+  // verified live): dates widened a day each way, hasattachments a KQL term.
+  assert(
+    buildSearchKql("receipt", { dateFrom: "2026-08-19", dateTo: "2026-08-20", hasAttachments: true }) ===
+      "receipt AND received>=2026-08-18 AND received<=2026-08-21 AND hasattachments:true",
+    `got: ${buildSearchKql("receipt", { dateFrom: "2026-08-19", dateTo: "2026-08-20", hasAttachments: true })}`
+  );
+
+  // The exact client-side window: 03:59Z on Aug 19 is still Aug 18 in Toronto.
+  const filters = { dateFrom: "2026-08-19", dateTo: "2026-08-19" };
+  assert(!matchesFilters({ receivedDateTime: "2026-08-19T03:59:00Z" }, filters), "pre-midnight leaked in");
+  assert(matchesFilters({ receivedDateTime: "2026-08-19T04:00:00Z" }, filters), "midnight excluded");
+  assert(matchesFilters({ receivedDateTime: "2026-08-20T03:59:00Z" }, filters), "late evening excluded");
+  assert(!matchesFilters({ receivedDateTime: "2026-08-20T04:00:00Z" }, filters), "next day leaked in");
+  assert(!matchesFilters({ receivedDateTime: undefined }, filters), "a dateless message passed a date filter");
+  assert(!matchesFilters({ hasAttachments: false }, { hasAttachments: true }), "attachment filter ignored");
+  assert(matchesFilters({ hasAttachments: false }, {}), "an unfiltered message was dropped");
+});
+
+await test("o21. delete_folder guards and the structured-content contract", async () => {
+  const facts = (overrides: Partial<FolderFacts> = {}): FolderFacts => ({
+    displayName: "Projects",
+    totalItemCount: 0,
+    childFolderCount: 0,
+    wellKnown: false,
+    ...overrides,
+  });
+  // Well-known: always refused, force or not.
+  assert(/well-known/.test(deleteFolderRefusal(facts({ wellKnown: true }), true) ?? ""), "well-known passed");
+  // Subfolders: always refused, force or not.
+  assert(/subfolder/.test(deleteFolderRefusal(facts({ childFolderCount: 2 }), true) ?? ""), "subfolders passed");
+  // Non-empty without force: refused, naming the count and the force escape.
+  const nonEmpty = deleteFolderRefusal(facts({ totalItemCount: 3 }), false);
+  assert(nonEmpty && /3 message/.test(nonEmpty) && /force/.test(nonEmpty), `got: ${nonEmpty}`);
+  // Non-empty WITH force, within the cap: allowed.
+  assert(deleteFolderRefusal(facts({ totalItemCount: 3 }), true) === null, "force did not open the gate");
+  // Beyond the cap: refused even with force.
+  assert(
+    /more than/.test(deleteFolderRefusal(facts({ totalItemCount: FORCE_MOVE_CAP + 1 }), true) ?? ""),
+    "an oversized force was allowed"
+  );
+  // Empty: allowed without force.
+  assert(deleteFolderRefusal(facts(), false) === null, "an empty folder was refused");
+
+  // The structured-content contract: exactly the five reader tools declare an
+  // outputSchema, and each schema is permissive (all-optional, tolerant of
+  // unknown keys) so it can never fail a call that used to work.
+  const structured = TOOLS.filter((t) => t.outputSchema !== undefined).map((t) => t.name).sort();
+  assert(
+    JSON.stringify(structured) ===
+      JSON.stringify(["get_health", "list_events", "list_folders", "list_tasks", "search_mail"]),
+    `tools with outputSchema: ${structured.join(", ")}`
+  );
+  for (const tool of TOOLS) {
+    if (!tool.outputSchema) continue;
+    const schema = z.object(tool.outputSchema);
+    assert(schema.safeParse({}).success, `${tool.name}'s outputSchema rejects an empty object`);
+    assert(
+      schema.safeParse({ somethingNew: true }).success,
+      `${tool.name}'s outputSchema rejects unknown keys — it would break older payloads`
+    );
+  }
+
+  // get_health's remote path runs offline against a seeded heartbeat: the
+  // structured copy must agree with the text.
+  const store = createMemoryStateStore("remote");
+  const report: HealthReport = {
+    at: "2026-08-19T13:37:00.000Z",
+    healthy: true,
+    checks: [
+      { name: "kv", ok: true, detail: "round-tripped" },
+      { name: "subscription", ok: true, detail: "live" },
+    ],
+  };
+  await writeJson(store, STATE_HEALTH, report);
+  const result = await runWithStateStore(store, () => getHealthHandler({}));
+  assert(!result.isError, `get_health failed: ${result.content[0]?.text}`);
+  assert(/HEALTHY/.test(result.content[0]!.text), "text lost the verdict");
+  const sc = result.structuredContent as any;
+  assert(sc?.mode === "remote" && sc?.healthy === true && sc?.checks?.length === 2, JSON.stringify(sc));
+  const healthSchema = z.object(TOOLS.find((t) => t.name === "get_health")!.outputSchema!);
+  assert(healthSchema.safeParse(sc).success, "get_health's own structuredContent fails its schema");
+  // And the no-report case still carries structured content (the SDK demands
+  // it on every non-error result once an outputSchema is declared).
+  const empty = await runWithStateStore(createMemoryStateStore("remote"), () => getHealthHandler({}));
+  assert((empty.structuredContent as any)?.hasReport === false, "the no-report path lost structuredContent");
+});
+
 // -------------------------------------------------- annotations and version
 
 await test("o16. annotations: all four hints on every tool, and the structural rules hold", async () => {
-  assert(TOOLS.length === 30, `expected 30 tools in the registry, found ${TOOLS.length}`);
+  assert(TOOLS.length === 31, `expected 31 tools in the registry, found ${TOOLS.length}`);
   for (const tool of TOOLS) {
     const { readOnlyHint, destructiveHint, idempotentHint, openWorldHint } = tool.annotations;
     for (const [hint, value] of Object.entries({ readOnlyHint, destructiveHint, idempotentHint, openWorldHint })) {
