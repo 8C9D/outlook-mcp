@@ -861,3 +861,79 @@ removed.
 suite (r26 enforces the version match); version 1.1.0 in package.json and
 core/version.ts; annotated tag `v1.1.0` pushed; CI (typecheck + offline tier)
 green on the final commit.
+
+---
+
+## Batch 5 — OneDrive (v1.2.0) — 2026-08-19
+
+**Shipped (37 tools; both transports; deployed and tagged v1.2.0).** Auth groundwork
+(Files.ReadWrite in the registration, every scope list, fresh consent, KV re-seed) was
+front-loaded by the orchestrator at `5656a33`; this batch changed no auth.
+
+1. **Six OneDrive tools** on the shared registry: `search_files` (name/content via the drive
+   search index, `type` filter for file/folder/extension, structured content), `list_folder`
+   (path / item id / root; folders-then-files with sizes and dates; exact and current, unlike
+   search), `read_file` (text/JSON < 50 KB inline on both transports — the attachment
+   thresholds exactly; binaries to ~/Downloads/outlook-mcp-attachments/ locally, the existing
+   bearer-gated 15-minute `/mcp/download/<id>` link remotely, 18 MB link cap), `upload_file`
+   (file_path stdio-only / url / content_base64 via the new shared `tools/file-sources.ts`;
+   25 MB cap; **rename-not-overwrite by default** with an explicit `overwrite` flag → Graph
+   `@microsoft.graph.conflictBehavior`), `manage_file` (move/rename/delete — delete goes to
+   the OneDrive recycle bin and says so; collisions refused, never overwritten), `share_link`
+   (create view/edit **anonymous** links with the third-party warning stated in description
+   AND output; list; revoke by permission id).
+2. **Cross-surface both ways**: `add_attachment` gained an `onedrive_path` source (a OneDrive
+   file's bytes into a draft, both transports, 25 MB pre-flight before the draft check);
+   `get_attachment` gained `save_to_onedrive` (attachment into a OneDrive folder, conflict
+   rename always — never overwrites).
+3. **Live Graph drive semantics probed first and recorded in ASSUMPTIONS "Batch 5"**: PUT
+   /content REPLACES by default (why rename is the tool default); upload-by-path auto-creates
+   parents; the personal-drive recycle bin is unlistable (four shapes 400) but restore-by-id
+   works — how soft-delete is verified and swept; createLink defaults to anonymous and is
+   idempotent per type; the owner permission carries a bare `link` object (share_link list
+   filters on `link.type` — caught by v13a's first run); search indexing lag measured 17 s to
+   >306 s.
+4. **Annotations** (frozen table + o16 + v10a updated, 37 tools): search_files/list_folder
+   read-only; read_file mirrors get_attachment; upload_file destructive (overwrite capability)
+   + open-world (url source); manage_file destructive; share_link destructive + open-world.
+   Structured content on search_files and list_folder (now seven reader tools), per Batch 4's
+   permissive-schema rules.
+
+**Suites (final runs, after all changes).** typecheck green (both tsconfigs);
+`test:offline` **22/22** (new o22: drive path grammar, conflict mapping, type filter,
+folders-first ordering, display paths); `test:tools` **54/54, 1 designed SKIP (v9e)** (new
+v13a lifecycle / v13b conflicts / v13c cross-surface; stdio smoke now asserts 37 tools and
+outputSchema on exactly seven); `test:remote` **31/31 headless, 16 auth-gated SKIPs** (new
+r30 headless + r31 authed; r28 extended to seven readers; r20 sweep extended to OneDrive).
+
+**Lifecycle evidence (v13a, local, real drive).** upload via content_base64 into a fresh
+[MCP TEST] folder (parents auto-created) → list_folder shows folders-first with the file's
+exact size → search_files found the file by its unique token after ~138 s of patient polling
+(first run: not indexed within 306 s — the test then verifies existence via list_folder and
+records the lag instead of failing; both behaviors observed and recorded) → read_file
+round-tripped the text byte-exactly inline and a 2 KB binary byte-exactly via disk (local)
+and via the parked TTL-link record (remote-mode store) → rename and move kept the item id →
+share_link create produced a live 1drv.ms URL + permission id with the anonymity warning,
+list showed it, revoke removed it (confirmed via Graph permissions) → manage_file delete was
+soft: the item 404s, POST /restore brought it back (recycle-bin proof), then test-only
+permanentDelete. v13b: same-name upload default → "conflict 1.txt" auto-rename with the first
+file untouched; overwrite:true → same item id, content replaced. v13c: onedrive_path → draft
+attachment bytes identical (sha-equal buffers); attachment → save_to_onedrive bytes
+identical; repeat save → numbered copy. **r30** repeated the whole lifecycle headlessly with
+an access token minted from the DEPLOYED KV refresh token (the Worker's own credential
+chain), proving the deployed grant covers OneDrive end to end; r31 covers the same through
+the deployed tools when a bearer exists (auth-gated SKIP headless, by design).
+
+**State.** `llm:config` verified byte-identical
+(`{"filingEnabled":true,"digestEnabled":true,"threshold":0.8,"skipPatterns":[],"dailyCallCap":200}`
+— captured by r24, re-verified by r20). Zero [MCP TEST] artifacts in the mailbox, OneDrive
+(root-children listing — exact, not the lagging index — plus best-effort index sweep; the
+unlistable recycle bin is covered by each test restoring + permanently deleting its own
+soft-deleted items), and KV (rings, audit, prefs, subscription record). Local sweep i. and
+remote r20 both green on the final runs.
+
+**Release.** Version 1.2.0 in package.json and core/version.ts (o17 asserts the sync);
+`npm run deploy` BEFORE the remote suite — deployed `/health` returns
+`{"status":"ok","service":"outlook-mcp","version":"1.2.0"}` (Worker version id
+41a9d1b4-757c-43e6-8eba-b0c1607f051a, all four cron triggers intact); annotated tag `v1.2.0`
+pushed; CI (typecheck + offline tier) green on the final commit.
