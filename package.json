@@ -1,6 +1,6 @@
 {
   "name": "outlook-mcp",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": true,
   "type": "module",
   "description": "MCP server connecting Claude to a personal Outlook account via Microsoft Graph (mail, attachments, folders, inbox rules, categories, calendar, contacts, Microsoft To Do tasks with subtasks, auto-reply, working hours and Focused-Inbox overrides, junk-sender blocking, MIME (.eml) export, delta 'what changed' checks and pushed change notifications, and two opt-in LLM features on the hosted server — injection-hardened auto-filing into existing folders and a drafted morning brief; sending only via explicit two-step draft-then-send).",
@@ -12,6 +12,7 @@
     "serve": "tsx src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "test:tools": "tsx src/test-tools.ts",
+    "test:offline": "tsx src/test-offline.ts",
     "cf-types": "wrangler types",
     "seed:kv": "tsx src/scripts/seed-kv.ts",
     "deploy": "wrangler deploy",

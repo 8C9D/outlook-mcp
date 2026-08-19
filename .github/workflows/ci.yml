@@ -1,0 +1,27 @@
+# CI: typecheck plus the offline test tier, on every push.
+#
+# The split is deliberate and matches src/test-offline.ts's header: CI runs
+# exactly the tests that need no Microsoft Graph, no MSAL token cache, no KV,
+# no .env and no secrets — fixtures, schema/allowlist validation, the health
+# check's failure modes against stubs, the rules-backup diff, and the
+# annotation/boundary/version assertions. The live suites (`npm run
+# test:tools` against the real mailbox, `npm run test:remote` against the
+# deployed Worker) stay local-only: they need the owner's credentials, and no
+# secret ever enters this repository or its CI.
+name: CI
+
+on:
+  push:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:offline

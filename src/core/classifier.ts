@@ -33,6 +33,7 @@ import {
   auditSubject,
   isProtectedSubject,
   readLlmConfig,
+  recordFeatureError,
   reserveApiCall,
   type AuditEntry,
 } from "./auto-filing.js";
@@ -214,6 +215,9 @@ export async function classifyAndFile(
         err instanceof AnthropicError
           ? err.message
           : `Anthropic call failed: ${err instanceof Error ? err.message : String(err)}`;
+      // A swallowed failure, so it also counts toward the health check's
+      // error counter — an audit entry alone is invisible until someone reads it.
+      await recordFeatureError(context.store, "filing", detail, now());
       return log({ action: "none", reason: detail }, { subject, model: LLM_MODEL });
     }
 
@@ -270,11 +274,11 @@ export async function classifyAndFile(
     );
   } catch (err) {
     // Anything unexpected (a Graph failure on the move, a KV blip) still lands
-    // in the log rather than escaping into the notification handler.
-    return log({
-      action: "none",
-      reason: `classification failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    // in the log rather than escaping into the notification handler — and in
+    // the error counter the daily health check reads.
+    const reason = `classification failed: ${err instanceof Error ? err.message : String(err)}`;
+    await recordFeatureError(context.store, "filing", reason, now());
+    return log({ action: "none", reason });
   }
 }
 
