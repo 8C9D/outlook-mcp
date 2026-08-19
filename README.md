@@ -1,7 +1,7 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a **personal** Microsoft (outlook.com) mailbox through Microsoft
-Graph. Thirty tools, two prompts and two resources, served from one shared registry over **two
+Graph. Thirty-one tools, two prompts and two resources, served from one shared registry over **two
 transports**: a local stdio server, and a Cloudflare Worker that claude.ai can use as a custom
 connector. All datetimes are America/Toronto unless a caller supplies an explicit UTC offset.
 
@@ -23,7 +23,7 @@ reply. No secrets ever enter this repository. The reasoning is in
 | --- | --- | --- |
 | **Read mail** | `search_mail`, `read_thread`, `read_message`, `check_new_mail`, `get_mailbox_activity` | full-text search or newest-first listing, whole conversations, one message with its attachment inventory and forensic headers, and two ways to ask "what's new" — a delta query anywhere, or Graph's pushed notifications on the hosted server |
 | **Write mail** | `create_draft`, `update_draft`, `add_attachment`, `send_draft` | compose, reply, forward and attach — and send **only** by naming an existing draft, never in one call ([why](#two-step-send-by-design)) |
-| **Organize** | `manage_message`, `list_folders`, `create_folder`, `manage_categories`, `manage_rules`, `manage_senders` | batch move/archive/delete/flag/categorize in one Graph round-trip, the folder tree, the category master list, inbox rules with exceptions (and deliberately no forwarding action), and junk-sender blocking |
+| **Organize** | `manage_message`, `list_folders`, `create_folder`, `delete_folder`, `manage_categories`, `manage_rules`, `manage_senders` | batch move/archive/delete/flag/categorize in one Graph round-trip, the folder tree, folder create and guarded soft delete, the category master list, inbox rules with exceptions (and deliberately no forwarding action), and junk-sender blocking |
 | **Calendar** | `list_calendars`, `list_events`, `create_event`, `manage_event` | multiple calendars, repeating events and reminders, single-occurrence or whole-series edits, and invitation responses |
 | **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts, out-of-office, working hours, Focused-Inbox overrides |
 | **Tasks** | `list_tasks`, `manage_task` | Microsoft To Do with subtasks, repeat rules, task lists, and mail turned into a task |
@@ -65,7 +65,7 @@ The full reasoning, including what third parties can observe and which approvals
 ## Architecture
 
 ```
-                    src/core/registry.ts  ── one table of 30 tools, 2 prompts, 2 resources
+                    src/core/registry.ts  ── one table of 31 tools, 2 prompts, 2 resources
                               │
         ┌─────────────────────┴─────────────────────┐
    src/server.ts                            src/worker/index.ts
@@ -85,11 +85,11 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 `core/state.ts` hold indirections each host installs (MSAL and a file locally, KV on the Worker).
 [More detail](#architecture-in-detail), including why the Worker needs no Durable Objects.
 
-## Tools (v11)
+## Tools (v1.1)
 
 | Tool | What it does |
 | --- | --- |
-| `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview. |
+| `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Both modes take `date_from`/`date_to` (America/Toronto calendar dates), `has_attachments`, and `all_folders` (the whole mailbox, Sent and Deleted Items included). Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview — as text and as [structured content](#structured-tool-output). |
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
 | `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). `include_headers` adds the forensic view — SPF/DKIM/DMARC verdict, the Received chain oldest-first, and a flag when Reply-To or Return-Path disagrees with From. |
 | `export_message` | The message's raw MIME as a `.eml` — a phishing sample to forward to a security team, or an evidential copy. **stdio**: saved to `~/Downloads/outlook-mcp-attachments/`. **Hosted**: the same expiring, sign-in-required download link `get_attachment` uses. |
@@ -101,6 +101,7 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 | `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, categorize, with per-message results. `categorize` **replaces** a message's categories rather than appending, and validates every name against the mailbox's category list first. All ids go out as **one Graph `$batch` request** (one HTTP round-trip instead of up to 20); throttled items are retried once per their `Retry-After`. |
 | `list_folders` | Mail folder tree (2 levels) with unread/total counts and folder ids. |
 | `create_folder` | Creates a mail folder at the mailbox root or under `parent_folder`. Rejects a duplicate name at the same level, naming the existing folder's id. |
+| `delete_folder` | Soft-deletes a user-created folder by **moving it into Deleted Items** — never Graph's own folder DELETE, which on a personal account permanently destroys the folder and its contents with no Deleted Items copy (verified live). Well-known folders are always refused; a folder with messages needs `force`, which first moves the messages into Deleted Items individually and says so; a folder with subfolders is always refused. |
 | `list_calendars` | The account's calendars with ids, marking the default one and any that are read-only. Supplies the names `calendar` accepts elsewhere. |
 | `list_events` | Calendar events for a date window (default: next 7 days) of the default or a named `calendar`, grouped by day; repeating events appear once per occurrence. `include_ids` adds the event ids `manage_event` needs, flagging occurrences of a series. |
 | `create_event` | Creates an event, optionally with a `reminder_minutes`, on a named `calendar`, and repeating (`recurrence`: daily/weekly/monthly/yearly, `interval`, `weekdays`, ending by `until` or after `count`). **If attendees are given, Outlook emails them invitations immediately — for a series, to every occurrence.** |
@@ -116,16 +117,16 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 | `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task; add, complete and remove **subtasks** (checklist items); create and rename a **task list** (deleting a list is deliberately not offered). `recurrence` on create makes the task repeat (`due_date` required); `clear_recurrence` on update stops it. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
 | `check_new_mail` | What changed in a folder **since the last call**, via a Graph delta query. The first call (or one with `reset`) only records a starting position and lists nothing; every later call returns just the added/changed/removed messages. Works on both transports. |
 | `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
-| `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, and extra never-classify subject patterns. **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
-| `get_auto_filing_log` | The audit trail of what the classifier actually did: every message it moved and why, and every message it deliberately left alone and why — low confidence, a protected subject, a discarded model answer, the budget cap. The last 100 decisions, newest first. **Remote only.** |
+| `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, extra never-classify subject patterns — and the **learned preferences** the filer picks up from your corrections (`list_preferences` / `remove_preference`, see [the feedback loop](#the-feedback-loop-corrections-become-preferences)). **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
+| `get_auto_filing_log` | The audit trail of what the classifier actually did: every message it moved and why — each entry's `source` says whether a **model** decided or a **learned preference** filed it with no API call — every message it deliberately left alone and why (low confidence, a protected subject, a discarded model answer, the budget cap), and every correction learned from you re-filing something. The last 100 decisions, newest first. **Remote only.** |
 | `get_health` | The server's own health. **Hosted**: the latest results of the [daily self-monitoring cron](#self-monitoring-the-daily-health-check) — KV, a forced token rotation, the Graph subscription, the LLM error counters. **stdio**: live checks of what matters locally (silent sign-in, mailbox access), with the remote-only checks named rather than faked. |
 
 ## Tool annotations
 
 Every tool states **all four** MCP annotation hints, on both transports, rather than leaving them to
 the protocol's defaults — which are "destructive and open-world unless told otherwise" and would be
-wrong here far more often than right. One rule defines each hint, so thirty tools cannot drift
-into thirty readings of the same word:
+wrong here far more often than right. One rule defines each hint, so thirty-one tools cannot drift
+into thirty-one readings of the same word:
 
 - **`readOnlyHint`** — the call changes nothing: not the mailbox, not the server's own state, not the
   local disk.
@@ -150,6 +151,7 @@ into thirty readings of the same word:
 | `manage_message` | — | **yes** | — | — |
 | `list_folders` | **yes** | — | **yes** | — |
 | `create_folder` | — | — | — | — |
+| `delete_folder` | — | **yes** | — | — |
 | `list_calendars` | **yes** | — | **yes** | — |
 | `list_events` | **yes** | — | **yes** | — |
 | `create_event` | — | — | — | **yes** |
@@ -407,6 +409,17 @@ normal tool call with whatever approval the client enforces. `search_mail`'s lis
 read/unread state, so `morning_brief` tells the model to call `read_message` rather than guess when that
 distinction matters.
 
+## Structured tool output
+
+Five tools whose answers a client may want to render — `search_mail`, `list_folders`, `list_events`,
+`list_tasks`, `get_health` — return **MCP structured content**: a machine-readable
+`structuredContent` object alongside the same compact text as before, with an `outputSchema`
+advertised in `tools/list` (identically on both transports, since both build from the shared
+registry). The text remains the fallback for clients that ignore structured content, and the schemas
+are deliberately permissive — every field optional, unknown keys tolerated — so a schema-validating
+client can never see a previously-working call start failing. The other twenty-six tools are
+prose-shaped (confirmations, per-item OK/FAILED lists) and stay text-only on purpose.
+
 ## Resources
 
 Two MCP resources are registered on both transports (`resources/list`, `resources/read`), so a client
@@ -495,6 +508,28 @@ counted across both features. Once it is reached everything is skipped and logge
 mail loop or a spam flood cannot run up a bill. Lower it with `set_daily_cap`, or set it to `0` to stop
 all API calls without changing the enable flags.
 
+### The feedback loop: corrections become preferences
+
+The filer learns from being corrected. When **you** move a message it filed — out of the folder the
+model chose and into another one, or back into the Inbox — that is detected and remembered as a
+**preference**: mail from that sender now goes to your chosen folder (or is left in the Inbox) on
+arrival, **with no model call and no cost**, and the audit entry says so (`source: preference`, no
+token usage). A repeat correction to the same folder marks the preference *standing*; correcting to a
+different folder replaces it — your latest choice always wins.
+
+Detection is reconciliation, not surveillance: on every notification delivery (and on the 6-hourly
+cron), the filer re-reads where its own recent moves ended up and compares against the audit log.
+Deleting or junking a filed message teaches nothing — only a re-filing does. Two things always outrank
+a preference: the OTP/verification-code **skip list** (a protected subject is never classified and
+never learns), and the **never-file allowlist** (a preference can never move mail into Deleted Items,
+Junk, Sent, and friends — the same fence the model itself is behind, because preferences act through
+the identical seven-method port). `manage_auto_filing` shows and edits the learned rules:
+
+```
+manage_auto_filing(action: "list_preferences")                       # what has been learned
+manage_auto_filing(action: "remove_preference", sender: "a@b.com")   # let the model decide again
+```
+
 ### Turning them on and off
 
 ```
@@ -522,7 +557,8 @@ happen:
 
 1. **Structurally.** `core/classifier.ts` imports **no Graph transport at all** — not `core/graph.ts`,
    not any tool. It declares the interface it is handed (`listFilingFolders`, `listCategories`,
-   `readMessage`, `move`, `categorize`) so the dependency points inward, and `core/mail-actions.ts`
+   `readMessage`, `getFolder`, `findByConversation`, `move`, `categorize` — seven methods, only
+   `move` and `categorize` mutating) so the dependency points inward, and `core/mail-actions.ts`
    implements it. **Send, delete, reply, forward, rule creation and settings changes are not
    expressible on this code path**, so no text inside an email can produce them — not because the model
    declines, but because there is no function to call. A test walks the import graph and fails if the
@@ -702,7 +738,7 @@ what a fresh clone can run.
 
 ## Remote deployment
 
-The same 30 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 31 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
