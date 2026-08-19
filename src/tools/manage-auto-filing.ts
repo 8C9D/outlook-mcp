@@ -5,10 +5,13 @@ import {
   PROTECTED_SUBJECT_PATTERNS,
   THRESHOLD_MAX,
   THRESHOLD_MIN,
+  isStandingPreference,
   readApiCallsToday,
   readAuditLog,
   readLastDigestDate,
   readLlmConfig,
+  readPreferences,
+  removePreference,
   torontoDateOf,
   writeLlmConfig,
   type LlmConfig,
@@ -28,10 +31,12 @@ export const manageAutoFilingSchema = {
       "set_daily_cap",
       "add_skip_pattern",
       "remove_skip_pattern",
+      "list_preferences",
+      "remove_preference",
     ])
     .default("status")
     .describe(
-      "status: report what is on, the tunables and today's API usage (default). enable_filing/disable_filing: LLM classification of newly-arrived mail into existing folders. enable_digest/disable_digest: the 07:00 America/Toronto morning brief, left as a draft. set_threshold, set_daily_cap, add_skip_pattern, remove_skip_pattern: the tunables."
+      "status: report what is on, the tunables and today's API usage (default). enable_filing/disable_filing: LLM classification of newly-arrived mail into existing folders. enable_digest/disable_digest: the 07:00 America/Toronto morning brief, left as a draft. set_threshold, set_daily_cap, add_skip_pattern, remove_skip_pattern: the tunables. list_preferences: the sender→folder rules learned from your corrections (moving a message the filer had filed); remove_preference: forget one sender's rule so the model decides again."
     ),
   threshold: z
     .number()
@@ -58,18 +63,26 @@ export const manageAutoFilingSchema = {
     .describe(
       'Subject substring (matched case-insensitively) that must never be classified — mail matching it is never sent to the model and never moved. Required for actions "add_skip_pattern" and "remove_skip_pattern". The built-in list (one-time passcodes, verification codes, password resets and so on) always applies and cannot be removed.'
     ),
+  sender: z
+    .string()
+    .min(3)
+    .max(320)
+    .optional()
+    .describe(
+      'Sender email address whose learned preference to remove. Required for action "remove_preference"; see list_preferences for the addresses.'
+    ),
 };
 
 const manageAutoFilingArgs = z.object(manageAutoFilingSchema);
 
 export const manageAutoFilingDescription =
-  "Turn the two LLM mail features on or off and tune them: auto-filing (when new mail arrives, a model classifies it against the mailbox's EXISTING folders and categories and files it, never sending, deleting or replying) and the morning digest (a brief of overnight mail, the day's calendar and tasks due soon, left as an unsent DRAFT at 07:00 America/Toronto). BOTH SHIP DISABLED and cost money per message classified — tell the user what the README's cost section says before enabling either. Use get_auto_filing_log to see what the classifier actually did. Available only on the hosted (remote) server, where both features run; the local stdio server returns an error.";
+  "Turn the two LLM mail features on or off and tune them: auto-filing (when new mail arrives, a model classifies it against the mailbox's EXISTING folders and categories and files it, never sending, deleting or replying) and the morning digest (a brief of overnight mail, the day's calendar and tasks due soon, left as an unsent DRAFT at 07:00 America/Toronto). BOTH SHIP DISABLED and cost money per message classified — tell the user what the README's cost section says before enabling either. The filer also learns from corrections: when the user moves a message it filed, that sender→folder choice is remembered and applied to future mail from that sender WITHOUT a model call (list_preferences shows the learned rules, remove_preference forgets one; the OTP/verification-code skip list always outranks them). Use get_auto_filing_log to see what the classifier actually did. Available only on the hosted (remote) server, where both features run; the local stdio server returns an error.";
 
 export async function manageAutoFilingHandler(
   input: z.input<typeof manageAutoFilingArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { action, threshold, daily_cap, pattern } = manageAutoFilingArgs.parse(input);
+    const { action, threshold, daily_cap, pattern, sender } = manageAutoFilingArgs.parse(input);
     const store = requireStateStore();
     if (store.mode !== "remote") {
       return errorResult(
@@ -152,6 +165,50 @@ export async function manageAutoFilingHandler(
         });
         return applied(store, config, `Removed the skip pattern "${needle}".`);
       }
+
+      case "list_preferences": {
+        const prefs = await readPreferences(store);
+        if (prefs.length === 0) {
+          return textResult(
+            "No learned filing preferences yet. One is learned each time you move a message " +
+              "the auto-filer filed: that sender's mail then goes to your chosen folder with no " +
+              "model call (or stays in the Inbox, if that is where you moved it)."
+          );
+        }
+        const lines = prefs.map((p, i) => {
+          const target =
+            p.folderName.trim().toLowerCase() === "inbox"
+              ? "leave in Inbox"
+              : `file to "${p.folderName}"`;
+          return (
+            `${i + 1}. ${p.sender} → ${target}` +
+            ` — ${p.corrections} correction(s)${isStandingPreference(p) ? ", standing" : ""}` +
+            `, last ${p.lastAt.slice(0, 10)}\n   folder id: ${p.folderId}`
+          );
+        });
+        return textResult(
+          `${prefs.length} learned filing preference(s), most recently corrected first — a hit ` +
+            `files with NO model call (the OTP/verification skip list still outranks them):\n\n` +
+            lines.join("\n\n") +
+            "\n\nRemove one with action remove_preference and its sender address."
+        );
+      }
+
+      case "remove_preference": {
+        if (!sender) {
+          throw new ToolInputError('Action "remove_preference" needs a sender email address.');
+        }
+        const removed = await removePreference(store, sender);
+        if (!removed) {
+          throw new ToolInputError(
+            `No learned preference for "${sender.trim().toLowerCase()}" — see list_preferences.`
+          );
+        }
+        return textResult(
+          `Forgot the learned preference for ${sender.trim().toLowerCase()}. The model decides ` +
+            "again for that sender's mail; correcting a future filing will re-learn one."
+        );
+      }
     }
   });
 }
@@ -166,6 +223,7 @@ async function describeStatus(store: StateStore, config: LlmConfig): Promise<str
   const used = await readApiCallsToday(store, today);
   const lastDigest = await readLastDigestDate(store);
   const logged = (await readAuditLog(store)).length;
+  const prefs = (await readPreferences(store)).length;
 
   return [
     "LLM mail features:",
@@ -183,5 +241,6 @@ async function describeStatus(store: StateStore, config: LlmConfig): Promise<str
     `  API calls today (${today}): ${used} of ${config.dailyCallCap}`,
     `  Last morning brief drafted: ${lastDigest ?? "(never)"}`,
     `  Decisions in the audit log: ${logged} (see get_auto_filing_log)`,
+    `  Learned preferences:        ${prefs} (from your corrections; see list_preferences)`,
   ].join("\n");
 }

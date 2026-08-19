@@ -7,11 +7,26 @@ export const TZ_PREFER = `outlook.timezone="${TIMEZONE}"`;
 
 export type ToolResult = {
   content: { type: "text"; text: string }[];
+  /**
+   * MCP structured content, returned alongside the text on the tools that
+   * declare an outputSchema (search_mail, list_folders, list_events,
+   * list_tasks, get_health). The SDK REQUIRES it on every non-error result of
+   * such a tool, so those handlers must attach it on every success path.
+   */
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 };
 
 export function textResult(text: string): ToolResult {
   return { content: [{ type: "text", text }] };
+}
+
+/** A text result plus the machine-readable copy of the same answer. */
+export function structuredResult(
+  text: string,
+  structured: Record<string, unknown>
+): ToolResult {
+  return { content: [{ type: "text", text }], structuredContent: structured };
 }
 
 export function errorResult(text: string): ToolResult {

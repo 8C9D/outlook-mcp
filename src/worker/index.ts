@@ -19,7 +19,7 @@ import { defaultHandler } from "./authorize.js";
 import { downloadHandler } from "./download.js";
 import { mcpHandler } from "./mcp-handler.js";
 import { keepSubscriptionAlive } from "./notifications.js";
-import { draftMorningBrief } from "./llm.js";
+import { draftMorningBrief, reconcileFilingCorrections } from "./llm.js";
 import { runWorkerHealthCheck } from "./health.js";
 import { torontoHourOf } from "../core/auto-filing.js";
 import type { Env } from "./env.js";
@@ -139,6 +139,14 @@ export default {
       keepSubscriptionAlive(env).then(
         (result) => console.log(`Cron ${event.cron}: mail subscription ${result.action}.`),
         (err) => console.error(`Cron ${event.cron}: subscription upkeep failed: ${String(err)}`)
+      )
+    );
+    // The auto-filer's feedback loop also reconciles on every accepted
+    // notification delivery; this tick covers quiet stretches. No-op while
+    // filing is disabled.
+    ctx.waitUntil(
+      reconcileFilingCorrections(env).catch((err) =>
+        console.error(`Cron ${event.cron}: correction reconcile failed: ${String(err)}`)
       )
     );
   },

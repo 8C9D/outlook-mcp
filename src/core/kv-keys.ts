@@ -31,6 +31,9 @@ export const STATE_LLM_AUDIT = "llm:audit";
 /** The Toronto date of the last morning brief that was drafted (idempotency). */
 export const STATE_DIGEST_LAST = "llm:digest:last";
 
+/** Sender→folder filing preferences learned from the user's corrections. */
+export const STATE_LLM_PREFS = "llm:prefs";
+
 /** Anthropic API calls made on one America/Toronto calendar day. */
 export function llmBudgetKey(torontoDate: string): string {
   return `llm:budget:${torontoDate}`;

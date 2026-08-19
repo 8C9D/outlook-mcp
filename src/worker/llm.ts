@@ -6,6 +6,7 @@
 // does, and both are strictly background work: a failure logs and is dropped
 // rather than costing Graph its 202 or the cron its tick.
 import { classifyAndFile } from "../core/classifier.js";
+import { reconcileCorrections } from "../core/corrections.js";
 import { runDailyDigest, type DigestOutcome } from "../core/digest.js";
 import { graphDigestMailbox } from "../core/digest-mailbox.js";
 import { graphClassifierMailbox } from "../core/mail-actions.js";
@@ -35,9 +36,8 @@ export async function classifyNotified(env: Env, entries: ActivityEntry[]): Prom
     .map((entry) => entry.messageId)
     .filter((id): id is string => typeof id === "string" && id !== "")
     .slice(0, CLASSIFY_PER_DELIVERY);
-  if (messageIds.length === 0) return;
 
-  if (!env.ANTHROPIC_API_KEY) {
+  if (messageIds.length > 0 && !env.ANTHROPIC_API_KEY) {
     console.error("Auto-filing is enabled but ANTHROPIC_API_KEY is not set; nothing classified.");
     return;
   }
@@ -45,6 +45,17 @@ export async function classifyNotified(env: Env, entries: ActivityEntry[]): Prom
   const today = torontoDateOf(new Date());
   await runWithTokenProvider(mailboxTokenProvider(env), async () => {
     const mailbox = graphClassifierMailbox();
+    // Corrections FIRST: if the user re-filed something the filer moved, the
+    // preference is learned before this delivery's messages are classified —
+    // so the very next message from that sender already takes the fast path.
+    const reconciled = await reconcileCorrections({
+      store,
+      mailbox,
+      skipPatterns: config.skipPatterns,
+    });
+    if (reconciled.corrections > 0) {
+      console.log(`Auto-filing: learned ${reconciled.corrections} correction(s) from the mailbox.`);
+    }
     for (const messageId of messageIds) {
       const outcome = await classifyAndFile(messageId, {
         store,
@@ -53,6 +64,32 @@ export async function classifyNotified(env: Env, entries: ActivityEntry[]): Prom
         today,
       });
       console.log(`Auto-filing ${messageId}: ${outcome.action} — ${outcome.reason}`);
+    }
+  });
+}
+
+/**
+ * The cron-driven half of the feedback loop: reconcile recent auto-filing
+ * moves against where their messages are NOW, learning a preference from each
+ * one the user re-filed. Also runs on every accepted notification delivery
+ * (above); this cron pass only exists so corrections are still noticed while
+ * no new mail happens to be arriving. A no-op when filing is disabled.
+ */
+export async function reconcileFilingCorrections(env: Env): Promise<void> {
+  const store = kvStateStore(env);
+  const config = await readLlmConfig(store);
+  if (!config.filingEnabled) return;
+  await runWithTokenProvider(mailboxTokenProvider(env), async () => {
+    const outcome = await reconcileCorrections({
+      store,
+      mailbox: graphClassifierMailbox(),
+      skipPatterns: config.skipPatterns,
+    });
+    if (outcome.checked > 0) {
+      console.log(
+        `Correction reconcile: checked ${outcome.checked} filed message(s), ` +
+          `learned ${outcome.corrections} correction(s).`
+      );
     }
   });
 }

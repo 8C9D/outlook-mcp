@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { TIMEZONE, TZ_PREFER, ToolResult, fetchPaged, runTool, textResult } from "./common.js";
+import { TIMEZONE, TZ_PREFER, ToolResult, fetchPaged, runTool, structuredResult } from "./common.js";
 import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
 
 export const listEventsSchema = {
@@ -30,6 +30,35 @@ export const listEventsSchema = {
 };
 
 const listEventsArgs = z.object(listEventsSchema);
+
+/** Permissive machine-readable day grouping; every field optional. */
+export const listEventsOutputSchema = {
+  startDate: z.string().optional(),
+  endDate: z.string().optional().describe("Last day of the window, inclusive."),
+  timezone: z.string().optional(),
+  calendar: z.string().optional(),
+  count: z.number().optional(),
+  days: z
+    .array(
+      z.looseObject({
+        date: z.string().optional(),
+        events: z
+          .array(
+            z.looseObject({
+              subject: z.string().optional(),
+              start: z.string().optional().describe("Local wall-clock HH:MM; absent when all-day."),
+              end: z.string().optional(),
+              allDay: z.boolean().optional(),
+              location: z.string().optional(),
+              id: z.string().optional().describe("Present when include_ids is set."),
+              occurrence: z.boolean().optional().describe("One date of a repeating series."),
+            })
+          )
+          .optional(),
+      })
+    )
+    .optional(),
+};
 
 export const listEventsDescription =
   "List the user's Outlook calendar events for a date window, grouped by day in America/Toronto local time. Shows each event as start–end time, subject, and location; all-day events are listed first within each day, and repeating events appear once per occurrence. Defaults to the next 7 days of the default calendar starting today; set calendar to read another one and include_ids to get the ids manage_event needs.";
@@ -69,8 +98,18 @@ export async function listEventsHandler(
     const events = await fetchPaged(path, EVENT_CAP, { Prefer: TZ_PREFER });
 
     const lastDay = addDays(startDate, parsed.days - 1);
+    const structuredBase = {
+      startDate,
+      endDate: lastDay,
+      timezone: TIMEZONE,
+      ...(target ? { calendar: target.name } : {}),
+    };
     if (events.length === 0) {
-      return textResult(`No events in this window (${startDate} to ${lastDay})${where}.`);
+      return structuredResult(`No events in this window (${startDate} to ${lastDay})${where}.`, {
+        ...structuredBase,
+        count: 0,
+        days: [],
+      });
     }
 
     const byDay = new Map<string, { allDay: any[]; timed: any[] }>();
@@ -81,6 +120,7 @@ export async function listEventsHandler(
     }
 
     const sections: string[] = [];
+    const structuredDays: Record<string, unknown>[] = [];
     for (const day of [...byDay.keys()].sort()) {
       const { allDay, timed } = byDay.get(day)!;
       const lines = [
@@ -90,11 +130,27 @@ export async function listEventsHandler(
         ),
       ];
       sections.push(`${day}\n${lines.join("\n")}`);
+      structuredDays.push({
+        date: day,
+        events: [...allDay, ...timed].map((ev) => describeStructured(ev, parsed.include_ids)),
+      });
     }
-    return textResult(
-      `Events ${startDate} to ${lastDay}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`
+    return structuredResult(
+      `Events ${startDate} to ${lastDay}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
+      { ...structuredBase, count: events.length, days: structuredDays }
     );
   });
+}
+
+function describeStructured(ev: any, includeIds: boolean): Record<string, unknown> {
+  const repeating = ev.type === "occurrence" || ev.type === "exception";
+  return {
+    subject: ev.subject || "(no subject)",
+    allDay: Boolean(ev.isAllDay),
+    ...(ev.isAllDay ? {} : { start: hhmm(ev.start), end: hhmm(ev.end) }),
+    ...(ev.location?.displayName ? { location: ev.location.displayName } : {}),
+    ...(includeIds ? { id: String(ev.id ?? ""), occurrence: repeating } : {}),
+  };
 }
 
 function hhmm(when: any): string {

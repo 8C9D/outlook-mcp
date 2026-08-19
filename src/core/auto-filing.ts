@@ -10,6 +10,7 @@ import {
   STATE_DIGEST_LAST,
   STATE_LLM_AUDIT,
   STATE_LLM_CONFIG,
+  STATE_LLM_PREFS,
   errorCounterKey,
   llmBudgetKey,
 } from "./kv-keys.js";
@@ -278,7 +279,14 @@ export type AuditEntry = {
   at: string;
   /** "filing" for a classified message, "digest" for the morning brief. */
   feature: "filing" | "digest";
-  action: "moved" | "categorized" | "moved+categorized" | "drafted" | "none";
+  action:
+    | "moved"
+    | "categorized"
+    | "moved+categorized"
+    | "drafted"
+    | "none"
+    /** The reconciler noticed the user re-filed something the filer had moved. */
+    | "correction";
   messageId?: string;
   /** Truncated; the audit log is read back by a tool, not a mail client. */
   subject?: string;
@@ -289,6 +297,32 @@ export type AuditEntry = {
   reason: string;
   model?: string;
   usage?: { input: number; output: number };
+  /**
+   * What decided a filing action: "llm" when the model was consulted,
+   * "preference" when a learned sender preference filed it with NO model call.
+   * Absent on entries where neither decided (skips, budget stops, corrections).
+   */
+  source?: "llm" | "preference";
+  /** The sender's bare email address, lowercased — what preferences key on. */
+  sender?: string;
+  /** The id of the folder a move targeted (displayName alone is ambiguous). */
+  folderId?: string;
+  /** The message's id after a move (a Graph move mints a new one). */
+  newMessageId?: string;
+  /**
+   * The conversation id, which — unlike message ids — survives moves. The
+   * correction reconciler falls back to it when the user's own move has
+   * invalidated newMessageId (verified live: the old id 404s after a move).
+   */
+  conversationId?: string;
+  /**
+   * Set by the correction reconciler once this move needs no further checks:
+   * "confirmed" (still where the filer put it after the confirmation window),
+   * "corrected" (the user moved it elsewhere; a preference was learned),
+   * "gone" (message unreadable — deleted, or its folder was),
+   * "ignored" (it landed somewhere no preference should learn from).
+   */
+  reconciled?: "confirmed" | "corrected" | "gone" | "ignored";
 };
 
 /** The audit ring, newest first. */
@@ -307,6 +341,108 @@ export async function appendAudit(store: StateStore, entry: AuditEntry): Promise
 export function auditSubject(subject: string | undefined): string {
   const text = (subject ?? "").replace(/\s+/g, " ").trim();
   return text.length > 120 ? `${text.slice(0, 117)}...` : text || "(no subject)";
+}
+
+// ------------------------------------------- learned filing preferences
+
+/** How many sender preferences are kept. Oldest-touched fall off. */
+export const PREFS_CAP = 200;
+
+/** A repeat correction to the same folder makes a preference "standing". */
+export const STANDING_CORRECTIONS = 2;
+
+/**
+ * One learned rule: mail from `sender` goes to `folderId`. Learned from the
+ * user's own corrections (moving a message the auto-filer had filed), consulted
+ * BEFORE the model on future arrivals — a hit files with no Anthropic call.
+ * A preference whose folder is the Inbox means "leave this sender's mail alone".
+ */
+export type FilingPreference = {
+  /** Bare email address, lowercased. */
+  sender: string;
+  folderId: string;
+  /** Display name at learning time, for humans; the id is what moves act on. */
+  folderName: string;
+  /** How many times the user has corrected this sender to this folder. */
+  corrections: number;
+  firstAt: string;
+  lastAt: string;
+};
+
+/** True once repeat corrections have confirmed the preference. */
+export function isStandingPreference(pref: FilingPreference): boolean {
+  return pref.corrections >= STANDING_CORRECTIONS;
+}
+
+/**
+ * The bare address inside a "Name <addr@host>" (or bare) sender string,
+ * lowercased — the key preferences are stored under. Null when there is none.
+ */
+export function extractAddress(from: string | undefined): string | null {
+  if (!from) return null;
+  const angled = /<([^<>\s]+@[^<>\s]+)>/.exec(from);
+  const bare = angled?.[1] ?? (/^[^\s<>]+@[^\s<>]+$/.test(from.trim()) ? from.trim() : null);
+  return bare ? bare.toLowerCase() : null;
+}
+
+/** Every learned preference, most recently touched first. */
+export async function readPreferences(store: StateStore): Promise<FilingPreference[]> {
+  const raw = await readJson<FilingPreference[]>(store, STATE_LLM_PREFS);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (p): p is FilingPreference =>
+      !!p && typeof p.sender === "string" && typeof p.folderId === "string"
+  );
+}
+
+export async function writePreferences(
+  store: StateStore,
+  prefs: FilingPreference[]
+): Promise<void> {
+  await writeJson(store, STATE_LLM_PREFS, prefs.slice(0, PREFS_CAP));
+}
+
+/** The preference for one sender address (case-insensitive exact match). */
+export function findPreference(
+  prefs: FilingPreference[],
+  sender: string
+): FilingPreference | undefined {
+  const needle = sender.trim().toLowerCase();
+  return prefs.find((p) => p.sender === needle);
+}
+
+/**
+ * Record one detected correction: the user moved mail from `sender` into
+ * `folder`. Same folder again → the correction count grows (toward "standing");
+ * a different folder replaces the preference and the count restarts at 1 —
+ * the user's latest choice always wins.
+ */
+export async function upsertPreferenceFromCorrection(
+  store: StateStore,
+  sender: string,
+  folder: { id: string; name: string },
+  when: Date = new Date()
+): Promise<FilingPreference> {
+  const at = when.toISOString();
+  const key = sender.trim().toLowerCase();
+  const prefs = await readPreferences(store);
+  const existing = findPreference(prefs, key);
+  const next: FilingPreference =
+    existing && existing.folderId === folder.id
+      ? { ...existing, folderName: folder.name, corrections: existing.corrections + 1, lastAt: at }
+      : { sender: key, folderId: folder.id, folderName: folder.name, corrections: 1, firstAt: at, lastAt: at };
+  await writePreferences(store, [next, ...prefs.filter((p) => p.sender !== key)]);
+  return next;
+}
+
+/** Remove one sender's preference. Returns whether one existed. */
+export async function removePreference(store: StateStore, sender: string): Promise<boolean> {
+  const key = sender.trim().toLowerCase();
+  const prefs = await readPreferences(store);
+  const remaining = prefs.filter((p) => p.sender !== key);
+  if (remaining.length === prefs.length) return false;
+  await writePreferences(store, remaining);
+  return true;
 }
 
 // ------------------------------------------------- digest idempotency marker
