@@ -46,6 +46,7 @@ two of its settings are the ones people get wrong.
    | `Contacts.ReadWrite` | `search_contacts`, `manage_contact` |
    | `MailboxSettings.ReadWrite` | `auto_reply`, `mailbox_settings` |
    | `Tasks.ReadWrite` | `list_tasks`, `manage_task` |
+   | `Files.ReadWrite` | the OneDrive tools (`search_files`, `upload_file`, …) |
 
    `offline_access` is requested automatically by the sign-in library and does not need adding by
    hand. There is no "grant admin consent" step for a personal account: **you** consent at sign-in, to

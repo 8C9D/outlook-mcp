@@ -32,6 +32,7 @@ export const MAILBOX_SCOPES = [
   "Contacts.ReadWrite",
   "MailboxSettings.ReadWrite",
   "Tasks.ReadWrite",
+  "Files.ReadWrite",
 ].join(" ");
 
 /** Identity-only scope for proving who is authorizing the connector. */

@@ -219,6 +219,7 @@ async function forcedKvTokenRotation(): Promise<void> {
     "Contacts.ReadWrite",
     "MailboxSettings.ReadWrite",
     "Tasks.ReadWrite",
+    "Files.ReadWrite",
   ].join(" ");
 
   const response = await fetch(
