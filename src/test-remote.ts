@@ -42,16 +42,19 @@ import {
   STATE_HEALTH,
   STATE_LLM_AUDIT,
   STATE_LLM_CONFIG,
+  STATE_LLM_PREFS,
   STATE_SUBSCRIPTION,
   deltaKey,
   downloadKey,
 } from "./core/kv-keys.js";
+import { z } from "zod";
 import { runHealthCheck, type HealthReport } from "./core/health.js";
 import type { StateStore } from "./core/state.js";
 import {
   NEVER_FILE_INTO,
   readLlmConfig,
   type AuditEntry,
+  type FilingPreference,
   type LlmConfig,
 } from "./core/auto-filing.js";
 import { createMemoryStateStore } from "./core/state.js";
@@ -663,6 +666,96 @@ await testAuthed("r11. tools/call list_events reaches Graph through the KV token
   );
 });
 
+await testAuthed("r28. the five reader tools serve structuredContent over Streamable HTTP", async () => {
+  assert(bearer, "no bearer token");
+
+  // tools/list must advertise the outputSchema on exactly the five, like stdio.
+  const listed = resultOf(await mcpCall(bearer!, "tools/list"), "tools/list").tools as {
+    name: string;
+    outputSchema?: { type?: string; properties?: Record<string, unknown> };
+  }[];
+  const withSchema = listed.filter((t) => t.outputSchema !== undefined).map((t) => t.name).sort();
+  assert(
+    withSchema.join(",") === "get_health,list_events,list_folders,list_tasks,search_mail",
+    `tools advertising outputSchema over HTTP: ${withSchema.join(", ")}`
+  );
+
+  // Each of the five returns structuredContent that its own registry schema
+  // accepts and that agrees with the text alongside it.
+  const calls: [string, Record<string, unknown>, (sc: any, text: string) => void][] = [
+    [
+      "search_mail",
+      { max_results: 3 },
+      (sc, text) => {
+        assert(sc.mode === "latest", `search_mail mode ${sc.mode}`);
+        assert(sc.count === (sc.messages ?? []).length, "search_mail count mismatch");
+        for (const m of sc.messages ?? []) {
+          assert(text.includes(m.messageId), `structured id ${m.messageId} missing from text`);
+        }
+      },
+    ],
+    [
+      "list_folders",
+      {},
+      (sc, text) => {
+        assert(Array.isArray(sc.folders) && sc.folders.length > 0, "list_folders has no folders");
+        assert(
+          sc.folders.some((f: any) => /inbox/i.test(String(f.name))),
+          "list_folders structured tree lacks the inbox"
+        );
+        for (const f of sc.folders.slice(0, 3)) assert(text.includes(f.id), "folder id missing from text");
+      },
+    ],
+    [
+      "list_events",
+      { days: 3 },
+      (sc) => {
+        assert(sc.timezone === "America/Toronto", `list_events timezone ${sc.timezone}`);
+        assert(Array.isArray(sc.days), "list_events days is not an array");
+      },
+    ],
+    [
+      "list_tasks",
+      {},
+      (sc) => {
+        assert(typeof sc.list === "string" && sc.list.length > 0, "list_tasks names no list");
+        assert(Array.isArray(sc.tasks), "list_tasks tasks is not an array");
+      },
+    ],
+    [
+      "get_health",
+      {},
+      (sc, text) => {
+        assert(sc.mode === "remote", `get_health mode ${sc.mode}`);
+        // Either a real heartbeat or the honest no-report answer.
+        assert(
+          sc.hasReport === false || typeof sc.healthy === "boolean",
+          `get_health structured: ${JSON.stringify(sc)}`
+        );
+        if (sc.healthy !== undefined) {
+          assert(
+            text.includes(sc.healthy ? "HEALTHY" : "UNHEALTHY"),
+            "get_health text disagrees with the structured verdict"
+          );
+        }
+      },
+    ],
+  ];
+  for (const [name, args, check] of calls) {
+    const result = resultOf(
+      await mcpCall(bearer!, "tools/call", { name, arguments: args }),
+      `tools/call ${name}`
+    );
+    const text = (result.content as { text: string }[]).map((c) => c.text).join("\n");
+    assert(result.isError !== true, `${name} returned isError: ${text}`);
+    assert(result.structuredContent, `${name} returned no structuredContent`);
+    const schema = z.object(TOOLS.find((t) => t.name === name)!.outputSchema!);
+    const parsed = schema.safeParse(result.structuredContent);
+    assert(parsed.success, `${name}'s structuredContent fails its own schema: ${JSON.stringify(result.structuredContent).slice(0, 300)}`);
+    check(result.structuredContent, text);
+  }
+});
+
 await testAuthed("r12. the mailbox refresh token in KV rotates on every exchange", async () => {
   assert(bearer, "no bearer token");
   const before = await kvGet(outlookNs, KV_REFRESH_TOKEN);
@@ -1257,6 +1350,171 @@ await testAuthed("r25. end-to-end: auto-filing classifies a notified message, th
   }
 });
 
+// --------------------------------------------- v11: the auto-filer's feedback loop
+
+// Headless by design, like the Batch C live verification: config and probes go
+// through KV (wrangler) and local Graph, and the DEPLOYED Worker does all the
+// classifying off its real webhook — so the loop under test is exactly the
+// production mechanism: notification → reconcile corrections → classify.
+await test("r29. feedback e2e: LLM files a probe → the user re-files it → the correction becomes a preference → a second probe is filed with NO model call", async () => {
+  const configBefore = await kvGet(outlookNs, STATE_LLM_CONFIG);
+  const prefsBefore = await kvGet(outlookNs, STATE_LLM_PREFS);
+
+  // A correction target the model has no reason to pick for a receipt. If it
+  // somehow does, a B folder keeps the correction a real change of folder.
+  const mkFolder = async (name: string) =>
+    callGraphServer("/me/mailFolders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ displayName: name }),
+    });
+  const folderA = await mkFolder(`${TEST_PREFIX} Correction Target ${randomBytes(3).toString("hex")}`);
+  let correctionFolder = folderA;
+
+  // Draft-then-send through local Graph (the same two-step the tools use;
+  // nothing here auto-sends anything of the user's).
+  const sendProbe = async (subject: string) => {
+    const draft = await callGraphServer("/me/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        subject,
+        body: {
+          contentType: "text",
+          content:
+            "Thank you for your order #B-1199 at Acme Hardware. Total charged: $18.75 CAD. " +
+            "This is your receipt; no action is needed.",
+        },
+        toRecipients: [{ emailAddress: { address: ownAddress } }],
+      }),
+    });
+    await callGraphServer(`/me/messages/${encodeURIComponent(draft.id)}/send`, { method: "POST" });
+    return subject;
+  };
+  const auditEntryFor = (log: AuditEntry[], marker: string) =>
+    log.find((entry) => entry.feature === "filing" && entry.subject?.includes(marker));
+
+  try {
+    // Filing on at threshold 0.5 for determinism (r25's finding: the model is
+    // rightly warier of [MCP TEST]-marked subjects), written straight to KV —
+    // the headless precedent — and restored byte-exact in the finally.
+    const current = configBefore ? (JSON.parse(configBefore) as Partial<LlmConfig>) : {};
+    await kvPut(
+      outlookNs,
+      STATE_LLM_CONFIG,
+      JSON.stringify({ ...current, filingEnabled: true, threshold: 0.5 })
+    );
+
+    // Probe 1: classified by the MODEL (source "llm", tokens spent).
+    const marker1 = randomBytes(4).toString("hex");
+    await sendProbe(`${TEST_PREFIX} Your receipt from Acme Hardware ${marker1}`);
+    const first = await poll("the Worker to classify probe 1", 300_000, 10_000, async () => {
+      const log = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+      return auditEntryFor(log, marker1);
+    });
+    console.log(
+      `      probe 1: ${first.action} → ${first.folder ?? "(none)"} by ${first.source} ` +
+        `(model ${first.model}, ${first.usage?.input ?? 0}/${first.usage?.output ?? 0} tokens)`
+    );
+    assert(
+      first.action === "moved" || first.action === "moved+categorized",
+      `probe 1 was not filed by the model: ${first.action} — ${first.reason}`
+    );
+    assert(first.source === "llm", `probe 1's audit source is ${first.source}, expected "llm"`);
+    assert(first.model && (first.usage?.output ?? 0) > 0, "probe 1's entry records no model usage");
+    assert(first.folderId && first.newMessageId, "probe 1's entry lacks folderId/newMessageId — the reconciler could not watch it");
+
+    // The "user" corrects the filing: move the filed copy somewhere else.
+    if (first.folderId === folderA.id) {
+      correctionFolder = await mkFolder(`${TEST_PREFIX} Correction Target B ${randomBytes(3).toString("hex")}`);
+    }
+    await callGraphServer(`/me/messages/${encodeURIComponent(first.newMessageId!)}/move`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ destinationId: correctionFolder.id }),
+    });
+
+    // Probe 2, same sender: its own notification delivery FIRST reconciles
+    // (detecting the correction above, recording the preference) and THEN
+    // classifies — so probe 2 must take the preference fast path.
+    const marker2 = randomBytes(4).toString("hex");
+    await sendProbe(`${TEST_PREFIX} Your receipt from Acme Hardware ${marker2}`);
+    const second = await poll("the Worker to file probe 2 by preference", 300_000, 10_000, async () => {
+      const log = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+      const entry = auditEntryFor(log, marker2);
+      // Wait specifically for the filed entry (not an intermediate "none").
+      return entry && entry.action !== "none" ? entry : undefined;
+    });
+    console.log(
+      `      probe 2: ${second.action} → ${second.folder} by ${second.source} — ${second.reason}`
+    );
+
+    // THE fast-path proof: decided by preference, and no model was paid.
+    assert(second.source === "preference", `probe 2's audit source is ${second.source}, expected "preference"`);
+    assert(second.model === undefined, `probe 2's entry names a model (${second.model}) — the API was called`);
+    assert(second.usage === undefined, `probe 2's entry records token usage (${JSON.stringify(second.usage)}) — the API was called`);
+    assert(second.action === "moved", `probe 2 was ${second.action}, expected moved`);
+    assert(second.folderId === correctionFolder.id, `probe 2 went to ${second.folder} (${second.folderId}), not the corrected folder`);
+    assert(/no model call/.test(second.reason), `probe 2's reason does not state the fast path: ${second.reason}`);
+
+    // The correction itself is audited…
+    const log = JSON.parse((await kvGet(outlookNs, STATE_LLM_AUDIT)) || "[]") as AuditEntry[];
+    const correction = log.find(
+      (entry) => entry.action === "correction" && entry.folderId === correctionFolder.id
+    );
+    assert(correction, "no correction entry in the audit log");
+    assert(
+      correction.sender === ownAddress.toLowerCase(),
+      `the correction names sender ${correction.sender}`
+    );
+
+    // …the preference is really in KV…
+    const prefs = JSON.parse((await kvGet(outlookNs, STATE_LLM_PREFS)) || "[]") as FilingPreference[];
+    const learned = prefs.find((p) => p.sender === ownAddress.toLowerCase());
+    assert(
+      learned && learned.folderId === correctionFolder.id,
+      `no learned preference for ${ownAddress} → ${correctionFolder.id} in KV: ${JSON.stringify(prefs)}`
+    );
+
+    // …and the mailbox agrees: probe 2's message sits in the corrected folder.
+    const moved = await callGraphServer(
+      `/me/messages/${encodeURIComponent(second.newMessageId!)}?$select=id,parentFolderId`
+    );
+    assert(
+      moved.parentFolderId === correctionFolder.id,
+      "probe 2's message is not in the corrected folder"
+    );
+  } finally {
+    // The owner's real config and preferences back, byte-exact, whatever happened.
+    if (configBefore) await kvPut(outlookNs, STATE_LLM_CONFIG, configBefore);
+    else await kvDelete(outlookNs, STATE_LLM_CONFIG);
+    if (prefsBefore) await kvPut(outlookNs, STATE_LLM_PREFS, prefsBefore);
+    else await kvDelete(outlookNs, STATE_LLM_PREFS);
+
+    // The probes (every copy, wherever filed) and the correction folders.
+    const probes = await callGraphServer(
+      `/me/messages?$filter=${encodeURIComponent(
+        `startswith(subject,'${TEST_PREFIX} Your receipt from Acme Hardware')`
+      )}&$select=id`
+    ).catch(() => null);
+    for (const message of probes?.value ?? []) {
+      await callGraphServer(`/me/messages/${encodeURIComponent(message.id)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => undefined);
+    }
+    for (const base of ["/me/mailFolders", "/me/mailFolders/deleteditems/childFolders"]) {
+      const folders = await callGraphServer(`${base}?$top=100&$select=id,displayName`).catch(() => null);
+      for (const f of folders?.value ?? []) {
+        if (String(f.displayName ?? "").startsWith(TEST_PREFIX)) {
+          await callGraphServer(`/me/mailFolders/${encodeURIComponent(f.id)}/permanentDelete`, {
+            method: "POST",
+          }).catch(() => undefined);
+        }
+      }
+    }
+  }
+});
+
 // ------------------------------------------------- v10: is the deployment current
 
 // r9 compares the annotations the deployed server actually serves, but tools/list
@@ -1464,6 +1722,52 @@ await test("r20. cleanup: the probe message, its notifications and the delta pos
     !leftoverAudit.some((entry) => String(entry.subject ?? "").includes(TEST_PREFIX)),
     "the audit log still holds entries this run created"
   );
+
+  // Learned filing preferences: r29 restores the captured record byte-exact,
+  // so nothing may still point at a test folder (the "leave no preference
+  // behind" half of the feedback e2e's cleanup). A leftover is removed AND
+  // reported as a failure of the restore.
+  const prefsRaw = (await kvGet(outlookNs, STATE_LLM_PREFS)) ?? "[]";
+  let prefsNow: FilingPreference[] = [];
+  try {
+    prefsNow = JSON.parse(prefsRaw) as FilingPreference[];
+  } catch {
+    prefsNow = [];
+  }
+  const testPrefs = (Array.isArray(prefsNow) ? prefsNow : []).filter((p) =>
+    String(p?.folderName ?? "").startsWith(TEST_PREFIX)
+  );
+  if (testPrefs.length > 0) {
+    await kvPut(
+      outlookNs,
+      STATE_LLM_PREFS,
+      JSON.stringify(prefsNow.filter((p) => !String(p?.folderName ?? "").startsWith(TEST_PREFIX)))
+    );
+  }
+  assert(
+    testPrefs.length === 0,
+    `learned preferences still pointed at test folders (now removed): ${JSON.stringify(testPrefs)}`
+  );
+
+  // No [MCP TEST] mail folders anywhere — r29 creates correction-target
+  // folders and must take them with it.
+  for (const base of ["/me/mailFolders", "/me/mailFolders/deleteditems/childFolders"]) {
+    const folders = await callGraphServer(`${base}?$top=100&$select=id,displayName`);
+    const leftoverFolders = (folders?.value ?? []).filter((f: any) =>
+      String(f.displayName ?? "").startsWith(TEST_PREFIX)
+    );
+    for (const f of leftoverFolders) {
+      await callGraphServer(`/me/mailFolders/${encodeURIComponent(f.id)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => undefined);
+    }
+    assert(
+      leftoverFolders.length === 0,
+      `leftover test folders under ${base} (now purged): ${JSON.stringify(
+        leftoverFolders.map((f: any) => f.displayName)
+      )}`
+    );
+  }
 
   // The subscription record must not still carry r27's [MCP TEST]-marked
   // bogus id — a leftover here would mean the health e2e failed to restore it.
