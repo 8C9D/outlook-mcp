@@ -22,6 +22,20 @@ export const STATE_SUBSCRIPTION = "sub:mail";
 /** The capped ring buffer of received change notifications, newest first. */
 export const STATE_ACTIVITY = "activity:mail";
 
+/** Settings for the two LLM features (auto-filing and the morning digest). */
+export const STATE_LLM_CONFIG = "llm:config";
+
+/** The capped ring buffer of auto-filing decisions, newest first. */
+export const STATE_LLM_AUDIT = "llm:audit";
+
+/** The Toronto date of the last morning brief that was drafted (idempotency). */
+export const STATE_DIGEST_LAST = "llm:digest:last";
+
+/** Anthropic API calls made on one America/Toronto calendar day. */
+export function llmBudgetKey(torontoDate: string): string {
+  return `llm:budget:${torontoDate}`;
+}
+
 /** Prefix of the short-lived attachment downloads get_attachment hands out. */
 export const DOWNLOAD_PREFIX = "dl:";
 

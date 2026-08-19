@@ -7,6 +7,7 @@
 // presents no credential, so the shared clientState secret (generated at
 // subscription creation and stored in KV) is what authenticates a delivery.
 import { handleNotificationRequest, type MessageEnricher } from "../core/notifications.js";
+import { classifyNotified } from "./llm.js";
 import { runWithTokenProvider } from "../core/token.js";
 import { ensureMailSubscription, type EnsureResult } from "../core/subscriptions.js";
 import type { Env } from "./env.js";
@@ -56,11 +57,28 @@ function messageEnricher(env: Env): MessageEnricher {
   };
 }
 
-/** The public /notifications route: validation handshake and deliveries. */
-export function handleNotifications(request: Request, env: Env): Promise<Response> {
+/**
+ * The public /notifications route: validation handshake and deliveries.
+ *
+ * Anything a delivery triggers beyond recording it — today, LLM classification
+ * of the messages it named — is handed to ctx.waitUntil so Graph still gets its
+ * 202 immediately. Auto-filing ships disabled, so on a default deployment
+ * classifyNotified reads one KV key and returns.
+ */
+export function handleNotifications(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
   return handleNotificationRequest(request, {
     store: kvStateStore(env),
     enrich: messageEnricher(env),
+    onAccepted: (entries) =>
+      ctx.waitUntil(
+        classifyNotified(env, entries).catch((err) =>
+          console.error(`Auto-filing failed for a notification delivery: ${String(err)}`)
+        )
+      ),
   });
 }
 

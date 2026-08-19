@@ -17,6 +17,14 @@ export interface Env {
   /** Graph /me `userPrincipalName`/`mail` of that same account (second accepted match). */
   ALLOWED_MS_UPN: string;
   /**
+   * Anthropic API key for the two LLM features (auto-filing on the change
+   * notification, and the morning digest cron). Absent means both are simply
+   * unavailable — they ship disabled anyway, and every call path logs the
+   * missing key to the audit trail rather than failing loudly. Never logged,
+   * never returned by a tool, never written to KV.
+   */
+  ANTHROPIC_API_KEY?: string;
+  /**
    * Public origin of this Worker (wrangler var, not a secret). Graph is told to
    * deliver change notifications to `${PUBLIC_BASE_URL}/notifications`, so it
    * has to match the deployed hostname exactly.

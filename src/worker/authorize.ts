@@ -285,7 +285,7 @@ async function handleAuthorizeDirect(request: Request, env: Env): Promise<Respon
 }
 
 export const defaultHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/authorize") {
@@ -314,7 +314,8 @@ export const defaultHandler = {
     if (url.pathname === NOTIFICATIONS_PATH) {
       // Microsoft Graph posts here with no credential of its own; the endpoint
       // authenticates deliveries with the subscription's clientState instead.
-      return handleNotifications(request, env);
+      // ctx carries the waitUntil the follow-up work is scheduled on.
+      return handleNotifications(request, env, ctx);
     }
     if (url.pathname === "/health") {
       // Deliberately says nothing about the mailbox or whether anyone is authorized.

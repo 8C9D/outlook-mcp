@@ -58,6 +58,14 @@ export type NotificationContext = {
   store: StateStore;
   enrich?: MessageEnricher;
   now?: () => Date;
+  /**
+   * Called once with the notifications that passed the clientState check, after
+   * they are recorded and before the 202 goes back. Graph retries anything that
+   * is not answered promptly, so an implementation must hand the work off (the
+   * Worker uses ctx.waitUntil) rather than await it. Never awaited here, and a
+   * throw is swallowed: follow-up work must not cost us the acknowledgement.
+   */
+  onAccepted?: (entries: ActivityEntry[]) => void;
 };
 
 function textResponse(body: string, status: number): Response {
@@ -145,6 +153,14 @@ export async function handleNotificationRequest(
 
   // Newest first inside this delivery too, so the buffer stays ordered.
   await appendActivity(context.store, accepted.reverse());
+
+  if (context.onAccepted && accepted.length > 0) {
+    try {
+      context.onAccepted(accepted);
+    } catch (err) {
+      console.error(`Notification follow-up could not be scheduled: ${String(err)}`);
+    }
+  }
 
   if (rejected > 0) {
     console.error(

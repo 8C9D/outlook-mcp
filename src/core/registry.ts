@@ -113,6 +113,16 @@ import {
   getMailboxActivityHandler,
   getMailboxActivitySchema,
 } from "../tools/get-mailbox-activity.js";
+import {
+  getAutoFilingLogDescription,
+  getAutoFilingLogHandler,
+  getAutoFilingLogSchema,
+} from "../tools/get-auto-filing-log.js";
+import {
+  manageAutoFilingDescription,
+  manageAutoFilingHandler,
+  manageAutoFilingSchema,
+} from "../tools/manage-auto-filing.js";
 import { registerPrompts } from "./prompts.js";
 import { registerResources } from "./resources.js";
 import type { ZodRawShape } from "zod";
@@ -288,6 +298,18 @@ export const TOOLS: ToolDefinition[] = [
     description: getMailboxActivityDescription,
     inputSchema: getMailboxActivitySchema,
     handler: getMailboxActivityHandler,
+  },
+  {
+    name: "manage_auto_filing",
+    description: manageAutoFilingDescription,
+    inputSchema: manageAutoFilingSchema,
+    handler: manageAutoFilingHandler,
+  },
+  {
+    name: "get_auto_filing_log",
+    description: getAutoFilingLogDescription,
+    inputSchema: getAutoFilingLogSchema,
+    handler: getAutoFilingLogHandler,
   },
 ];
 
