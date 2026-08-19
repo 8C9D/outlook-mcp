@@ -67,6 +67,16 @@ import {
   torontoMidnightUtc,
 } from "./tools/search-mail.js";
 import { FORCE_MOVE_CAP, deleteFolderRefusal, type FolderFacts } from "./tools/delete-folder.js";
+import {
+  baseNameOf,
+  compareDriveChildren,
+  conflictBehaviorFor,
+  drivePathUrl,
+  itemDisplayPath,
+  matchesTypeFilter,
+  normalizeDrivePath,
+  parentPathOf,
+} from "./core/drive.js";
 import { getHealthHandler } from "./tools/get-health.js";
 import { runWithStateStore } from "./core/state.js";
 import { handleNotificationRequest } from "./core/notifications.js";
@@ -1199,13 +1209,21 @@ await test("o21. delete_folder guards and the structured-content contract", asyn
   // Empty: allowed without force.
   assert(deleteFolderRefusal(facts(), false) === null, "an empty folder was refused");
 
-  // The structured-content contract: exactly the five reader tools declare an
+  // The structured-content contract: exactly the seven reader tools declare an
   // outputSchema, and each schema is permissive (all-optional, tolerant of
   // unknown keys) so it can never fail a call that used to work.
   const structured = TOOLS.filter((t) => t.outputSchema !== undefined).map((t) => t.name).sort();
   assert(
     JSON.stringify(structured) ===
-      JSON.stringify(["get_health", "list_events", "list_folders", "list_tasks", "search_mail"]),
+      JSON.stringify([
+        "get_health",
+        "list_events",
+        "list_folder",
+        "list_folders",
+        "list_tasks",
+        "search_files",
+        "search_mail",
+      ]),
     `tools with outputSchema: ${structured.join(", ")}`
   );
   for (const tool of TOOLS) {
@@ -1245,8 +1263,80 @@ await test("o21. delete_folder guards and the structured-content contract", asyn
 
 // -------------------------------------------------- annotations and version
 
+await test("o22. drive logic: paths, URLs, conflict mapping, type filter, ordering", async () => {
+  // Path normalization: slashes collapse, backslashes convert, root spellings.
+  for (const [raw, want] of [
+    ["Documents/x.txt", "Documents/x.txt"],
+    ["/Documents//Receipts/", "Documents/Receipts"],
+    ["Documents\\sub\\a.pdf", "Documents/sub/a.pdf"],
+    ["", ""],
+    ["/", ""],
+    ["  ", ""],
+  ] as const) {
+    const result = normalizeDrivePath(raw);
+    assert(result.ok && result.path === want, `normalize(${JSON.stringify(raw)}) → ${JSON.stringify(result)}`);
+  }
+  // Navigation segments are refused, not resolved.
+  for (const bad of ["../etc", "a/../b", "a/./b"]) {
+    const result = normalizeDrivePath(bad);
+    assert(!result.ok && /not allowed/.test(result.message), `normalize(${bad}) was allowed`);
+  }
+  // Path pieces.
+  assert(parentPathOf("a/b/c.txt") === "a/b" && parentPathOf("c.txt") === "", "parentPathOf broke");
+  assert(baseNameOf("a/b/c.txt") === "c.txt" && baseNameOf("c.txt") === "c.txt", "baseNameOf broke");
+
+  // URL grammar: root vs path addressing, segment encoding, suffix placement.
+  assert(drivePathUrl("") === "/me/drive/root", "root URL");
+  assert(drivePathUrl("", "/children") === "/me/drive/root/children", "root children URL");
+  assert(drivePathUrl("a b/c.txt") === "/me/drive/root:/a%20b/c.txt", "path URL encoding");
+  assert(
+    drivePathUrl("a b/c#1.txt", "/content") === "/me/drive/root:/a%20b/c%231.txt:/content",
+    "suffix URL: " + drivePathUrl("a b/c#1.txt", "/content")
+  );
+
+  // The overwrite flag maps to Graph's vocabulary — and the default MUST be
+  // rename, because Graph's own default (replace) silently destroys the
+  // existing file (verified live; ASSUMPTIONS v13).
+  assert(conflictBehaviorFor(false) === "rename", "default must be rename");
+  assert(conflictBehaviorFor(true) === "replace", "overwrite must be replace");
+
+  // Type filter: kinds and extensions, case-insensitive, dot optional.
+  const file = { name: "Report.PDF", file: { mimeType: "application/pdf" } };
+  const folder = { name: "pdf", folder: { childCount: 1 } };
+  assert(matchesTypeFilter(file, undefined) && matchesTypeFilter(folder, undefined), "no filter matches all");
+  assert(matchesTypeFilter(file, "file") && !matchesTypeFilter(folder, "file"), "file kind");
+  assert(matchesTypeFilter(folder, "folder") && !matchesTypeFilter(file, "folder"), "folder kind");
+  assert(matchesTypeFilter(file, "pdf") && matchesTypeFilter(file, ".PDF"), "extension filter");
+  assert(!matchesTypeFilter(folder, "pdf"), "a folder named pdf is not a .pdf file");
+  assert(!matchesTypeFilter(file, "docx"), "wrong extension matched");
+
+  // Ordering: folders first, then case-insensitive names within each group.
+  const items = [
+    { name: "zeta.txt" },
+    { name: "Beta", folder: {} },
+    { name: "alpha.txt" },
+    { name: "acme", folder: {} },
+  ];
+  const sorted = [...items].sort(compareDriveChildren).map((i) => i.name);
+  assert(
+    JSON.stringify(sorted) === JSON.stringify(["acme", "Beta", "alpha.txt", "zeta.txt"]),
+    `ordering: ${sorted.join(", ")}`
+  );
+
+  // Display paths from parentReference, root included.
+  assert(
+    itemDisplayPath({ name: "c.txt", parentReference: { path: "/drive/root:/a/b" } }) === "/a/b/c.txt",
+    "display path nested"
+  );
+  assert(
+    itemDisplayPath({ name: "c.txt", parentReference: { path: "/drive/root:" } }) === "/c.txt",
+    "display path root child"
+  );
+  assert(itemDisplayPath({ name: "root", root: {} }) === "/", "display path of the root");
+});
+
 await test("o16. annotations: all four hints on every tool, and the structural rules hold", async () => {
-  assert(TOOLS.length === 31, `expected 31 tools in the registry, found ${TOOLS.length}`);
+  assert(TOOLS.length === 37, `expected 37 tools in the registry, found ${TOOLS.length}`);
   for (const tool of TOOLS) {
     const { readOnlyHint, destructiveHint, idempotentHint, openWorldHint } = tool.annotations;
     for (const [hint, value] of Object.entries({ readOnlyHint, destructiveHint, idempotentHint, openWorldHint })) {
@@ -1270,6 +1360,18 @@ await test("o16. annotations: all four hints on every tool, and the structural r
     "manage_rules must stay destructive but closed-world (no forwarding actions)"
   );
   assert(get("get_health").annotations.readOnlyHint, "get_health must be read-only");
+  assert(
+    get("search_files").annotations.readOnlyHint && get("list_folder").annotations.readOnlyHint,
+    "the OneDrive readers must be read-only"
+  );
+  assert(
+    get("share_link").annotations.openWorldHint,
+    "share_link opens the item to anyone with the URL — it must be open-world"
+  );
+  assert(
+    get("upload_file").annotations.destructiveHint && get("manage_file").annotations.destructiveHint,
+    "upload_file (overwrite capability) and manage_file (delete) must be destructive"
+  );
 });
 
 await test("o17. version: package.json and core/version.ts agree", async () => {

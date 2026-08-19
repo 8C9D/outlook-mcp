@@ -1,9 +1,22 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
+import {
+  downloadDriveItem,
+  getDriveItemByPath,
+  itemDisplayPath,
+  normalizeDrivePath,
+} from "../core/drive.js";
 import { getStateStore } from "../core/state.js";
-import { ToolResult, errorResult, runTool, textResult } from "./common.js";
+import {
+  MAX_FILE_SIZE,
+  SourcePreparation,
+  SourceReadError,
+  contentTypeForFile,
+  prepareBase64Source,
+  prepareFileSource,
+  prepareUrlSource,
+} from "./file-sources.js";
+import { ToolResult, errorResult, isNotFound, runTool, textResult } from "./common.js";
 import { formatSize } from "./read-message.js";
 
 export const addAttachmentSchema = {
@@ -16,21 +29,28 @@ export const addAttachmentSchema = {
     .min(1)
     .optional()
     .describe(
-      "Source 1 of 3: absolute local path of a file on the machine running this server (e.g. /Users/me/report.pdf). Works only on the local (stdio) server — the hosted server has no filesystem and rejects it."
+      "Source 1 of 4: absolute local path of a file on the machine running this server (e.g. /Users/me/report.pdf). Works only on the local (stdio) server — the hosted server has no filesystem and rejects it."
     ),
   url: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Source 2 of 3: an https:// URL the server downloads and attaches (max 25 MB). The URL must be reachable without credentials."
+      "Source 2 of 4: an https:// URL the server downloads and attaches (max 25 MB). The URL must be reachable without credentials."
     ),
   content_base64: z
     .string()
     .min(1)
     .optional()
     .describe(
-      "Source 3 of 3: the file's bytes, base64-encoded, for content you already hold (max 3 MB decoded). Give attachment_name too, so the file arrives with a sensible name and type."
+      "Source 3 of 4: the file's bytes, base64-encoded, for content you already hold (max 3 MB decoded). Give attachment_name too, so the file arrives with a sensible name and type."
+    ),
+  onedrive_path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Source 4 of 4: the OneDrive path of a file to attach (e.g. "Documents/report.pdf") — the file\'s bytes are copied into the draft; the OneDrive file is not modified. Works on both servers.'
     ),
   attachment_name: z
     .string()
@@ -44,46 +64,12 @@ export const addAttachmentSchema = {
 const addAttachmentArgs = z.object(addAttachmentSchema);
 
 export const addAttachmentDescription =
-  "Attach a file to an existing email draft (max 25 MB) from exactly one of three sources: file_path (a local file — local stdio server only), url (an https link this server fetches), or content_base64 (bytes you supply, max 3 MB). Natural flow: create_draft → add_attachment (once per file) → send_draft. Fails if the id is not a draft, no source or more than one is given, or the file is missing/oversized. This tool never sends — the draft stays in Drafts until send_draft is called.";
+  "Attach a file to an existing email draft (max 25 MB) from exactly one of four sources: file_path (a local file — local stdio server only), url (an https link this server fetches), content_base64 (bytes you supply, max 3 MB), or onedrive_path (a file in OneDrive, attached as a copy of its bytes). Natural flow: create_draft → add_attachment (once per file) → send_draft. Fails if the id is not a draft, no source or more than one is given, or the file is missing/oversized. This tool never sends — the draft stays in Drafts until send_draft is called.";
 
 const SMALL_LIMIT = 3 * 1024 * 1024; // single-POST fileAttachment below this
-const MAX_SIZE = 25 * 1024 * 1024; // hard cap for this tool
-const BASE64_MAX = 3 * 1024 * 1024; // cap for inline content_base64 (decoded)
 const CHUNK_SIZE = 4 * 1024 * 1024; // upload-session chunk size
 
-const CONTENT_TYPES: Record<string, string> = {
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".csv": "text/csv",
-  ".html": "text/html",
-  ".htm": "text/html",
-  ".ics": "text/calendar",
-  ".json": "application/json",
-  ".xml": "application/xml",
-  ".pdf": "application/pdf",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".heic": "image/heic",
-  ".svg": "image/svg+xml",
-  ".zip": "application/zip",
-  ".gz": "application/gzip",
-  ".doc": "application/msword",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".xls": "application/vnd.ms-excel",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".ppt": "application/vnd.ms-powerpoint",
-  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  ".mp3": "audio/mpeg",
-  ".mp4": "video/mp4",
-  ".mov": "video/quicktime",
-};
-
-export function contentTypeForFile(filename: string): string {
-  return CONTENT_TYPES[path.extname(filename).toLowerCase()] ?? "application/octet-stream";
-}
+export { contentTypeForFile };
 
 /**
  * Upload a 3–25 MB file via an Outlook attachment upload session: 4 MB PUT
@@ -132,157 +118,58 @@ async function uploadViaSession(
 }
 
 /**
- * A source that has passed every check cheap enough to make before the draft is
- * verified (existence, scheme, size where it is knowable). `read` produces the
- * bytes, and may sharpen the content type with what the transfer revealed.
+ * Pre-flight a OneDrive source: resolve the item and check its size BEFORE the
+ * draft check, exactly as the other sources are pre-flighted; the bytes are
+ * only downloaded after the draft is verified.
  */
-type Prepared = {
-  name: string;
-  read: () => Promise<{ buffer: Buffer; contentType?: string }>;
-};
-
-type Preparation = { ok: true; source: Prepared } | { ok: false; message: string };
-
-/** Last path segment of a URL, as a filename. */
-function nameFromUrl(url: URL): string {
-  const segment = url.pathname.split("/").filter(Boolean).pop() ?? "";
-  let decoded = segment;
+async function prepareOneDriveSource(
+  rawPath: string,
+  overrideName?: string
+): Promise<SourcePreparation> {
+  const normalized = normalizeDrivePath(rawPath);
+  if (!normalized.ok) return { ok: false, message: normalized.message };
+  if (normalized.path === "") {
+    return { ok: false, message: "onedrive_path names the drive root, not a file." };
+  }
+  let item: any;
   try {
-    decoded = decodeURIComponent(segment);
-  } catch {
-    // keep the raw segment
+    item = await getDriveItemByPath(normalized.path);
+  } catch (err) {
+    if (isNotFound(err)) {
+      return {
+        ok: false,
+        message: `No OneDrive file at ${JSON.stringify(normalized.path)}. Find it with search_files or list_folder.`,
+      };
+    }
+    throw err;
   }
-  return decoded.replace(/[/\\:\0-\x1f]/g, "_").trim() || "download";
-}
-
-async function prepareFile(filePath: string, attachmentName?: string): Promise<Preparation> {
-  if (!path.isAbsolute(filePath)) {
-    return { ok: false, message: `file_path must be an absolute path, got: ${filePath}` };
+  if (item.folder !== undefined) {
+    return {
+      ok: false,
+      message: `${itemDisplayPath(item)} is a folder — attachments must be single files.`,
+    };
   }
-  let stat;
-  try {
-    stat = await fs.stat(filePath);
-  } catch {
-    return { ok: false, message: `File not found or unreadable: ${filePath}` };
-  }
-  if (!stat.isFile()) return { ok: false, message: `Not a regular file: ${filePath}` };
-  try {
-    await fs.access(filePath, fs.constants.R_OK);
-  } catch {
-    return { ok: false, message: `File exists but is not readable: ${filePath}` };
-  }
-  // Size guard BEFORE reading any bytes — a stat is enough to refuse oversize files.
-  if (stat.size > MAX_SIZE) {
+  const size = Number(item.size ?? 0);
+  if (size > MAX_FILE_SIZE) {
     return {
       ok: false,
       message:
-        `File is ${formatSize(stat.size)}, over this tool's 25 MB attachment cap. ` +
-        "Share large files another way (e.g. a cloud link pasted into the draft body).",
+        `${itemDisplayPath(item)} is ${formatSize(size)}, over this tool's 25 MB attachment cap. ` +
+        "Share it as a link instead (share_link) and paste the URL into the draft body.",
     };
   }
   return {
     ok: true,
     source: {
-      name: attachmentName ?? path.basename(filePath),
-      read: async () => ({ buffer: await fs.readFile(filePath) }),
-    },
-  };
-}
-
-/** A download that failed for a reason the caller can act on. */
-class ToolFetchError extends Error {}
-
-/**
- * Download the URL, refusing anything over the cap. The body is read chunk by
- * chunk and abandoned the moment it grows too large, so a server that lies
- * about (or omits) Content-Length cannot make this buffer 2 GB.
- */
-async function prepareUrl(rawUrl: string, attachmentName?: string): Promise<Preparation> {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return { ok: false, message: `Not a valid URL: ${rawUrl}` };
-  }
-  if (url.protocol !== "https:") {
-    return {
-      ok: false,
-      message: `url must be https:// (got ${url.protocol}//). Plaintext and local-file URLs are refused.`,
-    };
-  }
-
-  return {
-    ok: true,
-    source: {
-      name: attachmentName ?? nameFromUrl(url),
+      name: overrideName ?? item.name ?? "attachment",
       read: async () => {
-        const response = await fetch(url, { redirect: "follow" });
-        if (!response.ok) {
-          throw new ToolFetchError(
-            `Could not download ${url.href}: HTTP ${response.status} ${response.statusText}`
-          );
-        }
-        const declared = Number(response.headers.get("content-length") ?? "");
-        if (Number.isFinite(declared) && declared > MAX_SIZE) {
-          throw new ToolFetchError(
-            `That URL is ${formatSize(declared)}, over this tool's 25 MB attachment cap.`
-          );
-        }
-        const chunks: Uint8Array[] = [];
-        let total = 0;
-        const reader = response.body?.getReader();
-        if (reader) {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            total += value.length;
-            if (total > MAX_SIZE) {
-              await reader.cancel();
-              throw new ToolFetchError(
-                "That URL is over this tool's 25 MB attachment cap (the download was stopped)."
-              );
-            }
-            chunks.push(value);
-          }
-        } else {
-          const body = new Uint8Array(await response.arrayBuffer());
-          if (body.length > MAX_SIZE) {
-            throw new ToolFetchError(
-              `That URL is ${formatSize(body.length)}, over this tool's 25 MB attachment cap.`
-            );
-          }
-          chunks.push(body);
-        }
-        const header = (response.headers.get("content-type") ?? "").split(";")[0]?.trim();
+        const { bytes } = await downloadDriveItem(item.id);
         return {
-          buffer: Buffer.concat(chunks),
-          // The server's own type wins when it says anything specific; a generic
-          // octet-stream tells us nothing the filename does not.
-          ...(header && header !== "application/octet-stream" ? { contentType: header } : {}),
+          buffer: Buffer.from(bytes),
+          ...(item.file?.mimeType ? { contentType: item.file.mimeType } : {}),
         };
       },
     },
-  };
-}
-
-function prepareBase64(content: string, attachmentName?: string): Preparation {
-  const cleaned = content.replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
-    return { ok: false, message: "content_base64 is not valid base64." };
-  }
-  const buffer = Buffer.from(cleaned, "base64");
-  if (buffer.length === 0) return { ok: false, message: "content_base64 decoded to zero bytes." };
-  if (buffer.length > BASE64_MAX) {
-    return {
-      ok: false,
-      message:
-        `content_base64 decodes to ${formatSize(buffer.length)}, over the 3 MB limit for inline ` +
-        "content. Use url for anything larger (up to 25 MB).",
-    };
-  }
-  return {
-    ok: true,
-    source: { name: attachmentName ?? "attachment", read: async () => ({ buffer }) },
   };
 }
 
@@ -290,35 +177,38 @@ export async function addAttachmentHandler(
   input: z.input<typeof addAttachmentArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { draft_id, file_path, url, content_base64, attachment_name } =
+    const { draft_id, file_path, url, content_base64, onedrive_path, attachment_name } =
       addAttachmentArgs.parse(input);
 
     const given = [
       ["file_path", file_path],
       ["url", url],
       ["content_base64", content_base64],
+      ["onedrive_path", onedrive_path],
     ].filter(([, value]) => value !== undefined);
     if (given.length !== 1) {
       return errorResult(
         given.length === 0
-          ? "Give exactly one source: file_path (local server only), url, or content_base64."
+          ? "Give exactly one source: file_path (local server only), url, content_base64, or onedrive_path."
           : `Give exactly one source, not ${given.length} (${given.map(([n]) => n).join(", ")}).`
       );
     }
     if (file_path !== undefined && getStateStore()?.mode === "remote") {
       return errorResult(
         "file_path works only on the local (stdio) server: this hosted server has no access to " +
-          "your filesystem. Attach the file with url (an https link, up to 25 MB) or " +
-          "content_base64 (bytes inline, up to 3 MB) instead."
+          "your filesystem. Attach the file with url (an https link, up to 25 MB), " +
+          "content_base64 (bytes inline, up to 3 MB), or onedrive_path instead."
       );
     }
 
     const prepared =
       file_path !== undefined
-        ? await prepareFile(file_path, attachment_name)
+        ? await prepareFileSource(file_path, attachment_name)
         : url !== undefined
-          ? await prepareUrl(url, attachment_name)
-          : prepareBase64(content_base64!, attachment_name);
+          ? await prepareUrlSource(url, attachment_name)
+          : content_base64 !== undefined
+            ? prepareBase64Source(content_base64, attachment_name)
+            : await prepareOneDriveSource(onedrive_path!, attachment_name);
     if (!prepared.ok) return errorResult(prepared.message);
 
     const msg = await callGraphServer(
@@ -338,7 +228,7 @@ export async function addAttachmentHandler(
       buffer = loaded.buffer;
       contentType = loaded.contentType ?? contentTypeForFile(name);
     } catch (err) {
-      if (err instanceof ToolFetchError) return errorResult(err.message);
+      if (err instanceof SourceReadError) return errorResult(err.message);
       throw err;
     }
 

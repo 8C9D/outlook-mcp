@@ -1608,3 +1608,101 @@ depth, delete_folder, and MCP structured content.
   audit/activity rings can pick up [MCP TEST] entries during a local run (and the classifier's
   cleanup races can tick `err:filing:<date>`); after the final local run those were swept from KV
   and `llm:config` re-verified byte-identical to the captured pre-run value.
+
+## Batch 5 — OneDrive on both transports (v1.2.0)
+
+Recorded while executing the "Batch 5 — OneDrive tools" task on 2026-08-19. The Files.ReadWrite
+scope, re-consent, and KV re-seed were front-loaded by the orchestrator (commit 5656a33); nothing
+in this batch touched auth, the Entra registration, or the Claude Desktop config.
+
+### Live Graph drive semantics, probed on the real personal drive before any code
+
+- **`PUT …:/content` on an existing name REPLACES it by default, silently** — same item id, new
+  content (verified). This is why every upload path in `core/drive.ts` states
+  `@microsoft.graph.conflictBehavior` explicitly and why the tool-level default is `rename`:
+  the platform default would make an innocent-looking upload destroy a file. `rename` produces
+  "name 1.ext"; `fail` answers `409 nameAlreadyExists`.
+- **Upload by path auto-creates missing parent folders** (mkdir -p semantics) — so `upload_file`
+  needs no separate create-folder step and its description says folders are created.
+- **The recycle bin cannot be LISTED on a personal drive.** All four documented/likely shapes 400:
+  `/drives/{id}/recycleBin`, `/drives/{id}/recycleBin/items`, the same on beta, and
+  `/me/drive/special/recycleBin`. But **restore-by-id works**: after a soft `DELETE` the item GETs
+  404 yet `POST /items/{id}/restore` brings it back (id preserved). The suites therefore verify
+  "delete really is soft" by restoring, then purge with `permanentDelete` (which also works on
+  personal drives, POST → 204). Recycle-bin *presence* is thus proven indirectly; enumerating
+  the bin is recorded here as a genuine platform absence, not skipped silently.
+- **`createLink` defaults to `scope: "anonymous"` on a personal drive** (probed with no scope
+  field), and is idempotent per link type: view-then-view returns the same URL and the same
+  permission id. `DELETE /permissions/{id}` revokes; the owner permission remains and is filtered
+  out of `share_link list`'s link view.
+- **Search indexing lags, wildly variably.** A fresh file with a distinctive single-token name was
+  indexed (name AND content) in ~17 s in one probe; a two-word query for another fresh file found
+  nothing within 134 s in an earlier probe. The lifecycle test polls for up to 5 minutes and, if
+  the index still has not caught up, verifies the file's existence via `list_folder` (exact,
+  immediate) and records the miss as an observation instead of failing the run on Microsoft's
+  index. Tool guidance follows the same split: `search_files`' description says the index lags and
+  points at `list_folder` for current state.
+- **`$orderby=name` works on children; `$orderby=folder` does not** ("must evaluate to a single
+  value of primitive type") — folders-first ordering is client-side (`compareDriveChildren`),
+  offline-tested.
+- `GET /items/{id}/content` answers 302 to a pre-authenticated `my.microsoftpersonalcontent.com`
+  URL; Node fetch follows it and the existing `callGraphServerBytes` returns the bytes unchanged —
+  no new transport was needed. Drive upload sessions live on the same host and carry their own
+  token, so chunk PUTs are plain fetches, exactly like the mail-attachment session path.
+
+### Design decisions
+
+- **Six new tools rather than one mega-tool**, mirroring the mail surface's read/write split:
+  `search_files` / `list_folder` (read-only, structured), `read_file`, `upload_file`,
+  `manage_file` (move/rename/delete), `share_link` (create/list/revoke). Names: `list_folder`
+  (singular, OneDrive) vs the existing `list_folders` (mail tree) is unfortunate but explicit in
+  both descriptions; the brief fixed the names.
+- **Thresholds copied from the attachment machinery, deliberately**: text/JSON < 50 KB inline on
+  both transports; binaries to `~/Downloads/outlook-mcp-attachments/` locally and the existing
+  bearer-gated `/mcp/download/<id>` TTL-link mechanism remotely (18 MB link cap, 15-minute max);
+  25 MB hard cap and 3 MB base64 cap on every source. One shared module (`tools/file-sources.ts`)
+  now owns the three caller-supplied byte sources for add_attachment AND upload_file, so the two
+  cannot drift; the simple-PUT/upload-session split for OneDrive is at 4 MB (Graph's documented
+  simple-upload cap) versus 3 MB for message attachments (Outlook's).
+- **Structured content on the two new listing tools** (search_files, list_folder), following
+  Batch 4's approach and rules: permissive all-optional schemas, structuredContent on every
+  success path, asserted offline (o21/o22), over stdio (smoke: exactly seven tools with
+  outputSchema) and over Streamable HTTP (r28).
+- **Annotations.** search_files/list_folder read-only; read_file mirrors get_attachment
+  ([false,false,false,false] — it writes a disk file or KV record). Judgment calls, recorded:
+  `upload_file` is **destructive** because `overwrite: true` replaces an existing file's content —
+  the capability lives in the tool even though the default renames; `share_link` is **destructive
+  and open-world** — a created link opens the item to anyone with the URL, and revoke kills a URL
+  others may rely on, irreversibly (a later create issues a different URL); `manage_file` is
+  destructive like every delete-capable tool (soft deletes count, per the v10 rule).
+- **Path handling**: caller paths are normalized (backslashes → slashes, empty segments dropped,
+  "" and "/" mean root) and `.`/`..` segments are refused outright — a drive path names a
+  location, it does not navigate. Segments are `encodeURIComponent`-ed into the
+  `/me/drive/root:/path:/suffix` grammar (offline-tested, including `#` and spaces).
+- **`get_attachment save_to_onedrive` never overwrites** (conflict rename, no flag) — parking an
+  attachment must not eat an existing file; the numbered-copy note tells the model what happened.
+  `add_attachment onedrive_path` pre-flights the item (exists, is a file, ≤ 25 MB via the item's
+  own size) before the draft check, matching the established guard order, and never modifies the
+  OneDrive file.
+- **manage_file refuses collisions** on move/rename (Graph's 409 nameAlreadyExists surfaced as a
+  clear "nothing was overwritten" error) rather than passing a conflict behavior — renames and
+  moves should never destroy the thing already sitting at the destination.
+- **Remote coverage split (headless-first)**: r30 drives a full lifecycle with an access token
+  minted from the DEPLOYED KV refresh token via the Worker's own exchange (proving the deployed
+  credential chain covers Files.ReadWrite end to end, headlessly); r31 (testAuthed, SKIPs
+  headless) drives the same lifecycle through the deployed tools over Streamable HTTP, including
+  the bearer-gated binary download link. Sweeps in both live suites list the drive ROOT's children
+  for [MCP TEST] names (exact and current) rather than trusting the lagging search index, purge
+  with permanentDelete, and note that the unlistable recycle bin is covered by each test
+  restoring + permanently deleting its own soft-deleted items.
+
+### Found by the first live suite run (and fixed before the gate)
+
+- **The owner permission on a personal drive carries a bare `link` object of its own** (no `type`,
+  no scope) — so `share_link list` filters on `link.type`, which only real sharing links have;
+  filtering on the presence of `link` alone miscounted the owner as a revocable link (v13a's
+  first run caught it).
+- Search-lag data point from the same run: a file created inside a brand-new folder was still
+  unindexed after 306 s (the lifecycle test's 5-minute poll expired, took the documented
+  verify-via-list_folder path, and recorded the miss). The index appears far slower for items in
+  freshly created folders than for root-level files (~17 s in the probe).
