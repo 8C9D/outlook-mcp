@@ -758,3 +758,106 @@ RUN-REPORT.md, re-introducing what the history rewrite removed — redacted,
 amended, force-pushed (main `8056f29`, CI green). The pre-amend commit may
 linger unreferenced on GitHub until garbage collection; it contains only the
 owner's own low-sensitivity university alias.
+
+---
+
+## Batch 4 — Feature completions (v1.1.0) — 2026-08-19
+
+**Shipped (31 tools; both transports; deployed and tagged v1.1.0).**
+
+1. **Auto-filer feedback loop.** Corrections — the user re-filing a message the
+   filer moved — are detected by reconciling recent audit-log moves against
+   each message's current parentFolderId (runs at the top of every accepted
+   notification delivery, before that delivery is classified, and on the
+   6-hourly upkeep cron; rationale vs. per-folder subscriptions in
+   ASSUMPTIONS "Batch 4"). A correction becomes a sender→folder preference in
+   KV (`llm:prefs`); preferences are consulted BEFORE the model — a hit files
+   (or deliberately leaves in the Inbox) with NO Anthropic call and is audited
+   with `source: "preference"` and no model/usage fields; repeat corrections
+   mark a preference standing; the OTP/protected skip list outranks
+   preferences in both directions (never acted on, never learned from).
+   `manage_auto_filing` gained `list_preferences` / `remove_preference`.
+   Boundary intact: `core/corrections.ts` sits inside the classifier-side
+   fence; the `ClassifierMailbox` port grew two READ methods (`getFolder`,
+   `findByConversation`) and still has exactly two mutations (move,
+   categorize) — o15/v9a pin it.
+   **Live bug found and fixed by the e2e's first run:** the user's own
+   correction move mints the message a NEW id (the watched one 404s —
+   verified), so the reconciler now records `conversationId` (stable across
+   moves) and re-finds the message through it, skipping same-conversation
+   copies in never-file folders (the Sent Items copy of self-sent mail).
+2. **Search depth.** `search_mail` (both modes, get_latest included) gained
+   `date_from`/`date_to` (America/Toronto calendar dates), `has_attachments`,
+   and `all_folders`. Graph semantics derived live and recorded: `$search`
+   combines with neither `$filter` nor `$orderby`, so query-mode filters ride
+   inside the KQL (`received>=`, `hasattachments:`), day-widened, with the
+   exact Toronto boundary enforced client-side; latest mode uses exact
+   server-side `$filter` with receivedDateTime leading (a hasAttachments-only
+   filter is InefficientFilter — sentinel date clause added). Defaults
+   unchanged.
+3. **`delete_folder`.** Verified live first: Graph's folder DELETE on a
+   personal account is PERMANENT (404 immediately, nothing in Deleted Items,
+   contents gone), so the tool never issues it — the soft delete is a folder
+   MOVE into Deleted Items (verified recoverable, id stable). Guards:
+   well-known folders always refused (matched by id via one $batch — consumer
+   mailFolder has no wellKnownName property); subfolders always refused;
+   non-empty refused without `force`; `force` moves the messages (≤500,
+   $batch) into Deleted Items first and the result says so. Annotated
+   destructive.
+4. **Structured output.** `search_mail`, `list_folders`, `list_events`,
+   `list_tasks`, `get_health` return `structuredContent` beside the same text
+   and advertise an `outputSchema` (SDK 1.30.0 native support; the SDK
+   requires structuredContent on every non-error result and validates it, so
+   every success path attaches it and schemas are permissive by rule —
+   all-optional, unknown-key tolerant, asserted in o21). Identical on both
+   transports via the shared registry.
+
+**Suites (final runs, after all changes).** typecheck green (both tsconfigs);
+`test:offline` **21/21** (was 17 — new: o18 preference matching/fast path, o19
+correction detection incl. the id-invalidation recovery case, o20 search query
+building/boundaries, o21 delete_folder guard matrix + structured-content
+contract); `test:tools` **51/51, 1 designed SKIP (v9e)** (was 49 — new: v12a
+search filters live, v12b delete_folder live; stdio smoke extended: 31 tools,
+outputSchema on exactly the five over the wire, a live tools/call whose
+structuredContent agrees with its text); `test:remote` **29/29 headless, 15
+auth-gated SKIPs** (was 27 — new: r28 structured content over Streamable HTTP
+(authed), r29 the feedback e2e, headless).
+
+**Feedback-loop e2e evidence (r29, headless, against the deployed Worker's
+real webhook — no temporary route needed since reconciliation runs on every
+delivery):**
+
+    probe 1: moved → Records/Finance by llm (model claude-haiku-4-5-20251001, 788/46 tokens)
+    probe 2: moved → [MCP TEST] Correction Target 07663b by preference —
+             filed by preference for arthur.yuhao.zhang@outlook.com
+             (learned from 1 correction); no model call
+
+r29 asserts probe 2's audit entry has `source: "preference"` and NO
+`model`/`usage` fields (the no-API-call proof), that the correction itself is
+audited, that the preference is in `llm:prefs`, and that Graph shows the
+message in the corrected folder; `llm:config` and `llm:prefs` restored
+byte-exact in a `finally`, probes and folders purged, r20's sweep extended to
+fail on leftover test preferences or folders.
+
+**Live-filer interference, found and fixed in the harness.** With filing
+genuinely ON (the owner's real state), the local suite's send-to-self probes
+can be filed out of the inbox before the harness's poll sees them — it
+happened this run ("[MCP TEST] v2" → "Dev" at 0.85; tests b/b2/c and v5a
+failed once). Local probes now carry `FILER_SHIELD` ("verification code
+probe"), which matches the compiled-in protected-subject list, so the
+deployed filer deterministically skips them; remote probes deliberately
+don't. Suites green on the rerun.
+
+**State.** `llm:config` verified byte-identical to the captured pre-run value
+(`{"filingEnabled":true,"digestEnabled":true,"threshold":0.8,"skipPatterns":[],"dailyCallCap":200}`
+— filing + digest remain ON); `llm:prefs` restored to its pre-run absence;
+zero [MCP TEST] artifacts in the mailbox, folders, rules, KV rings and audit
+log (local sweep i., remote r20, plus a manual post-run sweep of the deployed
+rings for entries the local run's probes left); the test-caused
+`err:filing:2026-08-19` counter (two 404-on-move races from probe cleanup)
+removed.
+
+**Release.** Deployed to the Worker (`/health` → 1.1.0) before the remote
+suite (r26 enforces the version match); version 1.1.0 in package.json and
+core/version.ts; annotated tag `v1.1.0` pushed; CI (typecheck + offline tier)
+green on the final commit.

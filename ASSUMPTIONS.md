@@ -1462,3 +1462,149 @@ the packaging decisions, and the public release.
   Annotated tag `v1.0.0` on the release commit, pushed.
 - Suites after all changes: typecheck green; `test:offline` 17/17; `test:tools` 49/49 (1 designed
   skip); `test:remote` headless 27/27 (14 auth-gated skips). `llm:config` untouched.
+
+## Batch 4 — feature completions (v1.1.0)
+
+Recorded while executing the "Batch 4" task on 2026-08-19: the auto-filer's feedback loop, search
+depth, delete_folder, and MCP structured content.
+
+### Correction detection: reconciliation, not events — and where it runs
+- **Mechanism chosen: periodic reconciliation of the audit log against reality.** Recent "moved"
+  audit entries (the filer's own moves, which since this batch record `folderId`, `newMessageId` and
+  `sender`) are compared against each message's CURRENT `parentFolderId`; a mismatch is the user's
+  correction. The alternative — change-notification subscriptions on destination folders — was
+  rejected: it needs one Graph subscription per folder (against a per-mailbox cap, each with its own
+  clientState/renewal lifecycle), and it still cannot see a move between two folders that carry no
+  subscription. Reconciliation is one bounded read per watched move, transport-agnostic, and can only
+  see a correction late, never miss it.
+- **It runs where the filer runs, on the filer's own triggers**: at the top of every accepted
+  notification delivery (BEFORE that delivery's messages are classified — so a correction is learned
+  before the very next message from that sender is filed, and the remote e2e can drive the whole loop
+  through the production webhook with no test-only route), and on the 6-hourly upkeep cron ticks for
+  quiet stretches. **No temporary route was needed for the e2e** — r29 sends a second probe and the
+  probe's own delivery performs the reconcile, exactly as production does.
+- Bounds: only entries younger than 72 h (`RECONCILE_WINDOW_MS`) are watched, at most 20 message
+  reads per pass; an entry still in place after 24 h (`CONFIRM_AFTER_MS`) is marked `confirmed` and
+  never re-read. Terminal marks on the audit entry (`confirmed` / `corrected` / `gone` / `ignored`)
+  are what stop re-checking; the ring is read once and written once per pass (same unlocked
+  read-modify-write caveat as every ring buffer here — accepted at single-mailbox scale).
+- **What does NOT teach a preference**: a message that vanished (deleted, or its folder was) — a
+  delete is not a filing choice; a move into any NEVER_FILE_INTO folder (Deleted Items, Junk, Sent,
+  …); and any message whose subject matches the protected (OTP/verification) patterns — the
+  compiled-in + configured skip list outranks the feedback loop in BOTH directions: the reconciler
+  refuses to learn from protected mail, and classifyAndFile checks the skip list BEFORE the
+  preference lookup, so a preference can never act on it either.
+
+### Preference schema and semantics
+- KV key `llm:prefs`: an array of `{sender, folderId, folderName, corrections, firstAt, lastAt}`,
+  capped at 200 entries (most-recently-touched kept), keyed on the sender's **bare email address,
+  lowercased** (`extractAddress` pulls it out of `Name <addr>` forms). Sender-exact rather than
+  domain-pattern: it is the signal the correction actually carries; pattern generalization was left
+  out rather than guessed at.
+- **A preference acts from the FIRST correction.** The user deliberately re-filing a message the
+  filer placed is an explicit instruction; making the filer repeat a known-wrong move until a second
+  correction arrives would be the feature ignoring its user (and the mandated e2e — one correction,
+  then a preference-filed second probe — assumes exactly this). "Repeated corrections … become a
+  standing preference" is therefore rendered as: a repeat correction to the same folder increments
+  `corrections` and marks the preference **standing** (`corrections >= 2`, shown by
+  `list_preferences`); a correction to a DIFFERENT folder replaces the preference and restarts the
+  count — the user's latest choice always wins.
+- **A correction back to the Inbox is itself a preference**: "leave this sender's mail alone". It is
+  stored like any other (folderId = the inbox's), and a hit logs `action: none, source: preference`
+  with no model call, rather than re-filing mail the user pulled back.
+- On every hit the target folder is re-validated (`getFolder`: still exists, not on NEVER_FILE_INTO);
+  a stale or unsafe preference falls through to the model instead of acting.
+- The audit `source` field ("llm" vs "preference") is the observable contract: preference decisions
+  carry NO `model`/`usage` fields and consume no budget — asserted offline (o18) and live (r29).
+- The classifier-side boundary holds: `core/corrections.ts` imports no Graph transport and acts only
+  through the same `ClassifierMailbox` port, which grew two READ methods — `getFolder` and
+  `findByConversation` — so the port is now "seven methods, still two mutating (move, categorize)".
+  o15/v9a walk the new module and pin the new method list.
+- **Found live by the first e2e run, then fixed: the user's correction move invalidates the very id
+  the reconciler was watching.** A Graph move mints a new message id and the old one 404s
+  immediately (probed directly). Without recovery the reconciler marked corrected messages "gone"
+  and learned nothing — in production as well as in the test, since real corrections are moves too.
+  Fix: `conversationId` (verified stable across moves) is now recorded on every filed move's audit
+  entry, and when the direct read misses, the message is re-found via `findByConversation`, keeping
+  only candidates with the same audit-truncated subject and skipping copies in never-file folders
+  (so the Sent Items copy of self-sent mail can never be mistaken for the filed one).
+
+### Search semantics (verified live on this mailbox, 2026-08-19)
+- `$search` combines with **neither** `$filter` (400 `SearchWithFilter`) nor `$orderby`. Query-mode
+  filters therefore ride INSIDE the KQL: `received>=YYYY-MM-DD`, `received<=YYYY-MM-DD` and
+  `hasattachments:true|false` all work in `$search` (probed individually and in AND-combinations).
+- KQL dates are day-granular in an unspecified timezone, so the KQL range is **widened one day each
+  way** and the exact America/Toronto boundary is enforced client-side on `receivedDateTime`
+  (`torontoMidnightUtc` tries the two possible offsets and asks Intl which one Toronto agrees with —
+  exact across DST, since Toronto's transitions happen at 02:00, never midnight). Query mode
+  over-fetches (up to 3× max_results, ≤100) before the exact post-filter, then slices.
+- `$filter` + `$orderby=receivedDateTime desc` works **only when receivedDateTime leads the filter**:
+  `hasAttachments eq true` alone earns `400 InefficientFilter`; prefixing a sentinel
+  `receivedDateTime ge 1900-01-01T00:00:00Z` clause fixes it (probed both ways). Latest mode's
+  filtering is exact server-side (UTC instants of the Toronto dates), with the same client-side
+  check kept as belt and braces.
+- `all_folders` maps to `/me/messages` (which includes Sent Items and Deleted Items — stated in the
+  schema and output); the default stays the single-folder path, so existing calls behave
+  identically. `date_from`/`date_to` are inclusive America/Toronto calendar dates (the mailbox's
+  documented timezone), `date_to` implemented as exclusive-next-midnight.
+
+### delete_folder: what Graph actually does, and the tool's honest shape
+- **Verified live (twice, with a 20 s consistency wait): `DELETE /me/mailFolders/{id}` on this
+  personal account is a PERMANENT delete.** The folder 404s immediately, nothing appears under
+  Deleted Items' childFolders, and a message that was inside is gone from `/me/messages` entirely.
+  The task brief's expectation ("Graph folder delete moves it to Deleted Items") is FALSE for
+  consumer mailboxes, so the tool **never issues that DELETE**. The soft delete is
+  `POST /me/mailFolders/{id}/move {destinationId: "deleteditems"}` — verified: the folder keeps its
+  id, lands under Deleted Items with its contents intact and reachable. The tool description states
+  all of this.
+- Guards, in order: well-known folders always refused — matched **by id** against the eleven
+  well-known names resolved in ONE `$batch` request (consumer mailFolder has no `wellKnownName`
+  property — `$select`ing it 400s, verified; and eleven parallel GETs drew per-mailbox 429s in the
+  first live run, hence the batch); subfolders always refused, force or not (no folder tree in one
+  call); non-empty refused without `force`; `force` moves the messages (≤500, batched 20 per
+  `$batch`) into Deleted Items FIRST — individually visible there, not buried in the deleted folder
+  — and the result says so; if any message move fails the folder is NOT deleted.
+- Annotated destructive (a soft delete still counts, per the v10 rule), not idempotent, closed-world.
+
+### Structured content: SDK mechanics and the permissive-schema rule
+- SDK 1.30.0's `registerTool` accepts `outputSchema` (zod raw shape) and serves it as JSON Schema in
+  `tools/list`; handlers return `structuredContent` beside `content`. Two SDK behaviors shaped the
+  implementation: the server **requires** structuredContent on every non-error result of a tool that
+  declares an outputSchema (a miss becomes a protocol error, not an isError result — so every
+  success path, including "no results" and "no report yet", attaches it), and it validates the
+  payload against the schema server-side. Schemas are therefore **permissive by rule**: every field
+  optional, arrays of `z.looseObject`s, unknown keys tolerated — o21 asserts each schema accepts
+  both `{}` and unknown keys, so a schema-validating client can never see a previously-working call
+  fail.
+- Scope: the five tools whose answers are data a client might render — search_mail, list_folders,
+  list_events, list_tasks, get_health. The rest are prose-shaped confirmations and stay text-only.
+  isError results deliberately carry no structuredContent (the SDK exempts them). Both transports
+  serve identical schemas/payloads by construction (shared registry); asserted over stdio (smoke
+  test) and Streamable HTTP (r28).
+
+### Test-side notes
+- The remote feedback e2e (r29) is **fully headless**: config via KV write (capture → mutate →
+  restore byte-exact, the r24/r25/r20 pattern, now also applied to `llm:prefs`), probes drafted and
+  sent via local Graph (the same two-step draft-then-send), the DEPLOYED Worker doing all
+  classification off its real webhook. Threshold lowered to 0.5 for the run (the v9 finding: the
+  model is rightly warier of [MCP TEST]-marked subjects). The correction-target folder is
+  deliberately named nothing like a receipt folder, with a fallback B folder if the model ever picks
+  it. Self-sent probes mean the learned preference keys on the owner's own address — which is why
+  the e2e restores `llm:prefs` byte-exact in a `finally` and r20's sweep additionally fails if any
+  preference still points at a [MCP TEST] folder (removing it) or any [MCP TEST] folder survives.
+- v12a (search filters, live) polls `$search` for its probe rather than asserting immediately —
+  search indexing lags delivery by seconds-to-minutes; the `$filter` assertions need no poll.
+- **The live filer really does race the local harness — fixed with a shield, not a retry.** With
+  auto-filing genuinely enabled on the deployed Worker (the owner's real state, threshold 0.8), a
+  local-suite send-to-self probe ("[MCP TEST] v2") was classified at 0.85 and filed out of the inbox
+  seconds after delivery, timing out the harness's inbox poll (tests b/b2/c, and v5a's delta probe
+  the same way). Earlier runs got lucky (the model chose no action on test-marked mail); this run it
+  didn't. Fix: every send-to-self probe in the LOCAL suite now carries `FILER_SHIELD` — the phrase
+  "verification code probe", which matches the auto-filer's compiled-in protected-subject list — so
+  the deployed filer skips them before any model call, deterministically. Test b asserts the phrase
+  still matches `isProtectedSubject`, so the shield cannot silently rot. Remote probes (r25, r29)
+  deliberately do NOT carry it: being classified is their point.
+- Deployed-KV hygiene beyond r20: the local suite's probes transit the real inbox, so the DEPLOYED
+  audit/activity rings can pick up [MCP TEST] entries during a local run (and the classifier's
+  cleanup races can tick `err:filing:<date>`); after the final local run those were swept from KV
+  and `llm:config` re-verified byte-identical to the captured pre-run value.
