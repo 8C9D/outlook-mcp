@@ -397,7 +397,7 @@ exactly as the suite prescribes; rotation confirmed on the next run.
   orchestrator's env-overridable deadline (30 min for gate runs). The flow
   under test was not modified.
 
-## Batch C — Webhook intelligence, the paid batch (v0.9.0) — IMPLEMENTED; GATE BLOCKED (stop-and-report)
+## Batch C — Webhook intelligence, the paid batch (v0.9.0) — PASSED (gate closed 2026-08-19; blocked stop-and-report below kept for the record)
 
 **Front-loaded steps completed.** The user confirmed the Anthropic API cost
 (~single-digit $/month at Haiku pricing) and uploaded ANTHROPIC_API_KEY via
@@ -465,6 +465,45 @@ reset — e.g. tomorrow):**
   Complete the device-code sign-in within 15 minutes of the ACTION REQUIRED
   line. Expected: 27/27. r25 enables auto-filing via the tool, verifies the
   classification and audit log, then disables it and cleans up.
+
+**GATE CLOSED — 2026-08-19.**
+- Remote suite **25/25, all live, zero skips** — the full surface including
+  r6 (interactive device-code sign-in against production) and r25 (the
+  tool-driven enable → classify → verify-move → audit → disable end-to-end:
+  a live probe classified `moved → Records/Finance` at 0.75 by
+  claude-haiku-4-5-20251001, the move confirmed in the mailbox, the audit
+  surfaced by get_auto_filing_log, filing off again, sweep clean). Local
+  harness re-run the same day: **45/45** (1 designed SKIP). The "expected
+  27/27" above overcounted; the suite is 25 tests, r1–r25.
+- **Password-change recovery is now a tested procedure.** Between the block
+  and the closure the account password was changed (revoking every Microsoft
+  refresh token, local and KV) and an authenticator app enrolled. Recovery
+  ran exactly as the README prescribes: `npm run login` then `npm run
+  seed:kv`; the re-seed was then proven live *before* the gate by forcing
+  one remote refresh through the public notification endpoint (a delivery
+  authenticated by the subscription's clientState makes the enricher mint a
+  Graph token) and watching `ms:refresh_token` rotate in KV
+  (cfc64c50cb59… → 382d3b854bc2…); r12 re-proved rotation from that same
+  token during the suite. The claude.ai↔Worker OAuth grants survived the
+  password change untouched, as designed.
+- r25's first two live runs each exposed a test-side verification bug —
+  the feature itself behaved correctly both times: (1) the folder check
+  matched the Sent Items copy of the self-sent probe instead of the filed
+  copy (both live outside the inbox); (2) nested filing folders are
+  audit-named `Parent/Child` while Graph's displayName is the leaf alone,
+  so `Records/Finance` failed a straight equality check against `Finance`.
+  Both fixed in test-remote.ts (exclude Sent Items; compare per segment,
+  parent included). No product code changed for the gate.
+- Sign-in friction, recorded for next time: the authenticator number-match
+  push expires ~40 s after "Send request", and delivery to the phone often
+  loses that race — five pushes across three suite runs timed out before
+  one registered instantly. What worked: the owner keeping Authenticator
+  foregrounded and re-requesting the push while primed. A passkey would
+  remove the race entirely (recommendation from the previous run stands).
+- Both LLM features verified DISABLED on the deployed Worker after the run:
+  `llm:config` absent from KV (the shipped default, both off) — r24 proved
+  the deployed state before r25 touched it and the final sweep proved the
+  restore.
 
 ## Final report — extension run 2 (ended at the Batch C gate)
 

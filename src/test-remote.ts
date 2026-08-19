@@ -1110,19 +1110,40 @@ await testAuthed("r25. end-to-end: auto-filing classifies a notified message, th
     assert(decision.folder, "a move was audited without naming a folder");
 
     // The move really happened, and not into a folder the allowlist excludes.
+    // A probe sent to self exists twice: the Sent Items copy (which never
+    // moves) and the delivered copy the classifier filed — only a copy outside
+    // both well-known folders can be the filed one.
     const filed = await callGraphServer(
       `/me/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,parentFolderId`
     );
     const inbox = await callGraphServer("/me/mailFolders/inbox?$select=id");
-    const received = (filed?.value ?? []).filter((m: any) => m.parentFolderId !== inbox.id);
-    assert(received.length > 0, "the probe is still in the inbox — no move took place");
-    const folder = await callGraphServer(
-      `/me/mailFolders/${encodeURIComponent(received[0].parentFolderId)}?$select=displayName`
+    const sent = await callGraphServer("/me/mailFolders/sentitems?$select=id");
+    const received = (filed?.value ?? []).filter(
+      (m: any) => m.parentFolderId !== inbox.id && m.parentFolderId !== sent.id
     );
+    assert(received.length > 0, "the probe is still in the inbox — no move took place");
+    // The audit names nested folders as "Parent/Child" (the filing allowlist
+    // convention); Graph's displayName is the leaf alone, so compare per
+    // segment — leaf against the folder, parent (if any) against its parent.
+    const folder = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(received[0].parentFolderId)}?$select=displayName,parentFolderId`
+    );
+    const segments = String(decision.folder).split("/");
+    const leaf = segments[segments.length - 1];
     assert(
-      folder.displayName === decision.folder,
+      folder.displayName === leaf,
       `the audit log says ${decision.folder} but the message is in ${folder.displayName}`
     );
+    if (segments.length > 1) {
+      const parent = await callGraphServer(
+        `/me/mailFolders/${encodeURIComponent(folder.parentFolderId)}?$select=displayName`
+      );
+      assert(
+        parent.displayName === segments[segments.length - 2],
+        `the audit log says ${decision.folder} but the message is in ` +
+          `${parent.displayName}/${folder.displayName}`
+      );
+    }
     assert(
       !NEVER_FILE_INTO.includes(String(folder.displayName).toLowerCase()),
       `the classifier filed into ${folder.displayName}, which is on the never-file list`
