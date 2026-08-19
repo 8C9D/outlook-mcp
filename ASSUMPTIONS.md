@@ -1291,3 +1291,114 @@ stdio smoke test additionally asserts the version the server reports over `initi
 - Live filer during the local suite: its probes were classified but produced no action
   (below threshold / model chose none), so the local tests are undisturbed by the enabled
   filer; the two test-marked audit entries were swept afterwards.
+
+## Batch 2 — Operational maturity (v0.11.0)
+
+Recorded while executing the "Batch 2" task on 2026-08-19: self-monitoring, rules backup, CI, and
+their tests.
+
+### Health-check cron: schedule and dispatch
+- **`37 13 * * *`** (daily). 13:37 UTC is 09:37 Toronto in EDT and 08:37 in EST — always morning for
+  the owner, after the digest ticks (11:00/12:00 UTC), and colliding with none of the upkeep ticks
+  (minute 17 of hours 5/11/17/23 UTC). Unlike the digest it has no wall-clock meaning to preserve, so
+  the DST drift of a fixed UTC hour is irrelevant and one schedule suffices.
+- Dispatched on `event.cron === HEALTH_CRON` rather than the Toronto hour: the hour-based guard exists
+  only because the digest needs the same local hour across DST, and adding a third hour-dispatched job
+  would have entangled the two. The remaining ticks keep the existing hour dispatch unchanged.
+
+### The health check itself (core/health.ts)
+- Five checks, in failure-domain order: KV round-trip (a probe value put and read back, 5-minute TTL),
+  a **forced refresh-token rotation** (`refreshMailboxToken` on the Worker — a real exchange, with the
+  rotated token persisted first, exactly the steady-state path), the subscription named by `sub:mail`
+  alive in Graph with a future expiry, and the two LLM error counters. Every dependency (store, Graph
+  transport, rotation, drafting, clock, threshold) is injectable, which is what makes each failure mode
+  unit-testable offline (o1–o7) and lets the remote e2e (r27) run the REAL checks from Node.
+- **The alert is a DRAFT created directly in the inbox** (`POST /me/mailFolders/inbox/messages`,
+  `isDraft: true`, addressed to the owner), never sent — `send_draft` remains the only send path in the
+  repo. Subject `outlook-mcp health: <failing checks>`; body carries per-check detail, "since when"
+  (carried forward from the previous heartbeat so a persistent failure keeps its original start time),
+  and a fix pointer per check (re-seed procedure for token failures; `wrangler tail` /
+  `get_auto_filing_log` for the rest). The draft is created BEFORE the heartbeat is written, so a dead
+  KV — whose heartbeat write would fail — still produces the one signal it can.
+- Healthy runs write only the heartbeat (`health:last`: timestamp, verdict, per-check results). No
+  draft dedupe beyond the daily cadence: at most one draft per day while failing was judged the right
+  amount of noise for a personal mailbox, and a deleted-but-unfixed alert resurfaces next morning.
+- **Error counters** (`err:filing:<toronto-date>`, `err:digest:<toronto-date>`, JSON
+  {count, firstAt, lastAt, lastReason}, 2-day TTL — the same per-Toronto-day + TTL design as the API
+  budget): incremented by `recordFeatureError` in exactly the paths that swallow failures — the
+  classifier's Anthropic-call catch and its outer catch, and the digest's equivalents. The recorder
+  itself never throws (counting an error must not cause one), and it lives in `core/auto-filing.ts`
+  because the classifier's import boundary (v9a/o15) forbids it from reaching anything that can touch
+  Graph — `core/health.ts` imports the Graph transport and is asserted NOT reachable from the
+  classifier. Threshold: 5 per feature per Toronto day.
+- `get_health` is annotated fully read-only: it reads the heartbeat (remote) or performs two Graph GETs
+  (local). The KV probe and the draft belong to the cron. Local mode runs only what is honest locally —
+  silent sign-in and inbox access — and names the five remote-only checks instead of faking them.
+
+### Rules backup (manage_rules export / import)
+- Portable format `outlook-mcp-rules/1`: Graph's own field shapes (displayName, sequence, isEnabled,
+  conditions, exceptions, actions) plus the rule id for matching; volatile/read-only Graph fields are
+  dropped. Export always returns the JSON inline; the LOCAL transport also writes
+  `~/Downloads/outlook-mcp-attachments/inbox-rules-<toronto-date>.json` via the same `saveToDownloads`
+  path as export_message (the Worker has no filesystem and says so).
+- Import is **dry-run by default** (`apply: true` applies) and **never deletes**: matching is by rule id
+  first, then displayName case-insensitively (covers a deleted-and-recreated rule); live rules absent
+  from the backup land in a `liveOnly` list that both the dry-run and apply outputs print under an
+  explicit "import never deletes" heading. Updates are field-level PATCHes in place (id and sequence
+  preserved); creates POST with the backup's sequence.
+- **Forwarding discipline holds in both directions**: export records externally created forward rules
+  faithfully but warns; import refuses the whole backup while any entry carries
+  forwardTo/forwardAsAttachmentTo/redirectTo (empty arrays don't count). The create/update guards also
+  apply on the way in: no conditionless rule may be created or patched (it would match ALL mail), no
+  actionless rule created.
+- **Diff normalization**: keys sorted, null/empty values dropped, and `senderContains` values uppercased
+  before comparison — Graph stores them uppercased (a v4 finding), so without this a backup would diff
+  forever against the very rules it created. Asserted in o9.
+
+### The non-live tier split (npm run test:offline) and CI
+- A separate entry point (`src/test-offline.ts`, 17 tests) rather than an env flag: `test-tools.ts`
+  acquires a live token and reads the mailbox at module load, so flag-gating it would have meant
+  restructuring 4,000 lines for no gain. The tier's rule is stated in its header: no Graph, no MSAL
+  cache, no KV, no .env, no secrets — it deliberately does not import `src/auth.ts`, so a test that
+  accidentally reaches for Graph fails with AuthRequiredError instead of quietly needing a credential.
+- Contents: the health check's failure modes (o1–o7: healthy heartbeat, missing/expired/404
+  subscription, rotation failure, counters over threshold, KV unreachable, failingSince carry), the
+  rules-backup validation/diff (o8–o9), compact classifier fixtures + rails + digest offline (o10–o12,
+  including the new error-counter wiring), subscription upkeep and the webhook handshake against stubs
+  (o13–o14), the classifier import-boundary walk (o15), annotation-rule assertions (o16 — structural
+  rules only; the frozen per-tool table stays duplicated in test-tools.ts, a third copy would add drift
+  surface, not safety), and version sync (o17).
+- CI (`.github/workflows/ci.yml`): on push — checkout, Node 22, `npm ci`, `npm run typecheck`,
+  `npm run test:offline`. No live-mailbox tests, no secrets.
+- **CI validation method**: `act` is not installed on this machine, so the workflow was validated by a
+  fresh-tree simulation — `git add -A && git write-tree`, `git archive` of that tree into a scratch
+  directory (which, like a CI checkout, contains no .env, no .token-cache.json, no .dev.vars), then the
+  workflow's exact steps (`npm ci`, `npm run typecheck`, `npm run test:offline`) with AZURE_CLIENT_ID
+  and ANTHROPIC_API_KEY explicitly unset. All three steps passed (17/17). Local Node is 24 vs CI's 22;
+  nothing in the tier is version-sensitive beyond ES2022.
+
+### The live e2e (r27) and the gate heartbeat
+- r27 is headless-runnable by design, which is also how the gate's "real heartbeat" was produced: the
+  transport-agnostic `runHealthCheck` runs from Node with a wrangler-backed StateStore over the deployed
+  `OUTLOOK_KV`, the local-MSAL Graph transport, and a REAL forced rotation of the KV refresh token (the
+  same exchange the Worker performs, rotated token written back first; the consented scope list is
+  mirrored in the test with a comment, since `src/worker/ms-token.ts` cannot be imported into the Node
+  tsconfig without dragging in workerd's conflicting type universe).
+- Flow: capture `sub:mail` byte-exact → overwrite its id with `MCPTEST-bogus-<hex>` (the [MCP TEST]
+  marking of the forced state; r20's sweep asserts no MCPTEST remains in the record) → run the checks →
+  subscription fails, the other four pass live → the alert draft verified via Graph (isDraft, in the
+  INBOX, addressed to the owner, subject/body content) → restore and permanently delete the draft in a
+  `finally` → verify the restored record names a live Graph subscription → run the checks AGAIN, all
+  green, and assert the healthy heartbeat is the one in deployed KV.
+- Restore-race handling: if a concurrent upkeep rewrote `sub:mail` while the bogus record was in place
+  (possible only if the 6-hourly cron ticks during the ~1-minute window — no authed MCP requests happen
+  during r27), the racer's fresh record is kept instead of clobbered; the liveness assertion covers both
+  outcomes.
+- The bogus-id subscription check fails on Graph's 400 (malformed id) rather than a 404 — the check
+  treats any GraphError on the GET as "not live", which is the honest reading (it cannot be verified).
+
+### Docs/versioning
+- `package.json` and `src/core/version.ts` → **0.11.0**; deployed and verified via `/health` and r26.
+- Tool count 29 → 30 everywhere it is stated (README header/architecture/annotations table/Claude
+  Desktop note, stdio smoke test, offline annotation test); `get_health` added to the frozen annotation
+  table in test-tools.ts as read-only.

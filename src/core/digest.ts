@@ -16,6 +16,7 @@ import {
   appendAudit,
   readLastDigestDate,
   readLlmConfig,
+  recordFeatureError,
   reserveApiCall,
   writeLastDigestDate,
 } from "./auto-filing.js";
@@ -160,6 +161,9 @@ export async function runDailyDigest(context: DigestContext): Promise<DigestOutc
         err instanceof AnthropicError
           ? err.message
           : `Anthropic call failed: ${err instanceof Error ? err.message : String(err)}`;
+      // Swallowed (the cron has nobody to answer), so it also counts toward
+      // the error counter the daily health check reads.
+      await recordFeatureError(context.store, "digest", detail, now());
       return log({ drafted: false, reason: detail });
     }
 
@@ -185,10 +189,9 @@ export async function runDailyDigest(context: DigestContext): Promise<DigestOutc
 
     return { drafted: true, reason: "drafted", draftId, subject };
   } catch (err) {
-    return log({
-      drafted: false,
-      reason: `digest failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    const reason = `digest failed: ${err instanceof Error ? err.message : String(err)}`;
+    await recordFeatureError(context.store, "digest", reason, now());
+    return log({ drafted: false, reason });
   }
 }
 

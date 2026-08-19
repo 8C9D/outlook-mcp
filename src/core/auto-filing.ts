@@ -10,6 +10,7 @@ import {
   STATE_DIGEST_LAST,
   STATE_LLM_AUDIT,
   STATE_LLM_CONFIG,
+  errorCounterKey,
   llmBudgetKey,
 } from "./kv-keys.js";
 import { readJson, writeJson, type StateStore } from "./state.js";
@@ -216,6 +217,57 @@ export async function reserveApiCall(
 /** Today's call count without reserving anything (for manage_auto_filing status). */
 export async function readApiCallsToday(store: StateStore, today: string): Promise<number> {
   return Number((await store.get(llmBudgetKey(today))) ?? "0") || 0;
+}
+
+// ----------------------------------------------------------- error counters
+
+/**
+ * Errors one feature swallowed today. Both LLM features run in the background
+ * with nobody to return an error to, so their failure paths log-and-continue;
+ * this counter is what makes a run of such failures visible to the daily
+ * health check instead of only to someone reading `wrangler tail`.
+ */
+export type FeatureErrorRecord = {
+  count: number;
+  firstAt: string;
+  lastAt: string;
+  lastReason: string;
+};
+
+/**
+ * Count one swallowed error against today's counter. Keyed on the
+ * America/Toronto date (like the API budget) with a two-day TTL, so counters
+ * clean themselves up and the health check always reads "errors today".
+ * Never throws: counting an error must not be able to cause one.
+ */
+export async function recordFeatureError(
+  store: StateStore,
+  feature: "filing" | "digest",
+  reason: string,
+  when: Date = new Date()
+): Promise<void> {
+  try {
+    const key = errorCounterKey(feature, torontoDateOf(when));
+    const existing = await readJson<FeatureErrorRecord>(store, key);
+    const record: FeatureErrorRecord = {
+      count: (existing?.count ?? 0) + 1,
+      firstAt: existing?.firstAt ?? when.toISOString(),
+      lastAt: when.toISOString(),
+      lastReason: reason.replace(/\s+/g, " ").trim().slice(0, 300),
+    };
+    await store.put(key, JSON.stringify(record), { ttlSeconds: 2 * 24 * 3600 });
+  } catch {
+    // Deliberately swallowed; see above.
+  }
+}
+
+/** Today's swallowed-error record for one feature, or null when none. */
+export async function readFeatureErrors(
+  store: StateStore,
+  feature: "filing" | "digest",
+  torontoDate: string
+): Promise<FeatureErrorRecord | null> {
+  return readJson<FeatureErrorRecord>(store, errorCounterKey(feature, torontoDate));
 }
 
 // ------------------------------------------------------------- audit trail

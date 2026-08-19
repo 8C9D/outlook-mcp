@@ -123,6 +123,7 @@ import {
   manageAutoFilingHandler,
   manageAutoFilingSchema,
 } from "../tools/manage-auto-filing.js";
+import { getHealthDescription, getHealthHandler, getHealthSchema } from "../tools/get-health.js";
 import { registerPrompts } from "./prompts.js";
 import { registerResources } from "./resources.js";
 import type { ZodRawShape } from "zod";
@@ -399,6 +400,15 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: getAutoFilingLogSchema,
     annotations: READ_ONLY,
     handler: getAutoFilingLogHandler,
+  },
+  {
+    name: "get_health",
+    description: getHealthDescription,
+    inputSchema: getHealthSchema,
+    // Reads the stored heartbeat (remote) or performs Graph GETs (local); the
+    // KV probe and the alert draft belong to the CRON, not to this tool.
+    annotations: READ_ONLY,
+    handler: getHealthHandler,
   },
 ];
 

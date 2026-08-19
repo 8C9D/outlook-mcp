@@ -39,12 +39,15 @@ import {
   KV_ACCESS_TOKEN,
   KV_REFRESH_TOKEN,
   STATE_ACTIVITY,
+  STATE_HEALTH,
   STATE_LLM_AUDIT,
   STATE_LLM_CONFIG,
   STATE_SUBSCRIPTION,
   deltaKey,
   downloadKey,
 } from "./core/kv-keys.js";
+import { runHealthCheck, type HealthReport } from "./core/health.js";
+import type { StateStore } from "./core/state.js";
 import {
   NEVER_FILE_INTO,
   readLlmConfig,
@@ -151,7 +154,7 @@ async function kvDelete(nsId: string, key: string): Promise<void> {
 }
 
 /** Write a KV value through a 0600 temp file rather than argv, as seed:kv does. */
-async function kvPut(nsId: string, key: string, value: string): Promise<void> {
+async function kvPut(nsId: string, key: string, value: string, ttlSeconds?: number): Promise<void> {
   const tmpFile = path.join(os.tmpdir(), `outlook-mcp-remote-${randomBytes(8).toString("hex")}`);
   await fs.writeFile(tmpFile, value, { mode: 0o600 });
   try {
@@ -165,10 +168,82 @@ async function kvPut(nsId: string, key: string, value: string): Promise<void> {
       "--namespace-id",
       nsId,
       "--remote",
+      ...(ttlSeconds ? ["--ttl", String(Math.max(60, Math.ceil(ttlSeconds)))] : []),
     ]);
     assert(code === 0, `wrangler kv key put ${key} failed: ${stderr}`);
   } finally {
     await fs.rm(tmpFile, { force: true });
+  }
+}
+
+/**
+ * The deployed Worker's KV namespace as a StateStore, driven through wrangler
+ * with the local Cloudflare credentials. This is what lets the health check —
+ * transport-agnostic by design — run its REAL checks headlessly from Node
+ * against the same storage the Worker's cron uses.
+ */
+function wranglerStateStore(nsId: string): StateStore {
+  return {
+    mode: "remote",
+    get: (key) => kvGet(nsId, key),
+    put: (key, value, options) => kvPut(nsId, key, value, options?.ttlSeconds),
+    delete: (key) => kvDelete(nsId, key),
+  };
+}
+
+/**
+ * A REAL forced refresh-token rotation against the token in the deployed KV —
+ * the same exchange src/worker/ms-token.ts performs, driven from Node. The
+ * rotated refresh token is written back before anything else so the Worker can
+ * never be locked out by this test.
+ */
+async function forcedKvTokenRotation(): Promise<void> {
+  const clientId = process.env.AZURE_CLIENT_ID;
+  assert(clientId, "AZURE_CLIENT_ID is not set (auth.ts loads it from .env)");
+  const refreshToken = await kvGet(outlookNs, KV_REFRESH_TOKEN);
+  assert(refreshToken, `no ${KV_REFRESH_TOKEN} in KV — run npm run seed:kv`);
+
+  // Exactly the consented scope set, offline_access first — mirrors
+  // MAILBOX_SCOPES in src/worker/ms-token.ts (a Worker-only module this Node
+  // suite cannot import without dragging in the workerd type universe).
+  const scope = [
+    "offline_access",
+    "User.Read",
+    "Mail.Read",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "Contacts.ReadWrite",
+    "MailboxSettings.ReadWrite",
+    "Tasks.ReadWrite",
+  ].join(" ");
+
+  const response = await fetch(
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        scope,
+      }),
+    }
+  );
+  const payload = (await response.json().catch(() => ({}))) as {
+    access_token?: string;
+    refresh_token?: string;
+    error?: string;
+    error_description?: string;
+  };
+  if (!response.ok || !payload.access_token) {
+    throw new Error(
+      `Microsoft refused the refresh grant (HTTP ${response.status} ${payload.error ?? ""}: ${payload.error_description ?? "no detail"})`
+    );
+  }
+  if (payload.refresh_token && payload.refresh_token !== refreshToken) {
+    await kvPut(outlookNs, KV_REFRESH_TOKEN, payload.refresh_token);
   }
 }
 
@@ -1200,6 +1275,117 @@ await test("r26. the deployed Worker is running this checkout's version", async 
   );
 });
 
+// --------------------------------------------------- v11: the daily health check
+
+// Headless-runnable on purpose: core/health.js takes its store, Graph transport
+// and rotation as dependencies, so the REAL checks run from Node against the
+// deployed KV (via wrangler) and real Graph (via the local MSAL token) — the
+// same storage and mailbox the Worker's 13:37 UTC cron uses.
+await test("r27. e2e: a forced subscription failure drafts a health alert; the healthy rerun leaves a real heartbeat", async () => {
+  const store = wranglerStateStore(outlookNs);
+
+  const subBefore = await kvGet(outlookNs, STATE_SUBSCRIPTION);
+  assert(subBefore, "no subscription record in KV to force a failure against (r16 should have found one)");
+  const realRecord = JSON.parse(subBefore) as SubscriptionRecord;
+
+  // The forced state is [MCP TEST]-marked through its id, so a sweep (r20) can
+  // recognize a leftover if restoration ever failed.
+  const bogusId = `MCPTEST-bogus-${randomBytes(6).toString("hex")}`;
+  let alertDraftId: string | undefined;
+  try {
+    await kvPut(
+      outlookNs,
+      STATE_SUBSCRIPTION,
+      JSON.stringify({ ...realRecord, id: bogusId })
+    );
+
+    const failing = await runHealthCheck({
+      store,
+      refreshToken: forcedKvTokenRotation,
+    });
+    assert(!failing.healthy, "the health check called a bogus subscription healthy");
+    const sub = failing.checks.find((c) => c.name === "subscription");
+    assert(sub && !sub.ok, `the subscription check passed: ${JSON.stringify(failing.checks)}`);
+    assert(sub.detail.includes(bogusId), `the failure does not name the bogus id: ${sub.detail}`);
+    for (const name of ["kv", "token_refresh", "filing_errors", "digest_errors"] as const) {
+      const check = failing.checks.find((c) => c.name === name);
+      assert(check?.ok, `the ${name} check failed against the real deployment: ${check?.detail}`);
+    }
+    assert(failing.alertDraftId, `no alert draft was created: ${failing.alertError ?? "(no error)"}`);
+    alertDraftId = failing.alertDraftId;
+
+    // The draft is real, in the INBOX, addressed to the owner, and UNSENT.
+    const draft = await callGraphServer(
+      `/me/messages/${encodeURIComponent(alertDraftId)}?$select=isDraft,subject,parentFolderId,toRecipients,body`
+    );
+    assert(draft.isDraft === true, "the health alert is not a draft");
+    assert(
+      String(draft.subject).startsWith("outlook-mcp health: ") &&
+        String(draft.subject).includes("subscription"),
+      `alert subject: ${draft.subject}`
+    );
+    const inbox = await callGraphServer("/me/mailFolders/inbox?$select=id");
+    assert(draft.parentFolderId === inbox.id, "the alert draft is not in the inbox");
+    assert(
+      (draft.toRecipients ?? []).some(
+        (r: any) => String(r?.emailAddress?.address).toLowerCase() === ownAddress.toLowerCase()
+      ),
+      `the alert is not addressed to the owner: ${JSON.stringify(draft.toRecipients)}`
+    );
+    const body = String(draft.body?.content ?? "");
+    assert(body.includes("FAILING: subscription"), "the body does not name the failing check");
+    assert(/wrangler tail/.test(body), "the body carries no fix pointer");
+
+    // The rotation the check performed was real: the exchange succeeded against
+    // Microsoft, and KV still holds a working refresh token (proven again by
+    // the healthy rerun below, which rotates once more).
+  } finally {
+    // Restore the exact prior record — unless a racing upkeep rewrote it while
+    // the bogus record was in place, in which case the racer's fresh record is
+    // the correct current state and must be kept.
+    const current = await kvGet(outlookNs, STATE_SUBSCRIPTION);
+    const currentId = current ? (JSON.parse(current) as SubscriptionRecord).id : undefined;
+    if (currentId === bogusId || current === null) {
+      await kvPut(outlookNs, STATE_SUBSCRIPTION, subBefore);
+    }
+    if (alertDraftId) {
+      await callGraphServer(`/me/messages/${encodeURIComponent(alertDraftId)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => undefined);
+    }
+  }
+
+  // The record is back (byte-exact, or a racer's fresh one) and names a live subscription.
+  const restored = await poll("the subscription record to be restored", 60_000, 5_000, async () => {
+    const raw = await kvGet(outlookNs, STATE_SUBSCRIPTION);
+    if (!raw || raw.includes("MCPTEST")) return undefined;
+    return raw;
+  });
+  const restoredRecord = JSON.parse(restored) as SubscriptionRecord;
+  const live = await callGraphServer(
+    `/subscriptions/${encodeURIComponent(restoredRecord.id)}`
+  );
+  assert(live.id === restoredRecord.id, "the restored record names a subscription Graph does not have");
+
+  // The healthy rerun: all five checks green for real, no draft, and the
+  // heartbeat this batch's gate requires actually present in the deployed KV.
+  const healthy = await runHealthCheck({ store, refreshToken: forcedKvTokenRotation });
+  assert(
+    healthy.healthy,
+    `the healthy rerun still fails: ${JSON.stringify(healthy.checks.filter((c) => !c.ok))}`
+  );
+  assert(!healthy.alertDraftId, "a healthy run created an alert draft");
+
+  const heartbeatRaw = await poll("the heartbeat to land in KV", 60_000, 5_000, () =>
+    kvGet(outlookNs, STATE_HEALTH).then((raw) => raw ?? undefined)
+  );
+  const heartbeat = JSON.parse(heartbeatRaw) as HealthReport;
+  assert(heartbeat.healthy === true, `the stored heartbeat is unhealthy: ${heartbeatRaw}`);
+  assert(heartbeat.at === healthy.at, "the stored heartbeat is not this run's");
+  assert(heartbeat.checks.length === 5, `heartbeat carries ${heartbeat.checks.length} checks`);
+  console.log(`      heartbeat ${STATE_HEALTH}: healthy at ${heartbeat.at} (5/5 checks)`);
+});
+
 await test("r20. cleanup: the probe message, its notifications and the delta position are gone", async () => {
   // The mail itself: both copies, permanently (the tools only soft-delete).
   const messages = await callGraphServer(
@@ -1277,6 +1463,14 @@ await test("r20. cleanup: the probe message, its notifications and the delta pos
   assert(
     !leftoverAudit.some((entry) => String(entry.subject ?? "").includes(TEST_PREFIX)),
     "the audit log still holds entries this run created"
+  );
+
+  // The subscription record must not still carry r27's [MCP TEST]-marked
+  // bogus id — a leftover here would mean the health e2e failed to restore it.
+  const subRecord = (await kvGet(outlookNs, STATE_SUBSCRIPTION)) ?? "";
+  assert(
+    !subRecord.includes("MCPTEST"),
+    `the subscription record still carries the forced test state: ${subRecord}`
   );
 });
 

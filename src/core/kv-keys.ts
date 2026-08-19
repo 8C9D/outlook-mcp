@@ -36,6 +36,17 @@ export function llmBudgetKey(torontoDate: string): string {
   return `llm:budget:${torontoDate}`;
 }
 
+/** The latest health-check report: timestamp, verdict, per-check results. */
+export const STATE_HEALTH = "health:last";
+
+/** The throwaway value the health check round-trips to prove KV is reachable. */
+export const HEALTH_PROBE_KEY = "health:probe";
+
+/** Errors one LLM feature swallowed on one America/Toronto calendar day. */
+export function errorCounterKey(feature: "filing" | "digest", torontoDate: string): string {
+  return `err:${feature}:${torontoDate}`;
+}
+
 /** Prefix of the short-lived attachment downloads get_attachment hands out. */
 export const DOWNLOAD_PREFIX = "dl:";
 

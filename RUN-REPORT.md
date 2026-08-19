@@ -649,3 +649,56 @@ Auto-filing STAYS enabled. Remote suite made state-aware of an
 enabled-by-choice deployment (r24/r25/r20) and re-run green: remote 26/26
 headless, local 47/47. Review `get_auto_filing_log` after a few days and tune
 the threshold only if the audit shows misfiles.
+
+## Batch 2 — Operational maturity (v0.11.0) — PASSED (2026-08-19)
+
+**Shipped.** (1) **Self-monitoring**: a fourth cron, daily at `37 13 * * *`
+(09:37/08:37 Toronto across DST, colliding with no existing tick), runs
+`core/health.ts` — KV round-trip, a FORCED refresh-token rotation, the
+`sub:mail` subscription's liveness in Graph, and two new per-Toronto-day
+error counters (`err:filing:<date>` / `err:digest:<date>`, incremented where
+the classifier and digest swallow failures, 2-day TTL, threshold 5). Healthy
+runs write only the `health:last` heartbeat; any failing check also leaves an
+UNSENT draft in the inbox ("outlook-mcp health: <checks>", what/since
+when/fix pointers) — created directly in the inbox, never sent. New
+`get_health` tool on BOTH transports (30 tools now, fully annotated,
+read-only): heartbeat on the hosted server, honest local checks + named
+remote-only checks on stdio. (2) **Rules backup**: `manage_rules export`
+(portable `outlook-mcp-rules/1` JSON inline, plus a dated local file on
+stdio) and `import` (dry-run diff by default — field-level updates, creates,
+and a "live but not in the backup" list that is NEVER deleted; `apply: true`
+to apply; forwarding rules refused on import). (3) **CI**:
+`.github/workflows/ci.yml` runs `npm ci` → `typecheck` → `test:offline` on
+push; the new `npm run test:offline` tier (17 tests) is exactly the
+credential-free set — health failure modes, rules diff, classifier/digest
+fixtures, upkeep + handshake against stubs, boundary/annotation/version
+assertions. No `act` on this machine, so the workflow was validated by a
+fresh-tree simulation (git write-tree → git archive into scratch, no
+.env/token cache, credentials unset, exact steps run — all green).
+
+**Suites.** typecheck green; local `test:tools` **49/49** (1 designed skip,
+v9e); remote `test:remote` **27/27 headless (14 auth-gated skips)** — new
+r27 is the headless-runnable live e2e: `sub:mail` captured byte-exact, id
+overwritten with `MCPTEST-bogus-…`, the REAL checks run from Node against
+deployed KV + Graph (including a real KV refresh-token rotation), the alert
+draft verified via Graph (isDraft, in the INBOX, addressed to the owner,
+names the failing check and the fix), then restore, permanent-delete of the
+draft, and a healthy rerun; offline `test:offline` **17/17** (also 17/17
+inside the CI simulation). `npm run deploy` done — `/health` reports 0.11.0
+(version id 33902578-4595-443a-a84c-e7d7c586f10a), all four cron triggers
+registered.
+
+**Heartbeat evidence.** `health:last` in the deployed OUTLOOK_KV:
+`healthy: true` at `2026-08-19T16:38:30.920Z`, 5/5 checks ok — kv ("a probe
+value round-tripped"), token_refresh ("a forced refresh-token rotation
+succeeded and the new token is stored"), subscription
+(`95f07422-d465-455d-b03f-14d098692d93` live, expires 2026-08-21T17:31:56Z),
+filing_errors and digest_errors (0 today, threshold 5). Produced by r27's
+healthy rerun — the real checks against real KV/Graph, per the gate's
+preferred mechanism (no temporary route was needed this time).
+
+**State.** `llm:config` untouched (filing + digest remain ON at
+threshold 0.8, cap 200; r24 captured and r20 re-verified it byte-exact).
+Zero `[MCP TEST]` artifacts and zero "outlook-mcp health:" drafts left in
+the mailbox; `sub:mail` restored byte-exact and its subscription verified
+live in Graph.

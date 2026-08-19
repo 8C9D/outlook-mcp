@@ -24,7 +24,16 @@
   //                  has already covered. The digest ships DISABLED, so on a
   //                  default deployment these two ticks read one KV key and
   //                  return.
-  "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *"] },
+  //
+  //  "37 13 * * *"   The daily health check (HEALTH_CRON in src/worker/index.ts,
+  //                  dispatched on the cron expression itself). 13:37 UTC is
+  //                  09:37/08:37 America/Toronto across DST — morning for the
+  //                  owner, after the digest, and colliding with none of the
+  //                  ticks above. Healthy runs write the health:last heartbeat
+  //                  to KV; any failing check also leaves an UNSENT alert
+  //                  draft in the inbox (never sent — send_draft, driven by a
+  //                  human, remains the only send path in this server).
+  "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *"] },
   "vars": {
     // Public origin of this Worker. Graph is told to deliver notifications to
     // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname.

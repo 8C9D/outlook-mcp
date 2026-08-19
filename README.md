@@ -1,7 +1,7 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a **personal** Microsoft (outlook.com) mailbox through Microsoft
-Graph. Twenty-nine tools, two prompts and two resources, served from one shared registry over **two
+Graph. Thirty tools, two prompts and two resources, served from one shared registry over **two
 transports**: a local stdio server, and a Cloudflare Worker that claude.ai can use as a custom
 connector. All datetimes are America/Toronto unless a caller supplies an explicit UTC offset.
 
@@ -57,7 +57,7 @@ The full reasoning, including what third parties can observe and which approvals
 ## Architecture
 
 ```
-                    src/core/registry.ts  ── one table of 29 tools, 2 prompts, 2 resources
+                    src/core/registry.ts  ── one table of 30 tools, 2 prompts, 2 resources
                               │
         ┌─────────────────────┴─────────────────────┐
    src/server.ts                            src/worker/index.ts
@@ -66,7 +66,7 @@ The full reasoning, including what third parties can observe and which approvals
    state in .mcp-state.json                 state in KV, /notifications, cron triggers
         └─────────────────────┬─────────────────────┘
                               │
-                     src/tools/* (29 handlers)
+                     src/tools/* (30 handlers)
                               │
                        src/core/graph.ts  ──►  Microsoft Graph
 ```
@@ -77,7 +77,7 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 `core/state.ts` hold indirections each host installs (MSAL and a file locally, KV on the Worker).
 [More detail](#architecture-in-detail), including why the Worker needs no Durable Objects.
 
-## Tools (v10)
+## Tools (v11)
 
 | Tool | What it does |
 | --- | --- |
@@ -110,13 +110,14 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 | `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
 | `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, and extra never-classify subject patterns. **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
 | `get_auto_filing_log` | The audit trail of what the classifier actually did: every message it moved and why, and every message it deliberately left alone and why — low confidence, a protected subject, a discarded model answer, the budget cap. The last 100 decisions, newest first. **Remote only.** |
+| `get_health` | The server's own health. **Hosted**: the latest results of the [daily self-monitoring cron](#self-monitoring-the-daily-health-check) — KV, a forced token rotation, the Graph subscription, the LLM error counters. **stdio**: live checks of what matters locally (silent sign-in, mailbox access), with the remote-only checks named rather than faked. |
 
 ## Tool annotations
 
 Every tool states **all four** MCP annotation hints, on both transports, rather than leaving them to
 the protocol's defaults — which are "destructive and open-world unless told otherwise" and would be
-wrong here far more often than right. One rule defines each hint, so twenty-nine tools cannot drift
-into twenty-nine readings of the same word:
+wrong here far more often than right. One rule defines each hint, so thirty tools cannot drift
+into thirty readings of the same word:
 
 - **`readOnlyHint`** — the call changes nothing: not the mailbox, not the server's own state, not the
   local disk.
@@ -159,6 +160,7 @@ into twenty-nine readings of the same word:
 | `get_mailbox_activity` | **yes** | — | **yes** | — |
 | `manage_auto_filing` | — | — | — | **yes** |
 | `get_auto_filing_log` | **yes** | — | **yes** | — |
+| `get_health` | **yes** | — | **yes** | — |
 
 The calls worth explaining:
 
@@ -203,6 +205,16 @@ addresses; this server deliberately does not expose those actions (creating or l
 list output *does* flag externally created forward rules). A standing silent forward is an
 exfiltration primitive: one approved call would export all future mail. Rules here can only move,
 mark read, or soft-delete within the mailbox.
+
+**Backup and restore.** `manage_rules export` returns the whole rule set — conditions, exceptions,
+actions, sequence, enabled flags — as a portable `outlook-mcp-rules/1` JSON document; the local stdio
+server also writes it to a dated file in `~/Downloads/outlook-mcp-attachments/` (`inbox-rules-<date>.json`).
+`manage_rules import` takes that JSON back and is a **dry run by default**: it diffs the backup against
+the live rules (creates, field-level updates, rules already identical) and changes nothing until called
+again with `apply: true`. Two things it will never do: **delete** — live rules absent from the backup are
+listed as such and left alone — and **restore a forwarding rule**: a backup whose entries carry
+forward/redirect actions is refused outright, the same discipline as everywhere else in this tool. The
+same conservative guards as create/update apply on the way in (no conditionless or actionless rules).
 
 ## Microsoft To Do notes
 
@@ -661,6 +673,11 @@ what a fresh clone can run.
   subscription renewal, and a stdio protocol smoke test covering tools, prompts and resources. Verifies
   it leaves no `[MCP TEST]` artifacts behind — mail, folders, rules, categories, calendars, tasks, task
   lists, Focused-Inbox overrides, exported files — and restores auto-reply and working hours exactly.
+- `npm run test:offline` — the credential-free test tier: fixtures, schema/allowlist validation, the
+  health check's failure modes against stubs, the rules-backup diff, and the annotation, boundary and
+  version assertions. Needs no Graph, no token cache, no KV and no secrets, which is why it is exactly
+  what CI runs (`.github/workflows/ci.yml`: `npm ci` → `typecheck` → `test:offline` on every push —
+  the live suites stay local-only because no secret ever enters the repo or its CI).
 - `npm run verify` — the original auth/Graph foundation check.
 - `npm run typecheck` / `npm run build` — type-check (both the Node and Worker configs) / compile to `dist/`.
 - `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
@@ -677,7 +694,7 @@ what a fresh clone can run.
 
 ## Remote deployment
 
-The same 29 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 30 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
@@ -696,7 +713,7 @@ deployed tool list equals the local registry.
 ```
 src/core/*            transport-agnostic: registry, Graph calls, prompts, resources,
                       token + state indirection, notification and subscription logic
-src/tools/*           the 29 tool handlers (unchanged by transport)
+src/tools/*           the 30 tool handlers (unchanged by transport)
 src/server.ts         stdio entry  -> MSAL + .token-cache.json, state in .mcp-state.json
 src/worker/index.ts   Worker entry -> OAuth + tokens and state in KV, /notifications, cron
 ```
@@ -790,6 +807,31 @@ cron "17 */6 * * *"  --> create / renew the subscription       get_mailbox_activ
 - Because `OAuthProvider` exposes only a `fetch` handler, `src/worker/index.ts` wraps it in an object
   that adds `scheduled` for the cron.
 
+### Self-monitoring: the daily health check
+
+The failure modes of a hosted personal server are quiet ones: a subscription Graph silently dropped, a
+refresh token Microsoft stopped honouring, a background feature erroring on every message with nobody
+watching the logs. A fourth cron — **`37 13 * * *`**, 09:37/08:37 America/Toronto across DST, chosen
+to collide with none of the other ticks — runs `core/health.ts` once a day and verifies:
+
+1. **KV** — a probe value round-trips through the store;
+2. **token refresh** — one *forced* refresh-token rotation through the same exchange every Graph call
+   uses (if this breaks, the connector locks out within the hour);
+3. **subscription** — the subscription named by the `sub:mail` record is alive in Graph with a future
+   expiry;
+4. + 5. **filing / digest error counters** — the two LLM features increment a per-day KV counter
+   (`err:filing:<date>`, `err:digest:<date>`, two-day TTL) whenever their background paths swallow a
+   failure; five or more in one Toronto day fails the check.
+
+A healthy run writes only a heartbeat (`health:last`: timestamp, verdict, per-check results). Any
+failing check **also leaves an unsent draft in the inbox** — subject `outlook-mcp health: <checks>` —
+naming what failed, since when (carried across runs), and the fix: the re-seed procedure
+(`npm run login` + `npm run seed:kv`) for token failures, `wrangler tail` / `get_auto_filing_log` for
+the rest. The draft is created directly in the inbox and **never sent** — a dying server must not be
+able to mail anyone, so `send_draft` remains the only send path in the codebase. `get_health` surfaces
+the latest heartbeat on the hosted server, and on the stdio server runs the checks that mean something
+locally instead of pretending.
+
 ### Setting it up from scratch
 
 Step by step in [SETUP.md §4](SETUP.md#4-optional-deploy-the-hosted-server): two KV namespaces, the
@@ -852,7 +894,7 @@ runtime. The server resolves its own project root from its module location, so i
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.
 - **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether
-  it started; in a chat, the tools icon lists its twenty-nine tools when connected, and the prompt
+  it started; in a chat, the tools icon lists its thirty tools when connected, and the prompt
   picker offers `triage_inbox` and `morning_brief`.
 - **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and
   `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.

@@ -20,6 +20,7 @@ import { downloadHandler } from "./download.js";
 import { mcpHandler } from "./mcp-handler.js";
 import { keepSubscriptionAlive } from "./notifications.js";
 import { draftMorningBrief } from "./llm.js";
+import { runWorkerHealthCheck } from "./health.js";
 import { torontoHourOf } from "../core/auto-filing.js";
 import type { Env } from "./env.js";
 
@@ -28,6 +29,16 @@ const SCOPES_SUPPORTED = ["outlook"];
 
 /** The hour, America/Toronto, at which the morning brief is drafted. */
 export const DIGEST_HOUR_TORONTO = 7;
+
+/**
+ * The daily health-check schedule (must match wrangler.jsonc). 13:37 UTC is
+ * 09:37 Toronto in EDT and 08:37 in EST — always morning for the owner, after
+ * the digest, and colliding with neither the 6-hourly upkeep ticks (minute 17
+ * of hours 5/11/17/23 UTC) nor the digest ticks (11:00 and 12:00 UTC). This
+ * one is dispatched on the cron expression rather than the local hour, since
+ * unlike the digest it has no wall-clock meaning to preserve across DST.
+ */
+export const HEALTH_CRON = "37 13 * * *";
 
 /**
  * Both protected surfaces behind one handler: the MCP endpoint itself, and the
@@ -73,9 +84,15 @@ export default {
     oauthProvider.fetch(request, env, ctx),
 
   /**
-   * Cron triggers (see `triggers.crons` in wrangler.jsonc). Two jobs share the
-   * handler and are told apart by the hour America/Toronto is actually on:
+   * Cron triggers (see `triggers.crons` in wrangler.jsonc). Three jobs share
+   * the handler: the daily health check is dispatched on its exact cron
+   * expression, and the remaining ticks are told apart by the hour
+   * America/Toronto is actually on:
    *
+   *  - The health check, daily at 13:37 UTC (see HEALTH_CRON above). Verifies
+   *    KV, a forced token rotation, the Graph subscription and the two LLM
+   *    error counters; healthy runs write a heartbeat, failing ones also leave
+   *    an unsent alert draft in the inbox.
    *  - Subscription upkeep, every 6 hours. Mail subscriptions expire after ~2.9
    *    days and Graph drops them silently, so this runs far more often than
    *    that and creates, renews or leaves the subscription alone as needed.
@@ -92,6 +109,21 @@ export default {
    */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const hour = torontoHourOf(new Date(event.scheduledTime));
+
+    if (event.cron === HEALTH_CRON) {
+      ctx.waitUntil(
+        runWorkerHealthCheck(env).then(
+          (report) =>
+            console.log(
+              `Cron ${event.cron}: health check ${report.healthy ? "healthy" : "UNHEALTHY"}` +
+                (report.alertDraftId ? ` — alert draft ${report.alertDraftId}` : "") +
+                (report.alertError ? ` — ${report.alertError}` : "")
+            ),
+          (err) => console.error(`Cron ${event.cron}: health check failed: ${String(err)}`)
+        )
+      );
+      return;
+    }
 
     if (hour === DIGEST_HOUR_TORONTO) {
       ctx.waitUntil(

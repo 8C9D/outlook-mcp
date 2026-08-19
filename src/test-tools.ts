@@ -68,7 +68,10 @@ import {
 } from "./core/classifier.js";
 import { digestSubject, runDailyDigest } from "./core/digest.js";
 import { graphDigestMailbox } from "./core/digest-mailbox.js";
-import { STATE_LLM_AUDIT, STATE_LLM_CONFIG, llmBudgetKey } from "./core/kv-keys.js";
+import { STATE_HEALTH, STATE_LLM_AUDIT, STATE_LLM_CONFIG, llmBudgetKey } from "./core/kv-keys.js";
+import { getHealthHandler } from "./tools/get-health.js";
+import type { HealthReport } from "./core/health.js";
+import { RULES_BACKUP_FORMAT } from "./core/rules-backup.js";
 import {
   ACTIVITY_CAP,
   appendActivity,
@@ -3631,6 +3634,7 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   get_mailbox_activity: [true, false, true, false],
   manage_auto_filing: [false, false, false, true],
   get_auto_filing_log: [true, false, true, false],
+  get_health: [true, false, true, false],
 };
 
 /** The four hints of a tool definition or a tools/list entry, in a fixed order. */
@@ -3757,6 +3761,195 @@ await test("v10b. doctor (environment stage passes here, known failures translat
   assert(pkg.scripts.doctor, "package.json has no doctor script");
 });
 
+// ---- v11a. get_health on both kinds of store -------------------------------
+
+await test("v11a. get_health (live local checks; remote heartbeat rendering, honest when absent)", async () => {
+  // Local (the harness's file store): the two live checks run for real against
+  // Graph, and the remote-only checks are named rather than faked.
+  const local = toolText(await getHealthHandler({}), "get_health (local)");
+  assert(/OK\s+sign-in/.test(local), `no passing sign-in check:\n${local}`);
+  assert(/OK\s+mailbox/.test(local), `no passing mailbox check:\n${local}`);
+  assert(/signed in as \S+@\S+/.test(local), `the sign-in check names no account:\n${local}`);
+  assert(/Remote-only checks/.test(local), `remote-only checks are not named:\n${local}`);
+  for (const name of ["subscription", "token_refresh", "filing_errors", "digest_errors", "kv"]) {
+    assert(local.includes(name), `the remote-only note does not name "${name}":\n${local}`);
+  }
+
+  // Remote store with no heartbeat: says so instead of inventing results.
+  const empty = createMemoryStateStore("remote");
+  const none = await runWithStateStore(empty, () => getHealthHandler({}));
+  assert(/No health report yet/.test(toolText(none, "get_health (no heartbeat)")), "an absent heartbeat was not explained");
+
+  // Remote store with a stored report: renders verdict, checks and the alert.
+  const seeded = createMemoryStateStore("remote");
+  const report: HealthReport = {
+    at: "2026-08-19T13:37:00.000Z",
+    healthy: false,
+    checks: [
+      { name: "kv", ok: true, detail: "a probe value round-tripped through the store" },
+      { name: "token_refresh", ok: true, detail: "rotation succeeded" },
+      {
+        name: "subscription",
+        ok: false,
+        detail: "Graph does not have subscription sub-x (HTTP 404)",
+        failingSince: "2026-08-18T13:37:00.000Z",
+      },
+      { name: "filing_errors", ok: true, detail: "0 swallowed error(s) today (threshold 5)" },
+      { name: "digest_errors", ok: true, detail: "0 swallowed error(s) today (threshold 5)" },
+    ],
+    alertDraftId: "draft-abc",
+  };
+  await writeJson(seeded, STATE_HEALTH, report);
+  const rendered = toolText(
+    await runWithStateStore(seeded, () => getHealthHandler({})),
+    "get_health (heartbeat)"
+  );
+  assert(/UNHEALTHY/.test(rendered), `verdict missing:\n${rendered}`);
+  assert(/FAIL\s+subscription/.test(rendered), `failing check not shown:\n${rendered}`);
+  assert(/failing since/.test(rendered), `failingSince not shown:\n${rendered}`);
+  assert(rendered.includes("draft-abc"), `the alert draft id is not surfaced:\n${rendered}`);
+  assert(/OK\s+kv/.test(rendered), `passing checks not shown:\n${rendered}`);
+});
+
+// ---- v11b. manage_rules export / import ------------------------------------
+
+await test("v11b. rules backup (export → mutate → dry-run diff → apply restores → never deletes)", async () => {
+  const marker = `mcp-backup-${Math.random().toString(16).slice(2, 10)}`;
+  const ruleName = `${TEST_PREFIX} backup rule ${marker}`;
+  let ruleId: string | undefined;
+  let savedPath: string | undefined;
+  try {
+    // A real rule to round-trip.
+    const created = toolText(
+      await manageRulesHandler({
+        action: "create",
+        display_name: ruleName,
+        conditions: { subject_contains: [marker] },
+        actions: { mark_as_read: true },
+      }),
+      "create backup rule"
+    );
+    ruleId = created.match(/Rule id: (\S+)/)?.[1];
+    assert(ruleId, `no rule id in: ${created}`);
+
+    // Export: inline JSON that parses, plus a dated local file with the same bytes.
+    const exported = toolText(await manageRulesHandler({ action: "export" }), "export");
+    const jsonStart = exported.indexOf("Backup JSON:\n");
+    assert(jsonStart >= 0, `no inline JSON in: ${exported.slice(0, 300)}`);
+    const backupJson = exported.slice(jsonStart + "Backup JSON:\n".length);
+    const backup = JSON.parse(backupJson);
+    assert(backup.format === RULES_BACKUP_FORMAT, `format: ${backup.format}`);
+    const ours = backup.rules.find((r: any) => r.displayName === ruleName);
+    assert(ours && ours.id === ruleId, "the exported backup is missing the test rule");
+    assert(
+      JSON.stringify(ours.conditions?.subjectContains) === JSON.stringify([marker]),
+      `exported conditions: ${JSON.stringify(ours.conditions)}`
+    );
+    assert(ours.actions?.markAsRead === true, `exported actions: ${JSON.stringify(ours.actions)}`);
+
+    savedPath = exported.match(/Saved to: (.+)/)?.[1]?.trim();
+    assert(savedPath, `the local server did not save a file:\n${exported.split("Backup JSON:")[0]}`);
+    assert(path.basename(savedPath).startsWith("inbox-rules-"), `file name: ${savedPath}`);
+    const fileJson = await fs.readFile(savedPath, "utf8");
+    assert(fileJson === backupJson, "the saved file differs from the inline JSON");
+
+    // Mutate the live rule so the backup and reality disagree.
+    toolText(
+      await manageRulesHandler({
+        action: "update",
+        rule_id: ruleId,
+        conditions: { subject_contains: [`${marker}-mutated`] },
+      }),
+      "mutate rule"
+    );
+
+    // Dry run: shows the field-level update and changes nothing.
+    const dryRun = toolText(
+      await manageRulesHandler({ action: "import", backup_json: backupJson }),
+      "import dry run"
+    );
+    assert(/DRY RUN — nothing was changed/.test(dryRun), `not a dry run:\n${dryRun}`);
+    assert(
+      dryRun.includes(`Would UPDATE 1 rule(s)`) && dryRun.includes(ruleName),
+      `the dry run does not plan the update:\n${dryRun}`
+    );
+    assert(/conditions: live .*mutated/.test(dryRun), `no field-level diff:\n${dryRun}`);
+    assert(/apply: true/.test(dryRun), `the dry run does not say how to apply:\n${dryRun}`);
+    const stillMutated = toolText(await manageRulesHandler({ action: "list" }), "list after dry run");
+    assert(
+      stillMutated.includes(`${marker}-mutated`),
+      "the dry run changed the live rule"
+    );
+
+    // Apply: the rule is restored in place (same id), matching the backup again.
+    const applied = toolText(
+      await manageRulesHandler({ action: "import", backup_json: backupJson, apply: true }),
+      "import apply"
+    );
+    assert(/Import applied: 1 of 1/.test(applied), `apply summary:\n${applied}`);
+    assert(applied.includes(`updated "${ruleName}" in place`), `no in-place update:\n${applied}`);
+    const restored = toolText(await manageRulesHandler({ action: "list" }), "list after apply");
+    assert(
+      restored.includes(marker) && !restored.includes(`${marker}-mutated`),
+      `the rule was not restored:\n${restored}`
+    );
+    assert(restored.includes(ruleId), "the restore minted a new rule id instead of patching");
+    const reDiff = toolText(
+      await manageRulesHandler({ action: "import", backup_json: backupJson }),
+      "dry run after apply"
+    );
+    assert(/Nothing to apply/.test(reDiff), `apply did not converge:\n${reDiff}`);
+
+    // Never deletes: an empty backup only LISTS the live rules.
+    const emptyBackup = JSON.stringify({ format: RULES_BACKUP_FORMAT, exportedAt: "x", rules: [] });
+    for (const applyFlag of [false, true]) {
+      const result = toolText(
+        await manageRulesHandler({ action: "import", backup_json: emptyBackup, apply: applyFlag }),
+        `empty import (apply: ${applyFlag})`
+      );
+      assert(/import never deletes/.test(result), `the never-delete note is missing:\n${result}`);
+      assert(result.includes(ruleName), `the live rule is not listed as untouched:\n${result}`);
+    }
+    const survived = toolText(await manageRulesHandler({ action: "list" }), "list after empty import");
+    assert(survived.includes(ruleName), "an empty backup deleted a live rule");
+
+    // Forwarding rules are refused on the way back in.
+    const forwardingBackup = JSON.stringify({
+      format: RULES_BACKUP_FORMAT,
+      exportedAt: "x",
+      rules: [
+        {
+          displayName: `${TEST_PREFIX} leaky`,
+          conditions: { subjectContains: ["x"] },
+          actions: { forwardTo: [{ emailAddress: { address: "attacker@example.com" } }] },
+        },
+      ],
+    });
+    const refused = expectError(
+      await manageRulesHandler({ action: "import", backup_json: forwardingBackup, apply: true }),
+      "forwarding import"
+    );
+    assert(/forward\/redirect/.test(refused), `refusal does not explain itself:\n${refused}`);
+    const noLeaky = toolText(await manageRulesHandler({ action: "list" }), "list after refusal");
+    assert(!noLeaky.includes("leaky"), "a forwarding rule was imported despite the refusal");
+
+    // Malformed input fails readably.
+    const badParse = expectError(
+      await manageRulesHandler({ action: "import", backup_json: "{oops" }),
+      "malformed import"
+    );
+    assert(/JSON/.test(badParse), `unreadable parse error:\n${badParse}`);
+  } finally {
+    if (ruleId) {
+      await callGraphServer(
+        `/me/mailFolders/inbox/messageRules/${encodeURIComponent(ruleId)}`,
+        { method: "DELETE" }
+      ).catch(() => undefined);
+    }
+    if (savedPath) await fs.rm(savedPath, { force: true });
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -3828,6 +4021,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "export_message",
       "get_attachment",
       "get_auto_filing_log",
+      "get_health",
       "get_mailbox_activity",
       "list_calendars",
       "list_events",
@@ -3849,7 +4043,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "send_draft",
       "update_draft",
     ];
-    assert(tools.length === 29, `Expected 29 tools, got ${tools.length}`);
+    assert(tools.length === 30, `Expected 30 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
