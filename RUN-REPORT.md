@@ -937,3 +937,48 @@ remote r20 both green on the final runs.
 `{"status":"ok","service":"outlook-mcp","version":"1.2.0"}` (Worker version id
 41a9d1b4-757c-43e6-8eba-b0c1607f051a, all four cron triggers intact); annotated tag `v1.2.0`
 pushed; CI (typecheck + offline tier) green on the final commit.
+
+## Final report — enable-operate-publish run (Batches 1–5 all PASSED, 2026-08-19)
+
+What shipped and was enabled, in one day, each gate re-verified by the
+orchestrator re-running every suite:
+
+- **Batch 1 (enable)** — auto-filing + morning digest turned ON for real
+  (explicit user confirmation), default threshold 0.8, cap 200. First real
+  "Morning brief — 2026-08-19" drafted and left in the mailbox; a probe was
+  filed at 0.85 ≥ the untuned default. Remote suite made state-aware of an
+  enabled deployment.
+- **Batch 2 (v0.11.0, operate)** — daily health-check cron (37 13 * * *:
+  KV, forced token rotation, subscription liveness, filing/digest error
+  counters) alerting via unsent inbox drafts, heartbeat `health:last`,
+  `get_health` on both transports; manage_rules export/import (dry-run
+  diff, never deletes, refuses forwarding); CI workflow + credential-free
+  offline tier.
+- **Batch 3 (v1.0.0, publish)** — https://github.com/8C9D/outlook-mcp
+  PUBLIC under MIT. gitleaks + manual full-history scan; one finding (a
+  second personal alias) scrubbed via filter-repo BEFORE the remote
+  existed; the orchestrator's gate review caught the scan record itself
+  re-quoting the alias — redacted, amended, force-pushed. CI green, tag
+  pushed.
+- **Batch 4 (v1.1.0, complete)** — auto-filer feedback loop (corrections →
+  KV preferences consulted before the model; e2e proves the
+  `source: "preference"` no-API-call fast path against the live webhook);
+  search_mail date/attachment/all-folders filters; delete_folder with
+  guards (Graph folder DELETE proven permanent on consumer accounts — so
+  the tool moves to Deleted Items instead); structuredContent on five
+  tools. Two live bugs found by the e2e and fixed (correction-move id
+  churn; live-filer/harness race → FILER_SHIELD).
+- **Batch 5 (v1.2.0, OneDrive)** — Files.ReadWrite consent verified
+  scope-exact; six OneDrive tools + two cross-surface paths; full
+  lifecycle proven live on both credential chains (rename-not-overwrite
+  default countering Graph's replace-by-default; recycle bin unlistable
+  but restore-by-id proven; anonymous share links created and revoked;
+  search index lag measured 17–306 s).
+
+Final state: **37 tools, 2 prompts, 2 resources**; tags v1.0.0 / v1.1.0 /
+v1.2.0; deployed Worker at 1.2.0 with 4 crons; suites offline 22/22, local
+54/54 (1 designed SKIP), remote 31/31 headless (16 auth-gated SKIPs);
+CI green on the final commit. Auto-filing and the digest remain **ENABLED
+at the default threshold** — review `get_auto_filing_log` after a few days
+and tune only if the audit shows misfiles. Nothing mandatory remains for
+the user; optionally announce/share the published repo.
