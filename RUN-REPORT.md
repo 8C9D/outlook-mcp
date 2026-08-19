@@ -746,3 +746,15 @@ on `fcbbfe5`, pushed.
 sweeps clean — no `[MCP TEST]` artifacts; `llm:config` (filing + digest ON)
 untouched; auto-reply restored. This section's commit is pushed after the
 release commit, with CI required green on it too.
+
+### Batch 3 gate review (orchestrator)
+
+The review re-ran gitleaks (63 commits, no leaks), the alias grep, and all
+four suites (typecheck; offline 17/17; local 49/49; remote 27/27 headless —
+one transient wrangler-API crash in suite setup on the first attempt, clean
+on the rerun). One defect found and fixed at the gate: the Batch 3 docs
+commit itself quoted the scrubbed alias verbatim in ASSUMPTIONS.md and
+RUN-REPORT.md, re-introducing what the history rewrite removed — redacted,
+amended, force-pushed (main `8056f29`, CI green). The pre-amend commit may
+linger unreferenced on GitHub until garbage collection; it contains only the
+owner's own low-sensitivity university alias.
