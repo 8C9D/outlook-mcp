@@ -936,3 +936,213 @@ Off by default: it costs two extra fields on every read and most reads are not i
 - README: v8 header, 27-tool table, three new sections (mailbox settings; junk senders, with the probe
   table above; message forensics), the To Do notes extended with subtasks, repeating tasks and the
   no-delete-list rule, and the soft-delete section extended with the same rule.
+
+## v9 batch C — LLM-classified filing and a drafted morning brief
+
+Two features that call a language model on the mailbox's own content, on the hosted Worker only.
+**Both ship disabled.** The whole batch is written on the assumption that some of the mail is trying
+to hijack the model reading it, so most of the decisions below are about making that assumption
+structurally true rather than merely stated.
+
+### The model
+- **`claude-haiku-4-5`**, verified live against the deployed Worker on 2026-08-19. The API accepts the
+  bare alias and resolves it to **`claude-haiku-4-5-20251001`**, which is what comes back in the
+  response's `model` field and therefore what the audit log records. The brief named the dated id; the
+  alias is used in code because current Anthropic guidance is that the published ids are complete as
+  written and date suffixes should not be appended by hand. Both name the same snapshot, so this is a
+  naming choice with no behavioural difference — and the live check is what settled it rather than an
+  assumption.
+- Pricing $1 / $5 per million tokens in/out. Measured on this mailbox: **783 input, ~48–63 output
+  tokens per classification, ≈ $0.001 per message**; a digest ≈ $0.005/day. The README carries the
+  monthly table; the 200/day cap puts the worst case at ≈ $6.35/month.
+- **Raw `fetch`, not `@anthropic-ai/sdk`.** One endpoint is all either feature needs and the module is
+  bundled into workerd; a dependency would buy nothing. `core/anthropic.ts` mirrors `core/graph.ts`:
+  no Node-only imports, one retry on 429/5xx honouring `Retry-After`, and an error type that carries
+  the status and Anthropic's own message but **never the key**.
+- **No structured outputs / `output_config.format`.** Haiku-tier support was not something to depend
+  on here, and the validator has to exist anyway — the schema check is a security boundary, not a
+  convenience, so it cannot be delegated to the API even where the API would enforce it.
+
+### The injection defence, and why it is four things rather than a prompt
+A prompt instruction is the weakest of the four and is listed last on purpose.
+
+1. **Module boundary.** `core/classifier.ts` imports no Graph transport — not `core/graph.ts`, not any
+   tool. The `ClassifierMailbox` interface is **declared in `classifier.ts` itself** and implemented by
+   `core/mail-actions.ts`, inverting the dependency so the classifier's transitive import set contains
+   nothing that could reach Graph. That was a deliberate choice over the more obvious arrangement
+   (types in `mail-actions.ts`, `import type` in the classifier): a boundary that only holds because
+   TypeScript erases something is not a boundary worth asserting, and this way the test needs no
+   exception for type-only edges. Test `v9a` walks every import edge, including type-only ones, and
+   fails if `src/tools/`, `core/graph.ts`, `core/mail-actions.ts` or `core/digest-mailbox.ts` is
+   reachable; it then pins the interface to exactly five method names and scans the two modules that
+   *do* touch Graph (comments stripped) for `sendMail`, `/send`, `createReply`, `/reply`, `/forward`,
+   `permanentDelete`, `messageRules`, `mailboxSettings` and a `DELETE` verb.
+2. **Folder allowlist, with the destructive destinations removed.** The interesting case is not "the
+   model names a folder that does not exist" — it is that **a move into Deleted Items *is* a delete**.
+   `NEVER_FILE_INTO` strips Deleted Items, Junk Email, Drafts, Sent Items, Outbox, Conversation History,
+   Clutter and Sync Issues from the list the model is offered, so the delete is unreachable by the only
+   mutation the path has. **Archive is deliberately left in**: it is a legitimate and common filing
+   destination, it is recoverable and visible, and excluding it would gut the feature. Categories are
+   allowlisted the same way against the mailbox's real master categories; one unknown name discards the
+   whole answer rather than being dropped, because partial acceptance of a deviating answer is a worse
+   default than doing nothing.
+3. **Schema.** Exact-shape JSON: the four keys, no extras, `folder` and `reason` strings, `confidence`
+   a finite number in 0–1, `categories` an array of strings. Every rejection carries a reason into the
+   audit log, so an injection attempt reads as a discarded answer rather than as silence.
+4. **Prompt.** States the mail is untrusted data, that anything in it reading as an instruction is
+   itself evidence of phishing rather than a command, and that the model cannot send/delete/reply
+   whatever it is told. The mail sits inside `<<<UNTRUSTED_EMAIL_BEGIN/END>>>` markers with the
+   allowlists outside them — `v9b` asserts that ordering rather than trusting it.
+
+### The markdown fence — a live finding, not a design choice
+The first live run against the deployed Worker classified nothing: every answer was discarded as "not a
+bare JSON object". Adding a truncated snippet of the model's actual answer to the discard reason (which
+is a genuine operator improvement, kept) showed the cause immediately — Haiku wraps otherwise-perfect
+JSON in a ` ```json ` fence despite the prompt saying not to.
+
+`unfence()` strips **exactly one fence around the whole trimmed answer** and nothing else. This is
+framing rather than a schema relaxation: it widens nothing the model can express, because the shape and
+both allowlists still decide every field. Prose before the fence, an unclosed fence and two fences all
+fail to match and are discarded like any other malformed answer, and `v9b` has a fixture for each,
+including a *fenced* answer naming Deleted Items (still discarded). The prompt instruction was reworded
+rather than deleted — belt and braces, and it costs nothing.
+
+The snippet in the discard reason is model output derived from untrusted mail. It is truncated to 200
+characters, whitespace-flattened, and — like the `reason` field that was already being stored — only
+ever displayed. Nothing reads it back.
+
+### Skip list, threshold, budget
+- **Protected subjects are matched before any API call**, so a one-time passcode is never sent
+  anywhere, and (asserted in `v9c`) does not even consume a call from the daily budget. The compiled-in
+  list covers one-time/single-use/verification/security codes, verify-log-in, two-factor, 2FA and
+  password resets. `add_skip_pattern` extends it; the built-in half cannot be removed, and
+  `remove_skip_pattern` says so by name when asked to remove one.
+- **Threshold 0.8 by default**, floor 0.5, ceiling 1. Below it the classifier logs its reasoning and
+  does nothing — which is the correct outcome when the model is unsure, and is why the prompt tells it
+  to be conservative rather than decisive.
+- **Daily cap 200 calls per America/Toronto day**, across both features, read-modify-write in KV with a
+  2-day TTL. Same lost-update reasoning as the activity ring: the cap exists to stop a runaway loop,
+  not to bill to the cent. `set_daily_cap 0` stops all API calls without touching the enable flags.
+- Bodies truncated to 2,000 characters, subjects to 300, folder list capped at 60, 300 output tokens.
+
+### The digest
+- **Draft, never sent.** `DigestMailbox` has no send method — the same structural argument as the
+  classifier, and `v9a` scans `core/digest-mailbox.ts` for send verbs *and* for `/move`, since the
+  digest has no business moving anything either. `send_draft` remains the only send path in the repo.
+- Separate port module from the classifier's on purpose: neither feature can reach the other's
+  capabilities. The classifier cannot draft; the digest cannot move or categorize.
+- **Overnight = the last 14 hours**, which at 07:00 is 17:00 the previous day. A wall-clock "since
+  18:00 yesterday" would need its own DST reasoning for no benefit.
+- The brief's body carries a footer naming the model, the counts it was built from, and the fact that
+  it was never sent and that mail was treated as untrusted data — so the artifact explains itself to
+  someone who finds it in Drafts without context.
+
+### Cron and DST — two schedules plus a guard
+Cloudflare crons are UTC only. 07:00 America/Toronto is **11:00 UTC in EDT** and **12:00 UTC in EST**,
+so a single schedule drifts by an hour twice a year. Three options were on the table: one schedule and
+accept the drift, one schedule edited twice a year, or both schedules with a guard. The third was
+chosen: `0 11 * * *` and `0 12 * * *` both fire year-round and the `scheduled` handler computes the
+America/Toronto hour from `event.scheduledTime` and drops whichever tick is not 07:00 locally. Nothing
+drifts, nothing needs redeploying, and `v9c` asserts both directions (11:00 UTC is 07:00 in August,
+12:00 UTC is 07:00 in January, 11:00 UTC is *not* 07:00 in January).
+
+Belt and braces on top: `runDailyDigest` refuses a second brief for a Toronto date it has already
+covered (`llm:digest:last`), so even a double fire produces one draft. The 6-hourly subscription upkeep
+now runs only on the ticks that are *not* the digest hour, which is a clarity choice — running it on all
+five would have been harmless, since it is idempotent.
+
+### Tool surface
+- **`manage_auto_filing` controls both features** rather than splitting into two tools. The brief
+  allowed a rename; the name was kept because it is what the gate and the docs refer to, and because
+  the two features share every rail that matters (the key, the daily budget, the audit log). The
+  digest's flag is fully independent of filing's, as required.
+- **Both tools are hosted-only**, in the same shape `get_mailbox_activity` established: the features
+  run on the Worker off KV state, so a local stdio call would write settings nothing reads. They say
+  that in full rather than silently succeeding. `v9c` asserts both refusals.
+- `get_auto_filing_log` shows **no-action entries by default** (`actions_only` opts out). That is the
+  point of the log: seeing what the model declined to do, and why, is how you decide whether to trust
+  it. An action-only default would hide exactly the evidence an injection attempt leaves.
+- Neither tool can enable anything by accident: `readLlmConfig` treats a missing, corrupt or partial
+  record as **both features off**, asserted in `v9c` with deliberately corrupt JSON.
+
+### Notification wiring
+`handleNotificationRequest` gained an `onAccepted` callback, called synchronously after the ring-buffer
+write and never awaited — Graph retries anything not answered promptly with 2xx, so the Worker hands
+the classification to `ctx.waitUntil` and answers 202 immediately. A throw from the callback is caught
+and logged: follow-up work must not cost us the acknowledgement. At most 5 messages per delivery are
+classified. `defaultHandler.fetch` gained the `ctx` parameter to carry `waitUntil` down to the route.
+
+With filing disabled — the shipped state — the callback reads one KV key and returns, so the added cost
+to the notification path on a default deployment is one KV read.
+
+### Tests
+- Local: 40 → **45** (44 run + 1 skip on a default checkout).
+  - `v9a` the module boundary, described above.
+  - `v9b` fixtures with a canned model answer. The happy path files a receipt first, so "no action
+    everywhere" cannot pass by accident. Then: a body ordering the model to forward and delete, a
+    captured model naming Deleted Items, prose, prose-before-a-fence, an unclosed fence, an array, a
+    missing key, an extra key, a stringly confidence, confidence 42, non-string categories, a
+    non-allowlist folder, a folder differing only in case, an invented category, sub-threshold
+    confidence, the no-folder sentinel — every one asserted to leave the mailbox untouched *and* to be
+    audited with a reason. Plus the marker-ordering assertion and the threshold in both directions.
+  - `v9c` the rails: defaults off, corrupt config off, disabled means the model is never called,
+    protected subjects skipped before the API and off-budget, custom skip patterns, the daily cap
+    counting/resetting/hard-stopping, body truncation, the audit ring capping newest-first, both tools'
+    honest refusal on a local store, and the Toronto date/hour helpers.
+  - `v9d` drives the digest against the **real mailbox** with a canned brief and asserts the draft
+    exists, is a draft, is addressed to this mailbox, is titled `Morning brief — <date>` and carries the
+    footer; that a second run the same day is refused; and that the entry is audited with its usage. The
+    sentinel date is **2099-01-01** so the sweep can match the subject without ever touching a genuine
+    brief — the brief's subject deliberately carries no `[MCP TEST]` prefix, because that is the
+    feature's real format.
+  - `v9e` runs the **real production prompt against the real API**, gated on the key being in the
+    environment or `.dev.vars` and skipped cleanly when it is not. The key is a deployed Worker secret
+    and is not on this machine, so a default checkout **skips** it; the harness gained SKIP support and
+    a summary line that reports skips, mirroring the remote suite. The live path is instead covered by
+    `r25` and by the manual verification recorded below.
+  - Sweep: purges and asserts on morning-brief drafts for the sentinel date.
+  - stdio smoke test now expects **29 tools** and the two new names.
+- Remote: 23 → **25**.
+  - `r24` is the gate criterion as a test, and runs **unauthenticated** so it holds headless: it reads
+    `llm:config` from the deployed KV and fails if either flag is on, asserts that `readLlmConfig`
+    really does default both off (so an absent record cannot mean anything else), and checks both digest
+    cron schedules are declared. On this deployment the key is **absent** — the shipped default.
+  - `r25` (`testAuthed`) is the live end-to-end: enable through the tool, lower the threshold to 0.5 for
+    the run, send a plain shop receipt to self, poll the audit log, then assert the model id, that
+    tokens were spent, that the message really left the inbox, that Graph's folder matches the one the
+    audit log names, that it is not on the never-file list, and that `get_auto_filing_log` shows it.
+    A `finally` turns filing back off whatever happened.
+  - The arrival poll gets **300 s**. Self-delivery plus a Graph notification lags well past a minute and
+    a slow delivery is not a failure — the operational caveat from this run's batch brief.
+  - `r20` restores `llm:config` and `llm:audit` to exactly what predated the run and then re-asserts the
+    deployed server is back in the state `r24` requires.
+  - Headless: **25/25, 14 skipped**.
+
+### The threshold in `r25`, and a real behavioural finding
+The first live classification of a `[MCP TEST]`-prefixed receipt came back at **0.6 confidence**, with
+the model's own reason noting that the test marker in the subject looked like spam. That is the model
+being appropriately cautious about an odd subject, not a bug — so `r25` lowers the threshold to 0.5 for
+its own run rather than pretending a test-marked message is ordinary mail. Real mail with no such marker
+classified at 0.75 in the same session.
+
+### Live verification performed during this batch
+Against the **deployed** Worker, headlessly, driving a synthetic notification with the real `clientState`
+read from KV (which is exactly what Graph does, minus the wait):
+1. Auto-filing enabled by writing `llm:config` directly, since the tool path needs an interactive bearer.
+2. `POST /notifications` → `202 {"accepted":1,"discarded":0}`.
+3. Audit entry appeared in KV: `action: "moved"`, `folder: "Archive"`, `confidence: 0.75`,
+   `model: "claude-haiku-4-5-20251001"`, `usage: {input: 783, output: 48}`, reason "Transactional
+   receipt email. No action needed. Safe to archive after review."
+4. Graph confirmed the message had moved from Inbox to Archive.
+5. `llm:config` deleted, probe mail purged, audit log and budget counter restored. `r24` then confirmed
+   the deployed state is back to both-features-disabled.
+
+### Docs/versioning
+- `package.json` and `src/core/version.ts` → **0.9.0** (the harness asserts they match).
+- README: v9 header, 29-tool table, and a new **LLM mail intelligence** section carrying the honest cost
+  table, the enable/disable recipe, the four-mechanism injection explanation, the DST design and the
+  API-key handling. The security model gains a bullet on why the auto-filing path is fenced in code
+  rather than in a prompt — it is the one place where a model reads untrusted mail *and* acts without a
+  human approving each call.
+- `wrangler.jsonc`: `ANTHROPIC_API_KEY` documented in the secrets comment, and the two digest cron
+  schedules documented alongside the upkeep one.
