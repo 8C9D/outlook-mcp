@@ -702,3 +702,47 @@ threshold 0.8, cap 200; r24 captured and r20 re-verified it byte-exact).
 Zero `[MCP TEST]` artifacts and zero "outlook-mcp health:" drafts left in
 the mailbox; `sub:mail` restored byte-exact and its subscription verified
 live in Graph.
+
+## Batch 3 — Published (v1.0.0) — PASSED (2026-08-19)
+
+**Scan.** Full-history pre-publish scan, treated as a gate: `gitleaks 8.30.1`
+over all 60 commits (**no leaks found**) plus manual full-history greps
+(JWT/MSA/bearer/API-key patterns — zero hits; complete email/GUID/32-hex
+inventories, each value reviewed) and a per-path inventory proving
+`.env`/`.dev.vars`/`.token-cache.json`/`.mcp-state.json` never entered any
+commit. **One finding**: the owner's second personal alias
+(`[redacted-second-alias]`) on one ASSUMPTIONS.md line throughout history —
+scrubbed with `git filter-repo --replace-text` (→ `[redacted-second-alias]`)
+BEFORE the repo had any remote; every commit hash changed (Batch 2's
+`9f967e5` → `d641a5a`); gitleaks re-scan clean, alias grep zero. Everything
+else reviewed and kept deliberately (owner's documented mailbox address and
+workers.dev URL, the public-client app/tenant ids, subscription and KV
+namespace ids, Cloudflare account id, two truncated 12-hex prefixes of
+rotated-out refresh tokens) — the reasoning is itemized in ASSUMPTIONS.md
+"Batch 3".
+
+**Packaging.** MIT LICENSE (© 2026 Arthur Zhang); `"private": true` KEPT
+(its only effect is failing an accidental `npm publish` — the right guard
+for a public-source, non-npm repo); README first screen now includes the
+one-paragraph security model next to what-it-is / personal-account /
+SETUP.md; SECURITY.md (private reporting via GitHub advisories or email +
+threat-model summary); CONTRIBUTING.md (personal tool, PRs welcome,
+`typecheck` + `test:offline` run credential-free, live suites need your own
+mailbox/deployment). No runtime behavior changed anywhere in this batch.
+
+**Published.** **https://github.com/8C9D/outlook-mcp** — public, main
+pushed via `gh repo create --public --source . --push`. CI (typecheck +
+17-test offline tier) **green** on the pushed release commit `fcbbfe5`:
+https://github.com/8C9D/outlook-mcp/actions/runs/32278532958 (the tag
+push's run 32278533936 also green). Version **1.0.0** in package.json and
+`core/version.ts`; `npm run deploy` after the bump (version-only change) —
+deployed `/health` returns `{"status":"ok","service":"outlook-mcp",
+"version":"1.0.0"}` (Worker version id 4e3ad855…). Annotated tag `v1.0.0`
+on `fcbbfe5`, pushed.
+
+**Suites (after all Batch 3 changes).** typecheck green; `test:offline`
+**17/17**; `test:tools` **49/49** (1 designed skip); `test:remote` headless
+**27/27** (14 auth-gated skips, r27 live e2e included). Final `i.`/`r20`
+sweeps clean — no `[MCP TEST]` artifacts; `llm:config` (filing + digest ON)
+untouched; auto-reply restored. This section's commit is pushed after the
+release commit, with CI required green on it too.

@@ -1402,3 +1402,63 @@ their tests.
 - Tool count 29 → 30 everywhere it is stated (README header/architecture/annotations table/Claude
   Desktop note, stdio smoke test, offline annotation test); `get_health` added to the frozen annotation
   table in test-tools.ts as read-only.
+
+## Batch 3 — Published (v1.0.0)
+
+Recorded while executing the "Batch 3" publication task on 2026-08-19: the pre-publish history scan,
+the packaging decisions, and the public release.
+
+### Pre-publish scan: tooling and findings
+- **Tooling.** (1) `gitleaks 8.30.1` over ALL git history (`gitleaks git .` — 60 commits, ~1.76 MB):
+  **no leaks found**, both before and after the rewrite below. (2) Manual full-history greps over
+  `git log -p --all`: token patterns (`eyJ…` JWTs, `EwB…`/`EwA…` and `M.C5`/`M.R3`/`0.A…` MSA token
+  shapes, `Bearer <long>`, `sk-`/`sk-ant-`, `ghp_`/`gho_`, `AKIA…`, `client_secret`) — zero hits
+  (the only `refresh_token` matches are the KV **key name** constant `ms:refresh_token`);
+  a complete inventory of every email address, GUID and 32-hex string ever committed, each reviewed
+  individually (below). (3) A per-path inventory (`git log --all --name-only --diff-filter=A`)
+  proving `.env`, `.dev.vars`, `.token-cache.json`, `.mcp-state.json` and any KV dump/seed file
+  **never appeared in any commit**. (4) A docs sweep for quoted mailbox content: no real subjects,
+  senders or bodies — fixture data only (`[MCP TEST]`, `.invalid`/`example.com` addresses).
+- **One finding, scrubbed.** `[redacted-second-alias]` — the owner's own University of Waterloo alias,
+  not repeated here for the same reason it was scrubbed —
+  appeared on one line of ASSUMPTIONS.md (the app-registration tenant notes) throughout history. It is
+  not a secret, but it is a second personal identifier that was never part of the publish decision, so
+  it was removed rather than judged: `git filter-repo --replace-text` rewrote all 60 commits, replacing
+  the string with `[redacted-second-alias]` (pre-rewrite bundle kept locally outside the repo). This
+  happened BEFORE the repo had any remote, so no force-push was involved. **Every commit hash changed**
+  (the v0.11.0 Batch 2 commit `9f967e5` became `d641a5a`). Re-scan after the rewrite: gitleaks clean,
+  and a history-wide grep for the alias returns zero.
+- **Reviewed and accepted (deliberately NOT scrubbed).** The owner's `arthur.yuhao.zhang@outlook.com`
+  (the documented mailbox and git author identity) and the `arthur-yuhao-zhang.workers.dev` URL — the
+  public-deploy decision already made; the app registration's client id `1d362aa5-…` and its
+  Default-Directory tenant id `a289df25-…` (public-client identifiers, documented in this file, not
+  credentials); Microsoft's well-known consumers tenant `f8cdef31-…`; the Graph subscription id
+  `95f07422-…` and Worker version ids (identifiers, useless without a token); the Cloudflare account
+  id `cf54199…` (visible in every dashboard URL, not a secret); the two KV namespace ids in
+  wrangler.jsonc (already documented as not secrets); the wrangler-types hash; and two **truncated
+  12-hex prefixes of rotated-out refresh tokens** quoted in this file's Batch-C evidence
+  (`cfc64c50cb59…` → `382d3b854bc2…`) — both superseded by later rotations and far too short to
+  reconstruct anything. No real `clientState` value appears anywhere (fixtures and prose only).
+
+### Packaging decisions
+- **LICENSE**: MIT, © 2026 Arthur Zhang.
+- **`"private": true` KEPT in package.json.** The repo is public on GitHub but is not an npm package;
+  the flag's only effect is to make an accidental `npm publish` fail, which is exactly the guard a
+  public-source, non-npm project wants. Removing it would only remove that guard.
+- **README first screen** now carries the one-paragraph security model (untrusted-input stance,
+  two-step send, soft deletes, no rule forwarding, single-user interactive-only endpoint, fenced
+  auto-filing) alongside what-it-is, personal-account support and the SETUP.md link.
+- **SECURITY.md**: private reporting via GitHub security advisories (preferred) or email, plus the
+  threat-model summary distilled from the README. **CONTRIBUTING.md**: personal tool, PRs/issues
+  welcome, the credential-free `typecheck` + `test:offline` pair (what CI runs), and the warning that
+  the live suites need your own mailbox and deployment.
+
+### Release
+- Repo: **https://github.com/8C9D/outlook-mcp** (public). CI (typecheck + offline tier) green on the
+  first push: https://github.com/8C9D/outlook-mcp/actions/runs/32278532958 (main, commit `fcbbfe5`);
+  the tag push's run also green (32278533936).
+- Version 1.0.0 in package.json AND src/core/version.ts; `npm run deploy` after the bump (same code,
+  version only) — `/health` reports `1.0.0` (Worker version id 4e3ad855-4a36-430f-9003-60736d516d60).
+  Annotated tag `v1.0.0` on the release commit, pushed.
+- Suites after all changes: typecheck green; `test:offline` 17/17; `test:tools` 49/49 (1 designed
+  skip); `test:remote` headless 27/27 (14 auth-gated skips). `llm:config` untouched.
