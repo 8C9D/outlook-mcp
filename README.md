@@ -27,7 +27,8 @@ reply. No secrets ever enter this repository. The reasoning is in
 | **Calendar** | `list_calendars`, `list_events`, `create_event`, `manage_event` | multiple calendars, repeating events and reminders, single-occurrence or whole-series edits, and invitation responses |
 | **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts, out-of-office, working hours, Focused-Inbox overrides |
 | **Tasks** | `list_tasks`, `manage_task` | Microsoft To Do with subtasks, repeat rules, task lists, and mail turned into a task |
-| **Evidence** | `export_message`, `get_attachment` | attachment bytes and a message's raw `.eml` — saved to disk on stdio, handed out as an expiring sign-in-required link on the hosted server |
+| **Evidence** | `export_message`, `get_attachment` | attachment bytes and a message's raw `.eml` — saved to disk on stdio, handed out as an expiring sign-in-required link on the hosted server, or dropped straight into OneDrive (`save_to_onedrive`) |
+| **OneDrive files** | `search_files`, `list_folder`, `read_file`, `upload_file`, `manage_file`, `share_link` | search by name or content, exact folder listings, reading and uploading files (rename-not-overwrite by default), move/rename/soft delete into the recycle bin, and anonymous sharing links with revocation — plus attachments that flow both ways between mail and OneDrive ([detail](#onedrive-files)) |
 | **Optional LLM** | `manage_auto_filing`, `get_auto_filing_log` | auto-filing of arriving mail into your existing folders, and a morning brief left as a draft. **Both ship disabled**, both cost money, both are audited ([what they cost](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff)) |
 
 Every tool carries MCP [annotation hints](#tool-annotations) so a client can tell a read from a write,
@@ -65,7 +66,7 @@ The full reasoning, including what third parties can observe and which approvals
 ## Architecture
 
 ```
-                    src/core/registry.ts  ── one table of 31 tools, 2 prompts, 2 resources
+                    src/core/registry.ts  ── one table of 37 tools, 2 prompts, 2 resources
                               │
         ┌─────────────────────┴─────────────────────┐
    src/server.ts                            src/worker/index.ts
@@ -74,7 +75,7 @@ The full reasoning, including what third parties can observe and which approvals
    state in .mcp-state.json                 state in KV, /notifications, cron triggers
         └─────────────────────┬─────────────────────┘
                               │
-                     src/tools/* (30 handlers)
+                     src/tools/* (37 handlers)
                               │
                        src/core/graph.ts  ──►  Microsoft Graph
 ```
@@ -85,7 +86,7 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 `core/state.ts` hold indirections each host installs (MSAL and a file locally, KV on the Worker).
 [More detail](#architecture-in-detail), including why the Worker needs no Durable Objects.
 
-## Tools (v1.1)
+## Tools (v1.2)
 
 | Tool | What it does |
 | --- | --- |
@@ -93,11 +94,11 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
 | `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). `include_headers` adds the forensic view — SPF/DKIM/DMARC verdict, the Received chain oldest-first, and a flag when Reply-To or Return-Path disagrees with From. |
 | `export_message` | The message's raw MIME as a `.eml` — a phishing sample to forward to a security team, or an evidential copy. **stdio**: saved to `~/Downloads/outlook-mcp-attachments/`. **Hosted**: the same expiring, sign-in-required download link `get_attachment` uses. |
-| `get_attachment` | Small text/JSON attachments come back inline on both transports. Otherwise the **stdio** server saves the file to `~/Downloads/outlook-mcp-attachments/` (collision-safe names) and the **hosted** server, having no filesystem, returns a sign-in-required download link that expires within 15 minutes (`link_ttl_minutes`). |
+| `get_attachment` | Small text/JSON attachments come back inline on both transports. Otherwise the **stdio** server saves the file to `~/Downloads/outlook-mcp-attachments/` (collision-safe names) and the **hosted** server, having no filesystem, returns a sign-in-required download link that expires within 15 minutes (`link_ttl_minutes`). `save_to_onedrive` stores the attachment in a OneDrive folder instead, on both transports — never overwriting an existing file. |
 | `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`). Never sends. |
 | `update_draft` | Edits a draft's body/subject/to/cc (recipient arrays replace, not append). Rejects non-drafts. |
 | `send_draft` | **The only send path.** Sends an existing draft by id after verifying it really is a draft. |
-| `add_attachment` | Attaches a file to a draft from **exactly one** of `file_path` (a local file — stdio server only), `url` (an `https` link the server downloads, ≤ 25 MB) or `content_base64` (bytes inline, ≤ 3 MB). Uploads in a single request under 3 MB, chunked upload session for 3–25 MB. Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
+| `add_attachment` | Attaches a file to a draft from **exactly one** of `file_path` (a local file — stdio server only), `url` (an `https` link the server downloads, ≤ 25 MB), `content_base64` (bytes inline, ≤ 3 MB) or `onedrive_path` (a OneDrive file's bytes, both servers). Uploads in a single request under 3 MB, chunked upload session for 3–25 MB. Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
 | `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, categorize, with per-message results. `categorize` **replaces** a message's categories rather than appending, and validates every name against the mailbox's category list first. All ids go out as **one Graph `$batch` request** (one HTTP round-trip instead of up to 20); throttled items are retried once per their `Retry-After`. |
 | `list_folders` | Mail folder tree (2 levels) with unread/total counts and folder ids. |
 | `create_folder` | Creates a mail folder at the mailbox root or under `parent_folder`. Rejects a duplicate name at the same level, naming the existing folder's id. |
@@ -120,13 +121,19 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 | `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, extra never-classify subject patterns — and the **learned preferences** the filer picks up from your corrections (`list_preferences` / `remove_preference`, see [the feedback loop](#the-feedback-loop-corrections-become-preferences)). **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
 | `get_auto_filing_log` | The audit trail of what the classifier actually did: every message it moved and why — each entry's `source` says whether a **model** decided or a **learned preference** filed it with no API call — every message it deliberately left alone and why (low confidence, a protected subject, a discarded model answer, the budget cap), and every correction learned from you re-filing something. The last 100 decisions, newest first. **Remote only.** |
 | `get_health` | The server's own health. **Hosted**: the latest results of the [daily self-monitoring cron](#self-monitoring-the-daily-health-check) — KV, a forced token rotation, the Graph subscription, the LLM error counters. **stdio**: live checks of what matters locally (silent sign-in, mailbox access), with the remote-only checks named rather than faked. |
+| `search_files` | Search OneDrive by file/folder **name or content**, optionally filtered to files, folders, or one extension (`type: "pdf"`), via OneDrive's search index — which lags a few minutes behind brand-new or renamed files ([detail](#onedrive-files)). Results as text and [structured content](#structured-tool-output). |
+| `list_folder` | One OneDrive folder's contents — by path, item id, or the drive root — **folders first, then files**, with sizes, modified dates and item ids. Reads the folder directly, so unlike `search_files` it is always current. (Mail folders are `list_folders`.) |
+| `read_file` | Reads one OneDrive file. Small text/JSON inline on both transports (same thresholds as `get_attachment`); other files are saved to `~/Downloads/outlook-mcp-attachments/` on **stdio** and handed out as an expiring sign-in-required download link on the **hosted** server. |
+| `upload_file` | Uploads to OneDrive (≤ 25 MB) from exactly one of `file_path` (stdio only), `url` (`https` link), or `content_base64` (≤ 3 MB). `destination_path` names folder **and** filename; missing folders are created. On a name collision the default is **rename-not-overwrite** (the upload gets a numbered name); `overwrite: true` deliberately replaces. |
+| `manage_file` | Move, rename, or delete one OneDrive file or folder. **Delete is soft — into the OneDrive recycle bin**, recoverable for ~30 days. Name collisions on move/rename are refused, never overwritten; ids stay stable across moves and renames. |
+| `share_link` | Create, list, or revoke sharing links on a OneDrive item. **A created link is anonymous: anyone holding the URL can view (or, for `edit` links, modify) the item without signing in** — the tool says so in its output, and `revoke` kills the link for everyone. |
 
 ## Tool annotations
 
 Every tool states **all four** MCP annotation hints, on both transports, rather than leaving them to
 the protocol's defaults — which are "destructive and open-world unless told otherwise" and would be
-wrong here far more often than right. One rule defines each hint, so thirty-one tools cannot drift
-into thirty-one readings of the same word:
+wrong here far more often than right. One rule defines each hint, so thirty-seven tools cannot drift
+into thirty-seven readings of the same word:
 
 - **`readOnlyHint`** — the call changes nothing: not the mailbox, not the server's own state, not the
   local disk.
@@ -171,6 +178,12 @@ into thirty-one readings of the same word:
 | `manage_auto_filing` | — | — | — | **yes** |
 | `get_auto_filing_log` | **yes** | — | **yes** | — |
 | `get_health` | **yes** | — | **yes** | — |
+| `search_files` | **yes** | — | **yes** | — |
+| `list_folder` | **yes** | — | **yes** | — |
+| `read_file` | — | — | — | — |
+| `upload_file` | — | **yes** | — | **yes** |
+| `manage_file` | — | **yes** | — | — |
+| `share_link` | — | **yes** | — | **yes** |
 
 The calls worth explaining:
 
@@ -188,10 +201,17 @@ The calls worth explaining:
   whose switch commits the server to sending mail excerpts to the Anthropic API.
 - **`manage_senders` is neither destructive nor open-world:** blocking is undone by unblocking, and the
   junk list never leaves the mailbox.
+- **`upload_file` is destructive because `overwrite: true` replaces an existing file's content** — the
+  default is rename-not-overwrite, but the capability is in the tool. It is open-world for the same
+  reason `add_attachment` is: the `url` source fetches from an arbitrary `https` host.
+- **`share_link` is destructive and open-world:** a created link opens the item to anyone holding the
+  URL with no sign-in, and `revoke` kills a link other people may rely on — the same URL can never be
+  re-issued. `read_file` follows `get_attachment`'s reasoning exactly (a saved file or a KV record on
+  every call).
 
 These are hints, not a security boundary — the MCP spec is explicit that a client must not make trust
 decisions on annotations from an untrusted server. Here they exist so a client you *do* trust can
-prompt proportionately: reads without ceremony, the seven destructive tools with a real look.
+prompt proportionately: reads without ceremony, the ten destructive tools with a real look.
 
 ## Inbox rules (`manage_rules`)
 
@@ -357,6 +377,36 @@ server parks the bytes in KV under a 256-bit random id and returns a link to
   cannot go below 60 seconds; an expired record is refused and dropped.
 - is capped at 18 MB of attachment, which is what fits in a 25 MB KV value once base64-encoded.
 
+## OneDrive files
+
+Six tools work the account's personal OneDrive (`search_files`, `list_folder`, `read_file`,
+`upload_file`, `manage_file`, `share_link`), plus two cross-surface paths: `add_attachment`'s
+`onedrive_path` source copies a OneDrive file's bytes into a draft, and `get_attachment`'s
+`save_to_onedrive` stores an attachment in a OneDrive folder — both on both transports. The design
+follows what Microsoft Graph actually does on a *personal* drive, each point verified live before the
+tools were written:
+
+- **Uploads never overwrite by accident.** Graph's own default for an upload onto an existing name is
+  a silent *replace*, so every upload here states `@microsoft.graph.conflictBehavior` explicitly:
+  `rename` (the new file gets a numbered name, and the result says so) unless the caller passes
+  `overwrite: true`. Missing folders in a destination path are created automatically.
+- **Deletes are soft.** `manage_file` delete moves the item to the OneDrive recycle bin (recoverable
+  for ~30 days at onedrive.live.com). The bin cannot be *listed* through Graph on a personal drive,
+  but a deleted item can be restored by id — which is how the test suites prove the delete really is
+  recoverable, and how they clean up after themselves.
+- **Sharing links are anonymous, and the tool says so loudly.** `share_link` creates OneDrive's
+  anonymous view or edit links: anyone who obtains the URL can open (or modify) the item without
+  signing in. The output carries that warning every time, `list` shows every live link with its
+  permission id, and `revoke` deletes the permission so the URL dies for everyone. Creating the same
+  link type twice returns the same URL; a revoked one can never be re-issued.
+- **Search lags; listings do not.** `search_files` uses OneDrive's search index, which catches
+  name *and* content matches but runs seconds to minutes behind fresh uploads and renames.
+  `list_folder` reads the folder directly and is always current — the tools' descriptions steer the
+  model accordingly.
+- **Reading follows the attachment rules exactly**: text/JSON under 50 KB inline; otherwise a disk
+  save on stdio or the same bearer-gated, expiring `…/mcp/download/<id>` link on the hosted server,
+  with the same 18 MB link cap and 25 MB tool cap.
+
 ## Repeating events
 
 `create_event` and `manage_event` take a `recurrence` rule — `frequency` (daily/weekly/monthly/
@@ -411,13 +461,13 @@ distinction matters.
 
 ## Structured tool output
 
-Five tools whose answers a client may want to render — `search_mail`, `list_folders`, `list_events`,
-`list_tasks`, `get_health` — return **MCP structured content**: a machine-readable
+Seven tools whose answers a client may want to render — `search_mail`, `list_folders`, `list_events`,
+`list_tasks`, `get_health`, `search_files`, `list_folder` — return **MCP structured content**: a machine-readable
 `structuredContent` object alongside the same compact text as before, with an `outputSchema`
 advertised in `tools/list` (identically on both transports, since both build from the shared
 registry). The text remains the fallback for clients that ignore structured content, and the schemas
 are deliberately permissive — every field optional, unknown keys tolerated — so a schema-validating
-client can never see a previously-working call start failing. The other twenty-six tools are
+client can never see a previously-working call start failing. The other thirty tools are
 prose-shaped (confirmations, per-item OK/FAILED lists) and stay text-only on purpose.
 
 ## Resources
@@ -619,7 +669,9 @@ and `add_attachment`), then send that exact draft with `send_draft(draft_id)`. T
 ## Soft-delete policy
 
 Every *mailbox* delete in the tool surface (messages, events, contacts) is a **soft delete**: items move
-to Deleted Items and stay recoverable, and no tool permanently purges them. The one exception is
+to Deleted Items and stay recoverable, and no tool permanently purges them. OneDrive deletes follow the
+same rule: `manage_file` delete moves the item into the **OneDrive recycle bin** (never Graph's
+`permanentDelete`), and its description says so. The one exception is
 `manage_task` delete: Microsoft To Do has no recoverable deleted-items store, so removing a task is
 permanent (see [Microsoft To Do notes](#microsoft-to-do-notes)) — which is also why `manage_task`
 offers no way to delete a To Do *list*: that would destroy every task in it at once. (The test harness contains a
@@ -738,7 +790,7 @@ what a fresh clone can run.
 
 ## Remote deployment
 
-The same 31 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 37 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see

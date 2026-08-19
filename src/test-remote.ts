@@ -34,7 +34,7 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { PROJECT_ROOT } from "./project-root.js";
 import { installMsalTokenProvider } from "./auth.js";
-import { callGraphServer, callGraphServerBytes } from "./core/graph.js";
+import { callGraphServer, callGraphServerBytes, callGraphWithToken } from "./core/graph.js";
 import {
   KV_ACCESS_TOKEN,
   KV_REFRESH_TOKEN,
@@ -198,9 +198,10 @@ function wranglerStateStore(nsId: string): StateStore {
  * A REAL forced refresh-token rotation against the token in the deployed KV —
  * the same exchange src/worker/ms-token.ts performs, driven from Node. The
  * rotated refresh token is written back before anything else so the Worker can
- * never be locked out by this test.
+ * never be locked out by this test. Returns the minted access token, so tests
+ * can prove what the DEPLOYED credential chain can reach (r30).
  */
-async function forcedKvTokenRotation(): Promise<void> {
+async function forcedKvTokenRotation(): Promise<string> {
   const clientId = process.env.AZURE_CLIENT_ID;
   assert(clientId, "AZURE_CLIENT_ID is not set (auth.ts loads it from .env)");
   const refreshToken = await kvGet(outlookNs, KV_REFRESH_TOKEN);
@@ -249,6 +250,7 @@ async function forcedKvTokenRotation(): Promise<void> {
   if (payload.refresh_token && payload.refresh_token !== refreshToken) {
     await kvPut(outlookNs, KV_REFRESH_TOKEN, payload.refresh_token);
   }
+  return payload.access_token;
 }
 
 async function kvListKeys(nsId: string): Promise<string[]> {
@@ -667,21 +669,22 @@ await testAuthed("r11. tools/call list_events reaches Graph through the KV token
   );
 });
 
-await testAuthed("r28. the five reader tools serve structuredContent over Streamable HTTP", async () => {
+await testAuthed("r28. the seven reader tools serve structuredContent over Streamable HTTP", async () => {
   assert(bearer, "no bearer token");
 
-  // tools/list must advertise the outputSchema on exactly the five, like stdio.
+  // tools/list must advertise the outputSchema on exactly the seven, like stdio.
   const listed = resultOf(await mcpCall(bearer!, "tools/list"), "tools/list").tools as {
     name: string;
     outputSchema?: { type?: string; properties?: Record<string, unknown> };
   }[];
   const withSchema = listed.filter((t) => t.outputSchema !== undefined).map((t) => t.name).sort();
   assert(
-    withSchema.join(",") === "get_health,list_events,list_folders,list_tasks,search_mail",
+    withSchema.join(",") ===
+      "get_health,list_events,list_folder,list_folders,list_tasks,search_files,search_mail",
     `tools advertising outputSchema over HTTP: ${withSchema.join(", ")}`
   );
 
-  // Each of the five returns structuredContent that its own registry schema
+  // Each reader returns structuredContent that its own registry schema
   // accepts and that agrees with the text alongside it.
   const calls: [string, Record<string, unknown>, (sc: any, text: string) => void][] = [
     [
@@ -721,6 +724,26 @@ await testAuthed("r28. the five reader tools serve structuredContent over Stream
       (sc) => {
         assert(typeof sc.list === "string" && sc.list.length > 0, "list_tasks names no list");
         assert(Array.isArray(sc.tasks), "list_tasks tasks is not an array");
+      },
+    ],
+    [
+      "list_folder",
+      {},
+      (sc, text) => {
+        assert(sc.path === "/", `list_folder root path ${sc.path}`);
+        assert(Array.isArray(sc.items), "list_folder items is not an array");
+        for (const item of (sc.items ?? []).slice(0, 3)) {
+          assert(text.includes(item.id), "drive item id missing from text");
+        }
+      },
+    ],
+    [
+      "search_files",
+      { query: "mcp-remote-nonexistent-marker" },
+      (sc) => {
+        // A no-hit search still answers structurally (count 0) — the shape is
+        // the assertion; the OneDrive lifecycle itself is covered in r30/r31.
+        assert(sc.count === (sc.files ?? []).length, "search_files count mismatch");
       },
     ],
     [
@@ -1516,6 +1539,216 @@ await test("r29. feedback e2e: LLM files a probe → the user re-files it → th
   }
 });
 
+// ----------------------------------------------------- v13: OneDrive file tools
+
+const DRIVE_RUN = randomBytes(3).toString("hex");
+const REMOTE_DRIVE_FOLDER = `${TEST_PREFIX} Remote Drive ${DRIVE_RUN}`;
+
+/** TEST-ONLY: permanently delete root-level [MCP TEST] OneDrive items (local token). */
+async function purgeRemoteDriveItems(): Promise<void> {
+  const kids = await callGraphServer("/me/drive/root/children?$select=id,name&$top=200");
+  for (const item of kids?.value ?? []) {
+    if (String(item.name ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/drive/items/${encodeURIComponent(item.id)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => undefined);
+    }
+  }
+}
+
+// Headless-runnable on purpose: the deployed Worker's own credential chain is
+// the KV refresh token exchanged with MAILBOX_SCOPES — exactly what
+// forcedKvTokenRotation performs from Node. Driving a full file lifecycle with
+// THAT access token proves the deployed grant covers OneDrive end to end
+// (Files.ReadWrite consented, soft delete recoverable, sharing revocable),
+// independent of a bearer. What it cannot prove — the deployed TOOLS behind
+// /mcp — is r31's job, which needs a sign-in.
+await test("r30. OneDrive lifecycle through the deployed KV credential chain (headless)", async () => {
+  const accessToken = await forcedKvTokenRotation();
+  const kvGraph = (p: string, init?: RequestInit) =>
+    callGraphWithToken(async () => accessToken, p, init);
+  const payload = `remote drive probe ${DRIVE_RUN}\n`;
+  try {
+    // Upload (parent folder auto-created), addressed by path.
+    const encFolder = encodeURIComponent(REMOTE_DRIVE_FOLDER);
+    const up = await kvGraph(
+      `/me/drive/root:/${encFolder}/note.txt:/content?@microsoft.graph.conflictBehavior=rename`,
+      { method: "PUT", headers: { "Content-Type": "text/plain" }, body: payload }
+    );
+    assert(up?.id && up?.name === "note.txt", `upload answered: ${JSON.stringify(up).slice(0, 200)}`);
+
+    // The folder lists it, and the bytes round-trip.
+    const kids = await kvGraph(`/me/drive/root:/${encFolder}:/children?$select=id,name,size`);
+    assert(
+      (kids?.value ?? []).some((c: any) => c.id === up.id),
+      `the new file is not in its folder's children: ${JSON.stringify(kids?.value)}`
+    );
+    const got = await callGraphServerBytes(`/me/drive/items/${encodeURIComponent(up.id)}/content`);
+    assert(Buffer.from(got.bytes).toString("utf8") === payload, "content round-trip differs");
+
+    // Rename keeps the id.
+    const renamed = await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "note-renamed.txt" }),
+    });
+    assert(renamed?.id === up.id && renamed?.name === "note-renamed.txt", "rename failed");
+
+    // Share and revoke.
+    const perm = await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}/createLink`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "view", scope: "anonymous" }),
+    });
+    assert(/^https:\/\//.test(perm?.link?.webUrl ?? ""), `no link URL: ${JSON.stringify(perm)}`);
+    await kvGraph(
+      `/me/drive/items/${encodeURIComponent(up.id)}/permissions/${encodeURIComponent(perm.id)}`,
+      { method: "DELETE" }
+    );
+    const permsAfter = await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}/permissions`);
+    assert(
+      !(permsAfter?.value ?? []).some((p: any) => p.id === perm.id),
+      "the revoked permission is still listed"
+    );
+
+    // Soft delete → unreachable → restore proves the recycle bin → purge.
+    await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}`, { method: "DELETE" });
+    let gone = false;
+    try {
+      await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}`);
+    } catch {
+      gone = true;
+    }
+    assert(gone, "the deleted item is still reachable");
+    const restored = await kvGraph(`/me/drive/items/${encodeURIComponent(up.id)}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert(restored?.id, "restore from the recycle bin failed — the delete was not soft");
+    await kvGraph(`/me/drive/items/${encodeURIComponent(restored.id)}/permanentDelete`, {
+      method: "POST",
+    });
+  } finally {
+    await purgeRemoteDriveItems();
+  }
+});
+
+await testAuthed("r31. OneDrive lifecycle through the deployed tools (upload → read → conflict → rename → share/revoke → delete)", async () => {
+  const filePayload = Buffer.from(`deployed tool probe ${DRIVE_RUN}\nsecond line\n`, "utf8");
+  const dest = `${REMOTE_DRIVE_FOLDER}/tool-note.txt`;
+  try {
+    // upload_file over Streamable HTTP, from base64.
+    const upText = await callTool("upload_file", {
+      destination_path: dest,
+      content_base64: filePayload.toString("base64"),
+    });
+    const fileId = upText.match(/^id: (\S+)$/m)?.[1];
+    assert(fileId, `no id in upload_file output: ${upText}`);
+    assert(!/auto-renamed/.test(upText), `first upload renamed: ${upText}`);
+
+    // file_path is refused by the hosted server, by name.
+    const refused = await callToolRaw("upload_file", {
+      destination_path: dest,
+      file_path: "/etc/hosts",
+    });
+    assert(refused.isError, "the hosted server accepted file_path");
+    assert(
+      /no access to your filesystem|only on the local/i.test(refused.text),
+      `unexpected file_path refusal: ${refused.text}`
+    );
+
+    // list_folder and read_file agree with what was uploaded.
+    const listText = await callTool("list_folder", { path: REMOTE_DRIVE_FOLDER });
+    assert(listText.includes("tool-note.txt"), `listing lacks the file: ${listText}`);
+    const readText = await callTool("read_file", { item_id: fileId });
+    assert(
+      readText.includes(filePayload.toString("utf8")),
+      `read_file did not inline the text: ${readText}`
+    );
+
+    // Conflict: default rename, then a real overwrite.
+    const dupText = await callTool("upload_file", {
+      destination_path: dest,
+      content_base64: Buffer.from("duplicate\n").toString("base64"),
+    });
+    assert(/auto-renamed/.test(dupText) && /tool-note 1\.txt/.test(dupText), `no rename: ${dupText}`);
+    const overwriteText = await callTool("upload_file", {
+      destination_path: dest,
+      content_base64: Buffer.from("replaced\n").toString("base64"),
+      overwrite: true,
+    });
+    assert(
+      (overwriteText.match(/^id: (\S+)$/m)?.[1] ?? "") === fileId,
+      `overwrite minted a new id: ${overwriteText}`
+    );
+    const afterOverwrite = await callTool("read_file", { path: dest });
+    assert(/replaced/.test(afterOverwrite), "overwrite did not replace the content");
+
+    // A binary answer is a bearer-gated download link on the hosted server.
+    const binary = randomBytes(512);
+    const binText = await callTool("upload_file", {
+      destination_path: `${REMOTE_DRIVE_FOLDER}/blob.bin`,
+      content_base64: binary.toString("base64"),
+    });
+    const binId = binText.match(/^id: (\S+)$/m)?.[1];
+    assert(binId, `no id in: ${binText}`);
+    const binRead = await callTool("read_file", { item_id: binId });
+    const link = binRead.match(/Download: (\S+)/)?.[1];
+    assert(
+      link && link.startsWith(`${BASE_URL}${DOWNLOAD_ROUTE_PREFIX}`),
+      `no hosted download link: ${binRead}`
+    );
+    assert(!/Saved to:/.test(binRead), `the hosted server claimed to save a file: ${binRead}`);
+    const anon = await fetch(link!);
+    assert(anon.status === 401, `the download link answered anonymously: HTTP ${anon.status}`);
+    const authed = await fetch(link!, { headers: { Authorization: `Bearer ${bearer}` } });
+    assert(authed.status === 200, `the bearer could not open the link: HTTP ${authed.status}`);
+    assert(
+      Buffer.from(await authed.arrayBuffer()).equals(binary),
+      "the downloaded bytes differ from the upload"
+    );
+
+    // rename → share → revoke → soft delete, all through the tools.
+    const renameText = await callTool("manage_file", {
+      action: "rename",
+      item_id: fileId,
+      new_name: "tool-note-renamed.txt",
+    });
+    assert(/id \(unchanged\)/.test(renameText), `rename output: ${renameText}`);
+    const shareText = await callTool("share_link", { action: "create", item_id: fileId });
+    const permId = shareText.match(/permission id: (\S+)/)?.[1];
+    assert(permId && /ANYONE who obtains this URL/.test(shareText), `share output: ${shareText}`);
+    const revokeText = await callTool("share_link", {
+      action: "revoke",
+      item_id: fileId,
+      permission_id: permId,
+    });
+    assert(/revoked/.test(revokeText), `revoke output: ${revokeText}`);
+    const deleteText = await callTool("manage_file", { action: "delete", item_id: fileId });
+    assert(/recycle bin/i.test(deleteText), `delete output: ${deleteText}`);
+    // Verified soft via the local Graph token: unreachable, then restorable.
+    let gone = false;
+    try {
+      await callGraphServer(`/me/drive/items/${encodeURIComponent(fileId)}`);
+    } catch {
+      gone = true;
+    }
+    assert(gone, "the tool-deleted item is still reachable");
+    const restored = await callGraphServer(`/me/drive/items/${encodeURIComponent(fileId)}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert(restored?.id, "restore failed — the tool delete was not soft");
+    await callGraphServer(`/me/drive/items/${encodeURIComponent(restored.id)}/permanentDelete`, {
+      method: "POST",
+    });
+  } finally {
+    await purgeRemoteDriveItems();
+  }
+});
+
 // ------------------------------------------------- v10: is the deployment current
 
 // r9 compares the annotations the deployed server actually serves, but tools/list
@@ -1560,7 +1793,7 @@ await test("r27. e2e: a forced subscription failure drafts a health alert; the h
 
     const failing = await runHealthCheck({
       store,
-      refreshToken: forcedKvTokenRotation,
+      refreshToken: async () => { await forcedKvTokenRotation(); },
     });
     assert(!failing.healthy, "the health check called a bogus subscription healthy");
     const sub = failing.checks.find((c) => c.name === "subscription");
@@ -1628,7 +1861,7 @@ await test("r27. e2e: a forced subscription failure drafts a health alert; the h
 
   // The healthy rerun: all five checks green for real, no draft, and the
   // heartbeat this batch's gate requires actually present in the deployed KV.
-  const healthy = await runHealthCheck({ store, refreshToken: forcedKvTokenRotation });
+  const healthy = await runHealthCheck({ store, refreshToken: async () => { await forcedKvTokenRotation(); } });
   assert(
     healthy.healthy,
     `the healthy rerun still fails: ${JSON.stringify(healthy.checks.filter((c) => !c.ok))}`
@@ -1776,6 +2009,25 @@ await test("r20. cleanup: the probe message, its notifications and the delta pos
   assert(
     !subRecord.includes("MCPTEST"),
     `the subscription record still carries the forced test state: ${subRecord}`
+  );
+
+  // OneDrive: zero [MCP TEST] items among the root children (r30/r31 create
+  // everything under root-level [MCP TEST] folders; this listing is exact and
+  // current, unlike search, whose index lags). A leftover is purged AND fails
+  // the run. The recycle bin cannot be listed on a personal drive — the drive
+  // tests restore + permanently delete their own soft-deleted items instead.
+  const driveKids = await callGraphServer("/me/drive/root/children?$select=id,name&$top=200");
+  const driveLeftovers = (driveKids?.value ?? []).filter((c: any) =>
+    String(c.name ?? "").startsWith(TEST_PREFIX)
+  );
+  for (const item of driveLeftovers) {
+    await callGraphServer(`/me/drive/items/${encodeURIComponent(item.id)}/permanentDelete`, {
+      method: "POST",
+    }).catch(() => undefined);
+  }
+  assert(
+    driveLeftovers.length === 0,
+    `leftover OneDrive test items (now purged): ${JSON.stringify(driveLeftovers.map((c: any) => c.name))}`
   );
 });
 

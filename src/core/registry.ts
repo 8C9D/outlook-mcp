@@ -146,6 +146,34 @@ import {
   getHealthOutputSchema,
   getHealthSchema,
 } from "../tools/get-health.js";
+import {
+  searchFilesDescription,
+  searchFilesHandler,
+  searchFilesOutputSchema,
+  searchFilesSchema,
+} from "../tools/search-files.js";
+import {
+  listFolderDescription,
+  listFolderHandler,
+  listFolderOutputSchema,
+  listFolderSchema,
+} from "../tools/list-folder.js";
+import { readFileDescription, readFileHandler, readFileSchema } from "../tools/read-file.js";
+import {
+  uploadFileDescription,
+  uploadFileHandler,
+  uploadFileSchema,
+} from "../tools/upload-file.js";
+import {
+  manageFileDescription,
+  manageFileHandler,
+  manageFileSchema,
+} from "../tools/manage-file.js";
+import {
+  shareLinkDescription,
+  shareLinkHandler,
+  shareLinkSchema,
+} from "../tools/share-link.js";
 import { registerPrompts } from "./prompts.js";
 import { registerResources } from "./resources.js";
 import type { ZodRawShape } from "zod";
@@ -456,6 +484,62 @@ export const TOOLS: ToolDefinition[] = [
     // KV probe and the alert draft belong to the CRON, not to this tool.
     annotations: READ_ONLY,
     handler: getHealthHandler,
+  },
+  {
+    name: "search_files",
+    description: searchFilesDescription,
+    inputSchema: searchFilesSchema,
+    outputSchema: searchFilesOutputSchema,
+    annotations: READ_ONLY,
+    handler: searchFilesHandler,
+  },
+  {
+    name: "list_folder",
+    description: listFolderDescription,
+    inputSchema: listFolderSchema,
+    outputSchema: listFolderOutputSchema,
+    annotations: READ_ONLY,
+    handler: listFolderHandler,
+  },
+  {
+    name: "read_file",
+    description: readFileDescription,
+    inputSchema: readFileSchema,
+    // Writes: a file in ~/Downloads on stdio, a short-lived download record in
+    // KV on the Worker — the same shape as get_attachment, and like it a repeat
+    // leaves a second copy (collision-suffixed) or a second link.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    handler: readFileHandler,
+  },
+  {
+    name: "upload_file",
+    description: uploadFileDescription,
+    inputSchema: uploadFileSchema,
+    // Destructive because overwrite: true replaces an existing file's content
+    // (the default is rename-not-overwrite, and OneDrive keeps versions, but
+    // the capability is in the tool). The url source fetches from an arbitrary
+    // https host, and the default rename means a repeat adds another copy.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    handler: uploadFileHandler,
+  },
+  {
+    name: "manage_file",
+    description: manageFileDescription,
+    inputSchema: manageFileSchema,
+    // delete is soft (the OneDrive recycle bin), but soft deletes still count:
+    // the item leaves where it was. Moves keep the id but not the place.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    handler: manageFileHandler,
+  },
+  {
+    name: "share_link",
+    description: shareLinkDescription,
+    inputSchema: shareLinkSchema,
+    // Open-world by design: a created link opens the item to ANYONE holding the
+    // URL, no sign-in. Destructive because revoke kills a link others may rely
+    // on and the same URL can never be re-issued.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    handler: shareLinkHandler,
   },
 ];
 

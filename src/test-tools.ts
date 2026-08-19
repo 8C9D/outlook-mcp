@@ -13,6 +13,13 @@ import { GraphError, callGraphServer, graphRequestLog } from "./core/graph.js";
 import { PROJECT_ROOT } from "./project-root.js";
 import { searchMailHandler, torontoMidnightUtc } from "./tools/search-mail.js";
 import { deleteFolderHandler } from "./tools/delete-folder.js";
+import { downloadDriveItem } from "./core/drive.js";
+import { searchFilesHandler } from "./tools/search-files.js";
+import { listFolderHandler } from "./tools/list-folder.js";
+import { readFileHandler } from "./tools/read-file.js";
+import { uploadFileHandler } from "./tools/upload-file.js";
+import { manageFileHandler } from "./tools/manage-file.js";
+import { shareLinkHandler } from "./tools/share-link.js";
 import { readThreadHandler } from "./tools/read-thread.js";
 import { readMessageHandler } from "./tools/read-message.js";
 import { createDraftHandler } from "./tools/create-draft.js";
@@ -326,6 +333,23 @@ async function purgeTestTasks(): Promise<void> {
   }
 }
 
+/**
+ * TEST-ONLY: permanently delete any root-level [MCP TEST] OneDrive items. The
+ * drive tests create everything under root-level [MCP TEST]-prefixed folders or
+ * filenames, so a root-children scan (exact and immediate, unlike search, whose
+ * index lags) covers every artifact a run can leave behind.
+ */
+async function purgeTestDriveItems(): Promise<void> {
+  const kids = await callGraphServer("/me/drive/root/children?$select=id,name&$top=200");
+  for (const item of kids?.value ?? []) {
+    if (String(item.name ?? "").startsWith(TEST_PREFIX)) {
+      await callGraphServer(`/me/drive/items/${encodeURIComponent(item.id)}/permanentDelete`, {
+        method: "POST",
+      });
+    }
+  }
+}
+
 // ---- shared fixtures ----------------------------------------------------
 
 const me = await callGraphServer("/me?$select=mail,userPrincipalName");
@@ -360,6 +384,13 @@ function extractDraftId(createText: string): string {
   const draftId = createText.match(/Draft id: (\S+)/)?.[1];
   assert(draftId, `Could not extract draft id from output: ${createText}`);
   return draftId;
+}
+
+/** Extract the "id: …" line from a drive tool's output. */
+function extractDriveId(text: string): string {
+  const id = text.match(/^id: (\S+)$/m)?.[1];
+  assert(id, `Could not extract a drive item id from output: ${text}`);
+  return id;
 }
 
 // ---- v1: search_mail ----------------------------------------------------
@@ -3690,6 +3721,18 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   manage_auto_filing: [false, false, false, true],
   get_auto_filing_log: [true, false, true, false],
   get_health: [true, false, true, false],
+  search_files: [true, false, true, false],
+  list_folder: [true, false, true, false],
+  // Writes a local file / KV download record, like get_attachment.
+  read_file: [false, false, false, false],
+  // overwrite: true can replace an existing file's content; the url source
+  // fetches from an arbitrary https host.
+  upload_file: [false, true, false, true],
+  // delete is soft (OneDrive recycle bin) but soft deletes still count.
+  manage_file: [false, true, false, false],
+  // A created link opens the item to anyone holding the URL; revoke kills a
+  // link others may rely on.
+  share_link: [false, true, false, true],
 };
 
 /** The four hints of a tool definition or a tools/list entry, in a fixed order. */
@@ -4246,6 +4289,372 @@ await test("v12b. delete_folder (well-known refused; non-empty refused; force mo
   }
 });
 
+// ---- v13: OneDrive file tools -------------------------------------------
+
+// A distinctive single token: what OneDrive's search index handles best, and
+// unguessable enough that no real file can collide with it.
+const DRIVE_RUN = randomBytes(3).toString("hex");
+const DRIVE_MARKER = `mcpdrv${DRIVE_RUN}`;
+const DRIVE_FOLDER = `${TEST_PREFIX} Drive ${DRIVE_RUN}`;
+
+await test("v13a. OneDrive lifecycle (upload → list → search → read → rename → share/revoke → soft delete → recycle bin)", async () => {
+  const textPayload = Buffer.from(`OneDrive lifecycle probe ${DRIVE_MARKER}\nline two\n`, "utf8");
+  const fileName = `${DRIVE_MARKER}-note.txt`;
+  let folderId: string | undefined;
+  try {
+    // Upload from base64; the [MCP TEST] folder (and a subfolder) are created
+    // implicitly, which is itself an assertion of the mkdir -p semantics.
+    const upText = toolText(
+      await uploadFileHandler({
+        destination_path: `${DRIVE_FOLDER}/${fileName}`,
+        content_base64: textPayload.toString("base64"),
+      }),
+      "upload_file(base64)"
+    );
+    assert(new RegExp(`Path: /${DRIVE_FOLDER.replace(/[[\]]/g, "\\$&")}/${fileName}`).test(upText), `Unexpected upload path: ${upText}`);
+    assert(/Type: text\/plain/.test(upText), `Type not derived from the name: ${upText}`);
+    const fileId = extractDriveId(upText);
+    await uploadFileHandler({
+      destination_path: `${DRIVE_FOLDER}/sub/${DRIVE_MARKER}-deep.txt`,
+      content_base64: Buffer.from("deep\n").toString("base64"),
+    });
+
+    // list_folder: current, exact, folders before files, structured copy agrees.
+    const listResult = await listFolderHandler({ path: DRIVE_FOLDER });
+    const listText = toolText(listResult, "list_folder");
+    folderId = extractDriveId(listText);
+    const sc = listResult.structuredContent as any;
+    assert(sc?.folderCount === 1 && sc?.fileCount === 1, `structured counts: ${JSON.stringify(sc)}`);
+    assert(
+      sc.items[0]?.kind === "folder" && sc.items[0]?.name === "sub",
+      `folders do not come first: ${JSON.stringify(sc.items)}`
+    );
+    assert(
+      sc.items[1]?.id === fileId && sc.items[1]?.size === textPayload.length,
+      `the uploaded file is not in the listing: ${JSON.stringify(sc.items)}`
+    );
+    assert(listText.includes(fileName) && /\[folder\] sub/.test(listText), `listing text: ${listText}`);
+
+    // By id too, and the root form.
+    const byId = toolText(await listFolderHandler({ item_id: folderId }), "list_folder(item_id)");
+    assert(byId.includes(fileName), "listing by item_id missed the file");
+    const root = await listFolderHandler({});
+    assert((root.structuredContent as any)?.path === "/", "root listing path is not /");
+
+    // search_files: poll patiently — the index typically catches up in ~15-60 s
+    // but personal OneDrive has been observed to lag minutes (ASSUMPTIONS v13).
+    const SEARCH_DEADLINE_MS = 5 * 60 * 1000;
+    const started = Date.now();
+    let found: any = null;
+    while (Date.now() - started < SEARCH_DEADLINE_MS && !found) {
+      const result = await searchFilesHandler({ query: DRIVE_MARKER });
+      const files = (result.structuredContent as any)?.files ?? [];
+      found = files.find((f: any) => f.id === fileId) ?? null;
+      if (!found) await new Promise((r) => setTimeout(r, 10_000));
+    }
+    const lag = Math.round((Date.now() - started) / 1000);
+    if (found) {
+      console.log(`      (search index caught the new file after ~${lag}s)`);
+      assert(found.kind === "file" && found.name === fileName, `search hit: ${JSON.stringify(found)}`);
+      // The type filter narrows the same query.
+      const folderOnly = await searchFilesHandler({ query: DRIVE_MARKER, type: "folder" });
+      assert(
+        !((folderOnly.structuredContent as any)?.files ?? []).some((f: any) => f.id === fileId),
+        "type: folder still returned the file"
+      );
+    } else {
+      // The index simply has not caught up; the file's existence is already
+      // proven by list_folder above. Recorded as an indexing-lag observation
+      // (ASSUMPTIONS v13) rather than failing the suite on Microsoft's index.
+      console.log(`      (WARN: search index did not surface the new file within ${lag}s — lag recorded)`);
+    }
+
+    // read_file: inline text round-trip, by path and by id.
+    const readText = toolText(await readFileHandler({ path: `${DRIVE_FOLDER}/${fileName}` }), "read_file");
+    assert(
+      readText.endsWith(`Content:\n${textPayload.toString("utf8")}`),
+      `read_file did not round-trip the text: ${readText}`
+    );
+    assert(new RegExp(`^id: ${fileId.replace(/[!]/g, "\\$&")}$`, "m").test(readText), "read_file lost the id");
+
+    // Binary: locally saved to disk, byte-identical; remotely a TTL link whose
+    // parked bytes are identical.
+    const binary = Buffer.alloc(2048);
+    for (let i = 0; i < binary.length; i++) binary[i] = (i * 13) % 256;
+    const binName = `${DRIVE_MARKER}-blob.bin`;
+    const binUp = toolText(
+      await uploadFileHandler({
+        destination_path: `${DRIVE_FOLDER}/${binName}`,
+        content_base64: binary.toString("base64"),
+      }),
+      "upload_file(binary)"
+    );
+    const binId = extractDriveId(binUp);
+    const binRead = toolText(await readFileHandler({ item_id: binId }), "read_file(binary local)");
+    const savedPath = binRead.match(/Saved to: (.+)$/m)?.[1];
+    assert(savedPath, `no save path in: ${binRead}`);
+    const savedBytes = await fs.readFile(savedPath!);
+    assert(savedBytes.equals(binary), "the saved binary differs from the upload");
+    await fs.rm(savedPath!, { force: true });
+
+    const remoteStore = createMemoryStateStore("remote", "https://example.invalid");
+    const linkRead = toolText(
+      await runWithStateStore(remoteStore, () => readFileHandler({ item_id: binId })),
+      "read_file(binary remote)"
+    );
+    const linkId = linkRead.match(new RegExp(`${DOWNLOAD_ROUTE_PREFIX}([0-9a-f]{64})`))?.[1];
+    assert(linkId, `no download link in: ${linkRead}`);
+    const parked = await readDownload(remoteStore, linkId!);
+    assert(
+      parked && Buffer.from(parked.base64, "base64").equals(binary),
+      "the parked download differs from the upload"
+    );
+
+    // rename: id stays, name changes; a collision is refused, not overwritten.
+    const renamed = toolText(
+      await manageFileHandler({ action: "rename", item_id: fileId, new_name: `${DRIVE_MARKER}-renamed.txt` }),
+      "manage_file(rename)"
+    );
+    assert(/id \(unchanged\)/.test(renamed), `rename output: ${renamed}`);
+    const clash = expectError(
+      await manageFileHandler({ action: "rename", item_id: binId, new_name: `${DRIVE_MARKER}-renamed.txt` }),
+      "manage_file(rename onto an existing name)"
+    );
+    assert(/already exists/.test(clash), `Unexpected clash error: ${clash}`);
+
+    // move into the subfolder and back, id stable throughout.
+    const movedText = toolText(
+      await manageFileHandler({ action: "move", item_id: fileId, destination_folder: `${DRIVE_FOLDER}/sub` }),
+      "manage_file(move)"
+    );
+    assert(/id \(unchanged\)/.test(movedText), `move output: ${movedText}`);
+    const afterMove = await callGraphServer(
+      `/me/drive/items/${encodeURIComponent(fileId)}?$select=id,name,parentReference`
+    );
+    assert(
+      String(afterMove.parentReference?.path ?? "").endsWith("/sub"),
+      `not in the subfolder: ${JSON.stringify(afterMove.parentReference)}`
+    );
+    const badDest = expectError(
+      await manageFileHandler({ action: "move", item_id: fileId, destination_folder: `${DRIVE_FOLDER}/nope` }),
+      "manage_file(move to a missing folder)"
+    );
+    assert(/No OneDrive folder/.test(badDest), `Unexpected move error: ${badDest}`);
+
+    // share_link: create view → the URL and permission id exist; list shows it;
+    // revoke → gone from the list and from Graph.
+    const created = toolText(
+      await shareLinkHandler({ action: "create", item_id: fileId, link_type: "view" }),
+      "share_link(create)"
+    );
+    const linkUrl = created.match(/URL: (https:\/\/\S+)/)?.[1];
+    const permId = created.match(/permission id: (\S+)/)?.[1];
+    assert(linkUrl && permId, `share output: ${created}`);
+    assert(/ANYONE who obtains this URL/.test(created), "the third-party warning is missing");
+    const listed = toolText(await shareLinkHandler({ action: "list", item_id: fileId }), "share_link(list)");
+    assert(listed.includes(permId!), `list does not show the link: ${listed}`);
+    const revoked = toolText(
+      await shareLinkHandler({ action: "revoke", item_id: fileId, permission_id: permId }),
+      "share_link(revoke)"
+    );
+    assert(/revoked/.test(revoked), `revoke output: ${revoked}`);
+    const afterRevoke = toolText(await shareLinkHandler({ action: "list", item_id: fileId }), "share_link(list 2)");
+    assert(/no sharing links/.test(afterRevoke), `the link survived revocation: ${afterRevoke}`);
+    const perms = await callGraphServer(`/me/drive/items/${encodeURIComponent(fileId)}/permissions`);
+    assert(
+      !(perms?.value ?? []).some((p: any) => p.id === permId),
+      "Graph still lists the revoked permission"
+    );
+
+    // delete: soft, into the recycle bin. Graph can no longer GET the item —
+    // and the bin cannot be LISTED on a personal drive — but restore-by-id
+    // succeeds, which proves the item was recoverable, not destroyed.
+    const deleted = toolText(
+      await manageFileHandler({ action: "delete", item_id: binId }),
+      "manage_file(delete)"
+    );
+    assert(/recycle bin/i.test(deleted), `delete output does not name the recycle bin: ${deleted}`);
+    await expect404(`/me/drive/items/${encodeURIComponent(binId)}`, "the soft-deleted drive item");
+    const restored = await callGraphServer(`/me/drive/items/${encodeURIComponent(binId)}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert(restored?.id, "restore from the recycle bin failed — was the delete not soft?");
+    await callGraphServer(`/me/drive/items/${encodeURIComponent(restored.id)}/permanentDelete`, {
+      method: "POST",
+    });
+  } finally {
+    // TEST-ONLY permanent cleanup of everything this test created.
+    await purgeTestDriveItems();
+  }
+});
+
+await test("v13b. upload_file conflicts (rename by default, overwrite replaces in place, guards)", async () => {
+  const first = Buffer.from(`first ${DRIVE_MARKER}\n`);
+  const second = Buffer.from(`second ${DRIVE_MARKER}\n`);
+  const third = Buffer.from(`third ${DRIVE_MARKER}\n`);
+  const dest = `${DRIVE_FOLDER}/conflict.txt`;
+  try {
+    const one = toolText(
+      await uploadFileHandler({ destination_path: dest, content_base64: first.toString("base64") }),
+      "upload_file(1st)"
+    );
+    const firstId = extractDriveId(one);
+    assert(!/auto-renamed/.test(one), `the first upload should not rename: ${one}`);
+
+    // Same name again, default: the SECOND file gets a numbered name; the
+    // first is untouched.
+    const two = toolText(
+      await uploadFileHandler({ destination_path: dest, content_base64: second.toString("base64") }),
+      "upload_file(2nd)"
+    );
+    assert(/auto-renamed/.test(two) && /conflict 1\.txt/.test(two), `no rename note: ${two}`);
+    const secondId = extractDriveId(two);
+    assert(secondId !== firstId, "the renamed copy reused the first file's id");
+    const originalRead = toolText(await readFileHandler({ path: dest }), "read_file(original)");
+    assert(originalRead.includes(first.toString("utf8")), "the original was modified by a default upload");
+
+    // overwrite: true really replaces — same path, same id, new content.
+    const three = toolText(
+      await uploadFileHandler({ destination_path: dest, content_base64: third.toString("base64"), overwrite: true }),
+      "upload_file(overwrite)"
+    );
+    assert(!/auto-renamed/.test(three), `overwrite must not rename: ${three}`);
+    assert(extractDriveId(three) === firstId, "overwrite minted a new id instead of replacing");
+    const replacedRead = toolText(await readFileHandler({ path: dest }), "read_file(replaced)");
+    assert(replacedRead.includes(third.toString("utf8")), "overwrite did not replace the content");
+
+    // Guards: source count, root-only destination, remote file_path refusal.
+    const none = expectError(await uploadFileHandler({ destination_path: dest }), "upload_file(no source)");
+    assert(/exactly one source/i.test(none), `Unexpected no-source error: ${none}`);
+    const both = expectError(
+      await uploadFileHandler({
+        destination_path: dest,
+        url: PROBE_URL,
+        content_base64: first.toString("base64"),
+      }),
+      "upload_file(two sources)"
+    );
+    assert(/exactly one source/i.test(both), `Unexpected two-source error: ${both}`);
+    const rootOnly = expectError(
+      await uploadFileHandler({ destination_path: "/", content_base64: first.toString("base64") }),
+      "upload_file(no filename)"
+    );
+    assert(/must include a filename/.test(rootOnly), `Unexpected root error: ${rootOnly}`);
+    const remoteRefusal = expectError(
+      await runWithStateStore(createMemoryStateStore("remote"), () =>
+        uploadFileHandler({ destination_path: dest, file_path: "/etc/hosts" })
+      ),
+      "upload_file(file_path on a remote server)"
+    );
+    assert(
+      /hosted server has no access|file_path works only on the local/i.test(remoteRefusal),
+      `Unexpected remote file_path error: ${remoteRefusal}`
+    );
+
+    // file_path source works locally (byte-identical round trip).
+    const localFile = path.join(await tempDir(), "local-upload.bin");
+    const localBytes = randomBytes(1024);
+    await fs.writeFile(localFile, localBytes);
+    const four = toolText(
+      await uploadFileHandler({ destination_path: `${DRIVE_FOLDER}/local-upload.bin`, file_path: localFile }),
+      "upload_file(file_path)"
+    );
+    const fourId = extractDriveId(four);
+    const { bytes } = await downloadDriveItem(fourId);
+    assert(Buffer.from(bytes).equals(localBytes), "file_path upload bytes differ");
+  } finally {
+    await purgeTestDriveItems();
+  }
+});
+
+await test("v13c. cross-surface (onedrive_path → draft attachment; attachment → save_to_onedrive)", async () => {
+  const sourceBytes = Buffer.from(`cross-surface ${DRIVE_MARKER}\ncontent line\n`, "utf8");
+  const sourceName = `${DRIVE_MARKER}-cross.txt`;
+  let draftId: string | undefined;
+  try {
+    await uploadFileHandler({
+      destination_path: `${DRIVE_FOLDER}/${sourceName}`,
+      content_base64: sourceBytes.toString("base64"),
+    });
+
+    draftId = extractDraftId(
+      toolText(
+        await createDraftHandler({
+          to: [ownAddress],
+          subject: `${TEST_PREFIX} cross-surface draft`,
+          body: "OneDrive cross-surface test draft. Safe to delete.",
+        }),
+        "create_draft cross-surface"
+      )
+    );
+
+    // OneDrive file → draft attachment, bytes identical.
+    const attachText = toolText(
+      await addAttachmentHandler({ draft_id: draftId, onedrive_path: `${DRIVE_FOLDER}/${sourceName}` }),
+      "add_attachment(onedrive_path)"
+    );
+    assert(new RegExp(`Name: ${sourceName}`).test(attachText), `attachment name: ${attachText}`);
+    assert(/Type: text\/plain/.test(attachText), `attachment type not from OneDrive: ${attachText}`);
+    const inventory = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name`
+    );
+    const att = (inventory?.value ?? []).find((a: any) => a.name === sourceName);
+    assert(att, `attachment missing from the draft: ${JSON.stringify(inventory?.value)}`);
+    const full = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
+    );
+    assert(
+      Buffer.from(full.contentBytes ?? "", "base64").equals(sourceBytes),
+      "the attached bytes differ from the OneDrive file"
+    );
+
+    // Guards: a missing path, and a folder instead of a file.
+    const missing = expectError(
+      await addAttachmentHandler({ draft_id: draftId, onedrive_path: `${DRIVE_FOLDER}/nope.txt` }),
+      "add_attachment(missing onedrive_path)"
+    );
+    assert(/No OneDrive file/.test(missing), `Unexpected missing-path error: ${missing}`);
+    const folderErr = expectError(
+      await addAttachmentHandler({ draft_id: draftId, onedrive_path: DRIVE_FOLDER }),
+      "add_attachment(folder onedrive_path)"
+    );
+    assert(/is a folder/.test(folderErr), `Unexpected folder error: ${folderErr}`);
+
+    // Attachment → OneDrive: byte-identical, and a repeat parks a numbered
+    // copy rather than overwriting the first.
+    const saved = toolText(
+      await getAttachmentHandler({
+        message_id: draftId,
+        attachment_id: att.id,
+        save_to_onedrive: `${DRIVE_FOLDER}/saved`,
+      }),
+      "get_attachment(save_to_onedrive)"
+    );
+    assert(/Attachment saved to OneDrive/.test(saved), `save output: ${saved}`);
+    const savedId = saved.match(/OneDrive id: (\S+)/)?.[1];
+    assert(savedId, `no OneDrive id in: ${saved}`);
+    const { bytes: savedBytes } = await downloadDriveItem(savedId!);
+    assert(Buffer.from(savedBytes).equals(sourceBytes), "the OneDrive copy differs from the attachment");
+    const again = toolText(
+      await getAttachmentHandler({
+        message_id: draftId,
+        attachment_id: att.id,
+        save_to_onedrive: `${DRIVE_FOLDER}/saved`,
+      }),
+      "get_attachment(save_to_onedrive again)"
+    );
+    assert(/already existed there/.test(again), `the repeat save did not report a numbered copy: ${again}`);
+  } finally {
+    if (draftId) {
+      await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" }).catch(() => {});
+    }
+    await purgeTestMessages();
+    await purgeTestDriveItems();
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -4322,6 +4731,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "get_mailbox_activity",
       "list_calendars",
       "list_events",
+      "list_folder",
       "list_folders",
       "list_tasks",
       "mailbox_settings",
@@ -4329,18 +4739,23 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "manage_categories",
       "manage_contact",
       "manage_event",
+      "manage_file",
       "manage_message",
       "manage_rules",
       "manage_senders",
       "manage_task",
+      "read_file",
       "read_message",
       "read_thread",
       "search_contacts",
+      "search_files",
       "search_mail",
       "send_draft",
+      "share_link",
       "update_draft",
+      "upload_file",
     ];
-    assert(tools.length === 31, `Expected 31 tools, got ${tools.length}`);
+    assert(tools.length === 37, `Expected 37 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`
@@ -4362,9 +4777,17 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       );
     }
 
-    // Structured content: exactly the five reader tools advertise an
+    // Structured content: exactly the seven reader tools advertise an
     // outputSchema on the wire, as a JSON-Schema object.
-    const STRUCTURED_TOOLS = ["get_health", "list_events", "list_folders", "list_tasks", "search_mail"];
+    const STRUCTURED_TOOLS = [
+      "get_health",
+      "list_events",
+      "list_folder",
+      "list_folders",
+      "list_tasks",
+      "search_files",
+      "search_mail",
+    ];
     for (const tool of tools) {
       if (STRUCTURED_TOOLS.includes(tool.name)) {
         assert(
@@ -4505,6 +4928,7 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   await purgeTestTaskLists();
   await purgeTestFocusOverrides();
   await purgeTestDigestDrafts();
+  await purgeTestDriveItems();
 
   const messages = await callGraphServer(
     `/me/messages?$filter=${encodeURIComponent(`startswith(subject,'${TEST_PREFIX}')`)}&$select=id,subject,parentFolderId`
@@ -4604,6 +5028,34 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
       testTasks.length === 0,
       `Leftover test tasks in "${list.displayName}": ${JSON.stringify(testTasks.map((t: any) => t.title))}`
     );
+  }
+
+  // OneDrive: zero [MCP TEST] artifacts among the root children (the drive
+  // tests create everything under root-level [MCP TEST] names, and this
+  // listing is exact and current, unlike search, whose index lags). Search is
+  // still swept as best-effort: any indexed leftover is purged, and only
+  // still-listable leftovers fail the run. The recycle bin cannot be listed on
+  // a personal drive; tests that soft-delete restore + permanently delete
+  // their own items instead (ASSUMPTIONS v13).
+  const driveKids = await callGraphServer("/me/drive/root/children?$select=id,name&$top=200");
+  const driveLeftovers = (driveKids?.value ?? []).filter((c: any) =>
+    String(c.name ?? "").startsWith(TEST_PREFIX)
+  );
+  assert(
+    driveLeftovers.length === 0,
+    `Leftover OneDrive test items: ${JSON.stringify(driveLeftovers.map((c: any) => c.name))}`
+  );
+  const driveSearch = await callGraphServer(
+    `/me/drive/root/search(q='${encodeURIComponent("MCP TEST")}')?$select=id,name&$top=50`
+  );
+  for (const hit of driveSearch?.value ?? []) {
+    if (String(hit.name ?? "").startsWith(TEST_PREFIX)) {
+      // The index can also lag DELETIONS, so a hit may already be gone; purge
+      // only what still exists.
+      await callGraphServer(`/me/drive/items/${encodeURIComponent(hit.id)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => {});
+    }
   }
 
   // Delta state: the position really was written to the run's throwaway file
