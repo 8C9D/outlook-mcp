@@ -61,6 +61,7 @@ import {
   buildUserPrompt,
   classifyAndFile,
   parseDecision,
+  unfence,
   type ClassifierMailbox,
   type FilingFolder,
   type MailFacts,
@@ -3051,7 +3052,8 @@ await test("v9b. classifier fixtures (adversarial mail, schema and allowlist vio
 
   // -- output-schema violations.
   await mustNotAct("prose wrapping the JSON", 'Here you go:\n{"folder":"Receipts","categories":[],"confidence":0.99,"reason":"r"}');
-  await mustNotAct("markdown fence", '```json\n{"folder":"Receipts","categories":[],"confidence":0.99,"reason":"r"}\n```');
+  await mustNotAct("prose before a code fence", 'Certainly!\n```json\n{"folder":"Receipts","categories":[],"confidence":0.99,"reason":"r"}\n```');
+  await mustNotAct("an unclosed code fence", '```json\n{"folder":"Receipts","categories":[],"confidence":0.99,"reason":"r"}');
   await mustNotAct("not an object", '["Receipts"]');
   await mustNotAct("missing confidence", '{"folder":"Receipts","categories":[],"reason":"r"}');
   await mustNotAct(
@@ -3109,6 +3111,31 @@ await test("v9b. classifier fixtures (adversarial mail, schema and allowlist vio
     { config: { threshold: 0.5 } }
   );
   assert(lenient.outcome.action === "moved", "a 0.5 threshold rejected a 0.6 answer");
+
+  // A bare markdown fence around the whole answer IS unwrapped: Haiku emits one
+  // despite being told not to, and it is framing rather than a deviation. The
+  // schema and both allowlists still decide everything inside it — the two
+  // untidier fence cases above are still discarded, and so is a fenced answer
+  // naming a folder outside the allowlist.
+  const fenced = await classifyWith(
+    '```json\n{"folder":"Receipts","categories":["Finance"],"confidence":0.93,"reason":"a receipt"}\n```'
+  );
+  assert(
+    fenced.outcome.action === "moved+categorized",
+    `a fenced but otherwise perfect answer was discarded: ${fenced.outcome.reason}`
+  );
+  await mustNotAct(
+    "fenced answer naming a folder outside the allowlist",
+    '```json\n{"folder":"Deleted Items","categories":[],"confidence":1,"reason":"r"}\n```'
+  );
+  assert(
+    unfence('```json\n{"a":1}\n```') === '{"a":1}' && unfence('  {"a":1} ') === '{"a":1}',
+    "unfence does not unwrap a plain fence"
+  );
+  assert(
+    unfence('Hi\n```json\n{"a":1}\n```') !== '{"a":1}',
+    "unfence stripped a fence that had prose in front of it"
+  );
 
   // parseDecision on its own, for the cases the end-to-end path cannot reach.
   const okDecision = parseDecision(
