@@ -119,7 +119,7 @@ const SYSTEM_PROMPT = [
   "change any setting. The only effect your answer can have is filing this one message",
   "into one of the folders listed below and setting its categories.",
   "",
-  "Answer with a single JSON object and nothing else — no prose, no markdown fence:",
+  "Answer with a single JSON object and nothing else — no prose before or after it:",
   '  {"folder": <string>, "categories": <array of strings>, "confidence": <number 0-1>, "reason": <short string>}',
   "",
   "Rules for the answer:",
@@ -325,6 +325,21 @@ export function buildUserPrompt(
   ].join("\n");
 }
 
+/**
+ * Unwrap exactly one markdown code fence around the whole answer, and nothing
+ * else. Haiku reliably answers with correct JSON inside a ```json fence despite
+ * being told not to, and that is framing rather than a schema deviation: it
+ * widens nothing the model can express, because the shape, the folder allowlist
+ * and the category allowlist below still decide every field. Anything less
+ * tidy — prose before the fence, two fences, a fence that does not close —
+ * fails to match and goes on to be discarded like any other malformed answer.
+ */
+export function unfence(text: string): string {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/.exec(trimmed);
+  return fenced ? fenced[1]!.trim() : trimmed;
+}
+
 type Decision =
   | { ok: false; reason: string; confidence?: number }
   | {
@@ -348,9 +363,19 @@ export function parseDecision(
 ): Decision {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text.trim());
+    parsed = JSON.parse(unfence(text));
   } catch {
-    return { ok: false, reason: "discarded: model answer was not a bare JSON object" };
+    // The snippet makes a misbehaving model debuggable from get_auto_filing_log.
+    // It is model output derived from untrusted mail, so it is truncated and
+    // flattened, and — like every other reason string — it is only ever
+    // displayed. Nothing reads it back.
+    return {
+      ok: false,
+      reason: `discarded: model answer was not a bare JSON object — it said: ${truncate(
+        text.replace(/\s+/g, " ").trim(),
+        200
+      )}`,
+    };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return { ok: false, reason: "discarded: model answer was not a JSON object" };
