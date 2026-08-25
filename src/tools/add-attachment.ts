@@ -23,7 +23,17 @@ export const addAttachmentSchema = {
   draft_id: z
     .string()
     .min(1)
-    .describe("The id of the draft to attach the file to (from create_draft)."),
+    .optional()
+    .describe(
+      "The id of the email draft to attach the file to (from create_draft). Give exactly one of draft_id or event_id."
+    ),
+  event_id: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "The id of a calendar event to attach the file to instead (from list_events with include_ids, or create_event). On an event with attendees, they see the attachment when the event next syncs."
+    ),
   file_path: z
     .string()
     .min(1)
@@ -64,7 +74,7 @@ export const addAttachmentSchema = {
 const addAttachmentArgs = z.object(addAttachmentSchema);
 
 export const addAttachmentDescription =
-  "Attach a file to an existing email draft (max 25 MB) from exactly one of four sources: file_path (a local file — local stdio server only), url (an https link this server fetches), content_base64 (bytes you supply, max 3 MB), or onedrive_path (a file in OneDrive, attached as a copy of its bytes). Natural flow: create_draft → add_attachment (once per file) → send_draft. Fails if the id is not a draft, no source or more than one is given, or the file is missing/oversized. This tool never sends — the draft stays in Drafts until send_draft is called.";
+  "Attach a file to an existing email draft (draft_id) or calendar event (event_id) — max 25 MB — from exactly one of four sources: file_path (a local file — local stdio server only), url (an https link this server fetches), content_base64 (bytes you supply, max 3 MB), or onedrive_path (a file in OneDrive, attached as a copy of its bytes). Natural mail flow: create_draft → add_attachment (once per file) → send_draft. Fails if draft_id is not a draft, no source or more than one is given, or the file is missing/oversized. This tool never sends mail — a draft stays in Drafts until send_draft is called (update_draft's remove_attachments takes one off again).";
 
 const SMALL_LIMIT = 3 * 1024 * 1024; // single-POST fileAttachment below this
 const CHUNK_SIZE = 4 * 1024 * 1024; // upload-session chunk size
@@ -78,13 +88,13 @@ export { contentTypeForFile };
  * token is for graph.microsoft.com, a different audience).
  */
 async function uploadViaSession(
-  draftId: string,
+  basePath: string,
   name: string,
   contentType: string,
   buffer: Buffer
 ): Promise<void> {
   const session = await callGraphServer(
-    `/me/messages/${encodeURIComponent(draftId)}/attachments/createUploadSession`,
+    `${basePath}/attachments/createUploadSession`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -177,8 +187,14 @@ export async function addAttachmentHandler(
   input: z.input<typeof addAttachmentArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { draft_id, file_path, url, content_base64, onedrive_path, attachment_name } =
+    const { draft_id, event_id, file_path, url, content_base64, onedrive_path, attachment_name } =
       addAttachmentArgs.parse(input);
+
+    if ((draft_id === undefined) === (event_id === undefined)) {
+      return errorResult(
+        "Give exactly one target: draft_id (an email draft) or event_id (a calendar event)."
+      );
+    }
 
     const given = [
       ["file_path", file_path],
@@ -211,13 +227,40 @@ export async function addAttachmentHandler(
             : await prepareOneDriveSource(onedrive_path!, attachment_name);
     if (!prepared.ok) return errorResult(prepared.message);
 
-    const msg = await callGraphServer(
-      `/me/messages/${encodeURIComponent(draft_id)}?$select=isDraft,subject`
-    );
-    if (!msg.isDraft) {
-      return errorResult(
-        `Message ${draft_id} is not a draft (subject: ${JSON.stringify(msg.subject ?? "")}) — attachments can only be added to drafts.`
+    let basePath: string;
+    let targetLabel: string;
+    if (draft_id !== undefined) {
+      const msg = await callGraphServer(
+        `/me/messages/${encodeURIComponent(draft_id)}?$select=isDraft,subject`
       );
+      if (!msg.isDraft) {
+        return errorResult(
+          `Message ${draft_id} is not a draft (subject: ${JSON.stringify(msg.subject ?? "")}) — attachments can only be added to drafts.`
+        );
+      }
+      basePath = `/me/messages/${encodeURIComponent(draft_id)}`;
+      targetLabel = `Draft subject: ${msg.subject || "(no subject)"}\nDraft id: ${draft_id}\nStill in Drafts — use send_draft to send it.`;
+    } else {
+      let event: any;
+      try {
+        event = await callGraphServer(
+          `/me/events/${encodeURIComponent(event_id!)}?$select=subject,attendees,isOrganizer`
+        );
+      } catch (err) {
+        if (isNotFound(err)) {
+          return errorResult(
+            `No event ${event_id} — use an event id from list_events (include_ids) or create_event.`
+          );
+        }
+        throw err;
+      }
+      const attendeeCount = (event.attendees ?? []).length;
+      basePath = `/me/events/${encodeURIComponent(event_id!)}`;
+      targetLabel =
+        `Event: ${event.subject || "(no subject)"}\nEvent id: ${event_id}\n` +
+        (attendeeCount
+          ? `The event's ${attendeeCount} attendee(s) see the attachment when the event syncs to them.`
+          : "No attendees — the attachment is visible only on this calendar.");
     }
 
     const name = prepared.source.name;
@@ -233,7 +276,7 @@ export async function addAttachmentHandler(
     }
 
     if (buffer.length < SMALL_LIMIT) {
-      await callGraphServer(`/me/messages/${encodeURIComponent(draft_id)}/attachments`, {
+      await callGraphServer(`${basePath}/attachments`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -244,7 +287,7 @@ export async function addAttachmentHandler(
         }),
       });
     } else {
-      await uploadViaSession(draft_id, name, contentType, buffer);
+      await uploadViaSession(basePath, name, contentType, buffer);
     }
 
     return textResult(
@@ -252,9 +295,7 @@ export async function addAttachmentHandler(
         `Name: ${name}\n` +
         `Type: ${contentType}\n` +
         `Size: ${formatSize(buffer.length)}\n` +
-        `Draft subject: ${msg.subject || "(no subject)"}\n` +
-        `Draft id: ${draft_id}\n` +
-        "Still in Drafts — use send_draft to send it."
+        targetLabel
     );
   });
 }

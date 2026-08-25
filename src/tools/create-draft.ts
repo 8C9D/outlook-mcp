@@ -1,10 +1,35 @@
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
+import { getStateStore } from "../core/state.js";
+import { STATE_SIGNATURE } from "../core/kv-keys.js";
 import { ToolResult, errorResult, runTool, textResult, toRecipients } from "./common.js";
 
 // NOTE: Sending is two-step by structure. This tool only composes drafts;
 // the sole send path in this codebase is send_draft (POST /messages/{id}/send).
 // Nothing here may ever call /me/sendMail.
+
+/** Escape text for embedding in an HTML body (signature, plain fragments). */
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** The signature the user stored with mailbox_settings, or undefined. */
+export async function readSignature(): Promise<string | undefined> {
+  const store = getStateStore();
+  if (!store) return undefined;
+  const raw = await store.get(STATE_SIGNATURE).catch(() => null);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.text === "string" && parsed.text ? parsed.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const createDraftSchema = {
   reply_to_message_id: z
@@ -39,22 +64,63 @@ export const createDraftSchema = {
     .string()
     .min(1)
     .describe(
-      "Message body, treated as plain text. In reply and forward modes it is placed above the quoted original."
+      "Message body. Plain text unless body_format is \"html\". In reply and forward modes it is placed above the quoted original."
+    ),
+  body_format: z
+    .enum(["text", "html"])
+    .default("text")
+    .describe(
+      'How to interpret body: "text" (default) or "html" for a formatted message — body is then the HTML fragment for the new content (links, lists, bold, …).'
     ),
   cc: z.array(z.string().email()).optional().describe("Optional CC email addresses."),
+  bcc: z
+    .array(z.string().email())
+    .optional()
+    .describe("Optional BCC email addresses — hidden from the other recipients."),
+  importance: z
+    .enum(["low", "normal", "high"])
+    .optional()
+    .describe('Message importance flag shown to recipients ("high" = the red exclamation mark).'),
+  request_read_receipt: z
+    .boolean()
+    .optional()
+    .describe("Ask recipients' clients for a read receipt (they may decline to send one)."),
+  request_delivery_receipt: z
+    .boolean()
+    .optional()
+    .describe("Ask the receiving server for a delivery receipt."),
+  omit_signature: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Leave the stored email signature off this draft. By default, a signature saved with mailbox_settings set_signature is appended under the new text."
+    ),
 };
 
 const createDraftArgs = z.object(createDraftSchema);
 
 export const createDraftDescription =
-  "Create an email draft in the Outlook Drafts folder — this tool never sends; sending requires a separate send_draft call. Three mutually exclusive modes: reply mode (reply_to_message_id, optionally reply_all) drafts a reply with your text above the quoted original; forward mode (forward_message_id + to) drafts a forward; new-message mode (to + subject) drafts a fresh message. body is required in every mode.";
+  "Create an email draft in the Outlook Drafts folder — this tool never sends; sending requires a separate send_draft call. Three mutually exclusive modes: reply mode (reply_to_message_id, optionally reply_all) drafts a reply with your text above the quoted original; forward mode (forward_message_id + to) drafts a forward; new-message mode (to + subject) drafts a fresh message. body is required in every mode (HTML with body_format \"html\"). Also takes cc, bcc, importance, and read/delivery receipt requests. If a signature is stored (mailbox_settings set_signature) it is appended automatically unless omit_signature is set.";
 
 export async function createDraftHandler(
   input: z.input<typeof createDraftArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { reply_to_message_id, reply_all, forward_message_id, to, subject, body, cc } =
-      createDraftArgs.parse(input);
+    const {
+      reply_to_message_id,
+      reply_all,
+      forward_message_id,
+      to,
+      subject,
+      body,
+      body_format,
+      cc,
+      bcc,
+      importance,
+      request_read_receipt,
+      request_delivery_receipt,
+      omit_signature,
+    } = createDraftArgs.parse(input);
 
     const replyMode = reply_to_message_id !== undefined;
     const forwardMode = forward_message_id !== undefined;
@@ -83,6 +149,25 @@ export async function createDraftHandler(
       );
     }
 
+    const html = body_format === "html";
+    const signature = omit_signature ? undefined : await readSignature();
+    // The signature sits under the new text — above the quoted tail in
+    // reply/forward mode, exactly where Outlook's own clients put it.
+    const signedBody = signature
+      ? html
+        ? `${body}<br><br>${escapeHtml(signature).replace(/\n/g, "<br>")}`
+        : `${body}\n\n${signature}`
+      : body;
+
+    /** Fields shared by every mode; recipients and body are per-mode. */
+    const extraFields = {
+      ...(importance !== undefined ? { importance } : {}),
+      ...(request_read_receipt !== undefined ? { isReadReceiptRequested: request_read_receipt } : {}),
+      ...(request_delivery_receipt !== undefined
+        ? { isDeliveryReceiptRequested: request_delivery_receipt }
+        : {}),
+    };
+
     let draft: any;
     let modeLabel = "";
     if (replyMode || forwardMode) {
@@ -93,20 +178,25 @@ export async function createDraftHandler(
         `/me/messages/${encodeURIComponent(sourceId)}/${action}`,
         { method: "POST" }
       );
-      // Fetch the auto-generated quoted body as text, then prepend the new text above it.
+      // Fetch the auto-generated quoted body (text or HTML to match body_format),
+      // then place the new text — and the signature — above it.
       const existing = await callGraphServer(
         `/me/messages/${created.id}?$select=body,subject,toRecipients`,
-        { headers: { Prefer: 'outlook.body-content-type="text"' } }
+        html ? undefined : { headers: { Prefer: 'outlook.body-content-type="text"' } }
       );
       const quoted = (existing.body?.content ?? "").replace(/\r\n/g, "\n");
       const patch: any = {
-        body: { contentType: "Text", content: `${body}\n\n${quoted}`.trimEnd() + "\n" },
+        body: html
+          ? { contentType: "HTML", content: `${signedBody}<br><br>${quoted}` }
+          : { contentType: "Text", content: `${signedBody}\n\n${quoted}`.trimEnd() + "\n" },
+        ...extraFields,
       };
       if (forwardMode && to?.length) patch.toRecipients = toRecipients(to);
       if (cc?.length) {
         const existingCc = created.ccRecipients ?? [];
         patch.ccRecipients = [...existingCc, ...toRecipients(cc)];
       }
+      if (bcc?.length) patch.bccRecipients = toRecipients(bcc);
       draft = await callGraphServer(`/me/messages/${created.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -118,26 +208,34 @@ export async function createDraftHandler(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           subject,
-          body: { contentType: "Text", content: body },
+          body: { contentType: html ? "HTML" : "Text", content: signedBody },
           toRecipients: toRecipients(to!),
           ...(cc?.length ? { ccRecipients: toRecipients(cc) } : {}),
+          ...(bcc?.length ? { bccRecipients: toRecipients(bcc) } : {}),
+          ...extraFields,
         }),
       });
     }
 
-    const recipients = (draft.toRecipients ?? [])
-      .map((r: any) => r.emailAddress?.address)
-      .filter(Boolean)
-      .join(", ");
-    const ccList = (draft.ccRecipients ?? [])
-      .map((r: any) => r.emailAddress?.address)
-      .filter(Boolean)
-      .join(", ");
+    const addressList = (recipients: any[] | undefined) =>
+      (recipients ?? [])
+        .map((r: any) => r.emailAddress?.address)
+        .filter(Boolean)
+        .join(", ");
+    const recipients = addressList(draft.toRecipients);
+    const ccList = addressList(draft.ccRecipients);
+    const bccList = addressList(draft.bccRecipients);
     return textResult(
       `Draft created${modeLabel}.\n` +
         `Subject: ${draft.subject || "(no subject)"}\n` +
         `To: ${recipients || "(none)"}\n` +
         (ccList ? `Cc: ${ccList}\n` : "") +
+        (bccList ? `Bcc: ${bccList}\n` : "") +
+        (importance && importance !== "normal" ? `Importance: ${importance}\n` : "") +
+        (request_read_receipt ? "Read receipt: requested\n" : "") +
+        (request_delivery_receipt ? "Delivery receipt: requested\n" : "") +
+        (html ? "Body: HTML\n" : "") +
+        (signature ? "Signature: appended (omit_signature skips it)\n" : "") +
         `Draft id: ${draft.id}\n` +
         "Saved to Drafts — not sent. Use update_draft to revise, or send_draft to send it."
     );

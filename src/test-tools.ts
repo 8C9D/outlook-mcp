@@ -25,6 +25,9 @@ import { readMessageHandler } from "./tools/read-message.js";
 import { createDraftHandler } from "./tools/create-draft.js";
 import { updateDraftHandler } from "./tools/update-draft.js";
 import { sendDraftHandler } from "./tools/send-draft.js";
+import { manageScheduledSendHandler } from "./tools/manage-scheduled-send.js";
+import { manageCalendarHandler } from "./tools/manage-calendar.js";
+import { manageFolderHandler } from "./tools/manage-folder.js";
 import { manageMessageHandler } from "./tools/manage-message.js";
 import { listFoldersHandler } from "./tools/list-folders.js";
 import { listEventsHandler, torontoToday, addDays } from "./tools/list-events.js";
@@ -3696,10 +3699,15 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   create_draft: [false, false, false, false],
   update_draft: [false, false, true, false],
   send_draft: [false, true, false, true],
+  // cancel discards the waiting message outright (verified live: no Deleted
+  // Items copy) — destructive, and not repeatable.
+  manage_scheduled_send: [false, true, false, false],
   manage_message: [false, true, false, false],
   list_folders: [true, false, true, false],
   list_events: [true, false, true, false],
   list_calendars: [true, false, true, false],
+  // create/rename/recolor only — delete is deliberately absent.
+  manage_calendar: [false, false, false, false],
   create_event: [false, false, false, true],
   manage_event: [false, true, false, true],
   search_contacts: [true, false, true, false],
@@ -3713,6 +3721,8 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   // Soft (a MOVE into Deleted Items, never Graph's permanent DELETE), but soft
   // deletes still count as destructive.
   delete_folder: [false, true, false, false],
+  // Rename and move destroy nothing (folder, messages and id all survive).
+  manage_folder: [false, false, true, false],
   manage_categories: [false, true, false, false],
   list_tasks: [true, false, true, false],
   manage_task: [false, true, false, false],
@@ -4655,6 +4665,507 @@ await test("v13c. cross-surface (onedrive_path → draft attachment; attachment 
   }
 });
 
+// ---- v14. scheduled send, compose completeness, folders/calendars/contacts --
+
+await test("v14a. scheduled send end-to-end (send_at → parked in Drafts → listed → arrives)", async () => {
+  const subject = `${TEST_PREFIX} v14a scheduled ${FILER_SHIELD}`;
+  const createText = toolText(
+    await createDraftHandler({ to: [ownAddress], subject, body: "Scheduled-send probe body." }),
+    "create_draft"
+  );
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1];
+  assert(draftId, `no draft id in: ${createText}`);
+
+  // A send_at in the past must be refused before anything is touched.
+  const past = expectError(
+    await sendDraftHandler({ draft_id: draftId!, send_at: "2020-01-01T09:00" }),
+    "send_draft(past send_at)"
+  );
+  assert(/2 minutes/.test(past), `past send_at error: ${past}`);
+
+  // Schedule ~2.75 min out (the tool's minimum lead is 2 min).
+  const sendAt = new Date(Date.now() + 165_000).toISOString();
+  const sendText = toolText(
+    await sendDraftHandler({ draft_id: draftId!, send_at: sendAt }),
+    "send_draft(send_at)"
+  );
+  assert(/scheduled to send at/.test(sendText), `schedule output: ${sendText}`);
+  assert(sendText.includes(draftId!), "schedule output lost the message id");
+
+  // Parked in Drafts, still a draft, and listed by manage_scheduled_send.
+  const parked = await callGraphServer(
+    `/me/messages/${encodeURIComponent(draftId!)}?$select=isDraft,parentFolderId`
+  );
+  assert(parked.isDraft === true, "the scheduled message is no longer a draft");
+  const listText = toolText(await manageScheduledSendHandler({ action: "list" }), "manage_scheduled_send list");
+  assert(listText.includes(subject), `list is missing the scheduled message: ${listText}`);
+  assert(listText.includes(draftId!), "list is missing the message id");
+
+  // The deferred instant passes; the message sends itself and arrives.
+  const arrived = await poll("the scheduled message to arrive in the inbox", 300_000, async () => {
+    const found = await callGraphServer(
+      `/me/mailFolders/inbox/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id,receivedDateTime`
+    );
+    return found?.value?.[0];
+  });
+  assert(
+    Date.parse(arrived.receivedDateTime) >= Date.parse(sendAt) - 60_000,
+    `arrived at ${arrived.receivedDateTime}, before the scheduled ${sendAt}`
+  );
+  const sent = await callGraphServer(
+    `/me/mailFolders/sentitems/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id`
+  );
+  assert(sent?.value?.length, "no Sent Items copy after the scheduled send");
+  await purgeTestMessages();
+});
+
+await test("v14b. scheduled send cancel (stops the send, discards the message) and its guards", async () => {
+  const subject = `${TEST_PREFIX} v14b cancel ${FILER_SHIELD}`;
+  const createText = toolText(
+    await createDraftHandler({ to: [ownAddress], subject, body: "Must never arrive." }),
+    "create_draft"
+  );
+  const draftId = createText.match(/Draft id: (\S+)/)?.[1]!;
+  assert(draftId, "no draft id");
+
+  // An ordinary draft is not cancellable — it has no send time.
+  const plain = expectError(
+    await manageScheduledSendHandler({ action: "cancel", message_id: draftId }),
+    "cancel(plain draft)"
+  );
+  assert(/ordinary draft/.test(plain), `plain-draft cancel error: ${plain}`);
+
+  const sendAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  toolText(await sendDraftHandler({ draft_id: draftId, send_at: sendAt }), "send_draft(send_at)");
+  const cancelText = toolText(
+    await manageScheduledSendHandler({ action: "cancel", message_id: draftId }),
+    "manage_scheduled_send cancel"
+  );
+  assert(/cancelled/.test(cancelText) && /discarded/.test(cancelText), `cancel output: ${cancelText}`);
+
+  // Verified live when this was built, and re-asserted here: the message is
+  // gone everywhere (no Deleted Items copy), and nothing is waiting any more.
+  const anywhere = await callGraphServer(
+    `/me/messages?$filter=${encodeURIComponent(`subject eq '${subject}'`)}&$select=id`
+  );
+  assert((anywhere?.value ?? []).length === 0, "the cancelled message still exists somewhere");
+  const listText = toolText(await manageScheduledSendHandler({ action: "list" }), "list after cancel");
+  assert(!listText.includes(subject), "the cancelled message is still listed");
+});
+
+await test("v14c. compose completeness (bcc, importance, receipts, HTML, signature, attachment removal)", async () => {
+  let draftId: string | undefined;
+  let draft2Id: string | undefined;
+  try {
+    // Signature on: stored via mailbox_settings, appended by create_draft.
+    toolText(
+      await mailboxSettingsHandler({ action: "set_signature", signature: "Best,\nMCP Test" }),
+      "set_signature"
+    );
+    const createText = toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        cc: [ownAddress],
+        bcc: [ownAddress],
+        subject: `${TEST_PREFIX} v14c compose`,
+        body: "<p>HTML <b>body</b> from the harness.</p>",
+        body_format: "html",
+        importance: "high",
+        request_read_receipt: true,
+        request_delivery_receipt: true,
+      }),
+      "create_draft(full)"
+    );
+    draftId = createText.match(/Draft id: (\S+)/)?.[1];
+    assert(draftId, `no draft id in: ${createText}`);
+    assert(/Bcc: /.test(createText) && /Importance: high/.test(createText), `output: ${createText}`);
+    assert(/Signature: appended/.test(createText), `signature not appended: ${createText}`);
+
+    const raw = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId!)}?$select=bccRecipients,importance,isReadReceiptRequested,isDeliveryReceiptRequested,body`
+    );
+    assert(raw.bccRecipients?.length === 1, "bcc did not reach the draft");
+    assert(raw.importance === "high", `importance is ${raw.importance}`);
+    assert(raw.isReadReceiptRequested === true && raw.isDeliveryReceiptRequested === true, "receipts not set");
+    assert(raw.body?.contentType?.toLowerCase() === "html", `body type is ${raw.body?.contentType}`);
+    assert(/HTML <b>body<\/b>/.test(raw.body?.content ?? ""), "HTML body was mangled");
+    assert(/Best,(<br>|\n)MCP Test/.test(raw.body?.content ?? ""), "signature missing from the HTML body");
+
+    // update_draft: bcc replacement, importance back to normal, receipt withdrawal.
+    toolText(
+      await updateDraftHandler({
+        draft_id: draftId!,
+        bcc: [],
+        importance: "normal",
+        request_read_receipt: false,
+      }),
+      "update_draft(bcc/importance)"
+    );
+    const after = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId!)}?$select=bccRecipients,importance,isReadReceiptRequested`
+    );
+    assert((after.bccRecipients ?? []).length === 0, "bcc was not cleared");
+    assert(after.importance === "normal" && after.isReadReceiptRequested === false, "update did not land");
+
+    // omit_signature leaves the signature off; clear_signature stops it entirely.
+    const noSig = toolText(
+      await createDraftHandler({
+        to: [ownAddress],
+        subject: `${TEST_PREFIX} v14c nosig`,
+        body: "No signature wanted.",
+        omit_signature: true,
+      }),
+      "create_draft(omit_signature)"
+    );
+    draft2Id = noSig.match(/Draft id: (\S+)/)?.[1];
+    assert(!/Signature: appended/.test(noSig), "omit_signature was ignored");
+    const settingsText = toolText(await mailboxSettingsHandler({ action: "get" }), "mailbox_settings get");
+    assert(/Signature: set/.test(settingsText), `get does not show the signature: ${settingsText}`);
+    toolText(await mailboxSettingsHandler({ action: "clear_signature" }), "clear_signature");
+    const cleared = toolText(await mailboxSettingsHandler({ action: "get" }), "mailbox_settings get");
+    assert(/Signature: none/.test(cleared), `signature still set after clear: ${cleared}`);
+
+    // Attachment removal through update_draft.
+    toolText(
+      await addAttachmentHandler({
+        draft_id: draftId!,
+        content_base64: Buffer.from("removable").toString("base64"),
+        attachment_name: "removable.txt",
+      }),
+      "add_attachment"
+    );
+    const inventory = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId!)}/attachments?$select=id,name`
+    );
+    const attId = inventory?.value?.[0]?.id;
+    assert(attId, "the attachment did not land");
+    const removeText = toolText(
+      await updateDraftHandler({ draft_id: draftId!, remove_attachments: [attId] }),
+      "update_draft(remove_attachments)"
+    );
+    assert(/OK\s+attachment/.test(removeText), `removal output: ${removeText}`);
+    const emptied = await callGraphServer(
+      `/me/messages/${encodeURIComponent(draftId!)}/attachments?$select=id`
+    );
+    assert((emptied?.value ?? []).length === 0, "the attachment is still on the draft");
+  } finally {
+    await mailboxSettingsHandler({ action: "clear_signature" }).catch(() => {});
+    for (const id of [draftId, draft2Id]) {
+      if (id) await callGraphServer(`/me/messages/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+    }
+    await purgeTestMessages();
+  }
+});
+
+await test("v14d. manage_folder (rename in place, move keeps the id, well-known and collision guards)", async () => {
+  try {
+    const aText = toolText(
+      await createFolderHandler({ name: `${TEST_PREFIX} v14d A` }),
+      "create_folder A"
+    );
+    const aId = aText.match(/Folder id: (\S+)/)?.[1]!;
+    const bText = toolText(
+      await createFolderHandler({ name: `${TEST_PREFIX} v14d B` }),
+      "create_folder B"
+    );
+    const bId = bText.match(/Folder id: (\S+)/)?.[1]!;
+    assert(aId && bId, "folder ids missing");
+
+    const renamed = toolText(
+      await manageFolderHandler({ action: "rename", folder: aId, new_name: `${TEST_PREFIX} v14d A2` }),
+      "manage_folder rename"
+    );
+    assert(renamed.includes(`"${TEST_PREFIX} v14d A2"`), `rename output: ${renamed}`);
+
+    const moved = toolText(
+      await manageFolderHandler({ action: "move", folder: aId, destination_folder: bId }),
+      "manage_folder move"
+    );
+    assert(/unchanged — folder ids survive moves/.test(moved), `move output: ${moved}`);
+    const after = await callGraphServer(
+      `/me/mailFolders/${encodeURIComponent(aId)}?$select=id,parentFolderId`
+    );
+    assert(after.parentFolderId === bId, "the folder did not land under B");
+
+    // Guards: well-known folders, self-moves, sibling collisions.
+    const inboxErr = expectError(
+      await manageFolderHandler({ action: "rename", folder: "inbox", new_name: "X" }),
+      "rename inbox"
+    );
+    assert(/well-known/.test(inboxErr), `inbox rename error: ${inboxErr}`);
+    const selfErr = expectError(
+      await manageFolderHandler({ action: "move", folder: bId, destination_folder: bId }),
+      "move into itself"
+    );
+    assert(/into itself/.test(selfErr), `self-move error: ${selfErr}`);
+    // A sibling collision on rename is refused, naming the uniqueness rule:
+    // C sits at the root next to B and tries to take B's name.
+    const cText = toolText(
+      await createFolderHandler({ name: `${TEST_PREFIX} v14d C` }),
+      "create_folder C"
+    );
+    const cId = cText.match(/Folder id: (\S+)/)?.[1]!;
+    const clashErr = expectError(
+      await manageFolderHandler({ action: "rename", folder: cId, new_name: `${TEST_PREFIX} v14d B` }),
+      "rename onto an existing sibling"
+    );
+    assert(/unique among siblings/.test(clashErr), `collision error: ${clashErr}`);
+    void cId;
+    // Move A back to the root so the purge sees both folders at the top level.
+    toolText(
+      await manageFolderHandler({ action: "move", folder: aId, destination_folder: "root" }),
+      "manage_folder move to root"
+    );
+  } finally {
+    await purgeTestFolders();
+  }
+});
+
+await test("v14e. manage_calendar (create, duplicate refused, rename, recolor, default guard)", async () => {
+  try {
+    const createText = toolText(
+      await manageCalendarHandler({ action: "create", name: `${TEST_PREFIX} v14e cal` }),
+      "manage_calendar create"
+    );
+    assert(/Calendar .* created/.test(createText), `create output: ${createText}`);
+    const dupErr = expectError(
+      await manageCalendarHandler({ action: "create", name: `${TEST_PREFIX} v14e cal` }),
+      "duplicate calendar"
+    );
+    assert(/already exists/.test(dupErr), `duplicate error: ${dupErr}`);
+    const renameText = toolText(
+      await manageCalendarHandler({
+        action: "rename",
+        calendar: `${TEST_PREFIX} v14e cal`,
+        name: `${TEST_PREFIX} v14e cal renamed`,
+      }),
+      "manage_calendar rename"
+    );
+    assert(/renamed from/.test(renameText), `rename output: ${renameText}`);
+    const colorText = toolText(
+      await manageCalendarHandler({
+        action: "set_color",
+        calendar: `${TEST_PREFIX} v14e cal renamed`,
+        color: "lightGreen",
+      }),
+      "manage_calendar set_color"
+    );
+    assert(/lightGreen/.test(colorText), `color output: ${colorText}`);
+    const defaultErr = expectError(
+      await manageCalendarHandler({ action: "rename", calendar: "Calendar", name: "X" }),
+      "rename the default calendar"
+    );
+    assert(/default calendar/.test(defaultErr), `default-guard error: ${defaultErr}`);
+  } finally {
+    await purgeTestCalendars();
+  }
+});
+
+await test("v14f. event extras (show_as, private, categories, query, event attachment, forward)", async () => {
+  let eventId: string | undefined;
+  const categoryName = `${TEST_PREFIX} v14f cat`;
+  try {
+    toolText(
+      await manageCategoriesHandler({ action: "create", display_name: categoryName, color: "preset0" }),
+      "manage_categories create"
+    );
+    const start = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const createText = toolText(
+      await createEventHandler({
+        subject: `${TEST_PREFIX} v14f extras`,
+        start: `${start}T15:00`,
+        show_as: "free",
+        private: true,
+        categories: [categoryName],
+      }),
+      "create_event(extras)"
+    );
+    eventId = createText.match(/Event id: (\S+?)(?: |\n|$)/)?.[1];
+    assert(eventId, `no event id in: ${createText}`);
+    assert(/Shows as: free/.test(createText) && /Sensitivity: private/.test(createText), createText);
+
+    const raw = await callGraphServer(
+      `/me/events/${encodeURIComponent(eventId!)}?$select=showAs,sensitivity,categories`
+    );
+    assert(raw.showAs === "free" && raw.sensitivity === "private", `event carries ${raw.showAs}/${raw.sensitivity}`);
+    assert((raw.categories ?? []).includes(categoryName), "category missing from the event");
+
+    // An unknown category is refused with the real list, before Graph is asked.
+    const badCat = expectError(
+      await createEventHandler({
+        subject: `${TEST_PREFIX} v14f bad`,
+        start: `${start}T16:00`,
+        categories: ["No Such Category Exists"],
+      }),
+      "create_event(bad category)"
+    );
+    assert(/Unknown categor/.test(badCat), `bad-category error: ${badCat}`);
+
+    // manage_event update flips them back.
+    toolText(
+      await manageEventHandler({ event_id: eventId!, action: "update", show_as: "busy", private: false }),
+      "manage_event(show_as)"
+    );
+    const flipped = await callGraphServer(
+      `/me/events/${encodeURIComponent(eventId!)}?$select=showAs,sensitivity`
+    );
+    assert(flipped.showAs === "busy" && flipped.sensitivity === "normal", "update did not land");
+
+    // list_events query finds it (and misses with a nonsense query).
+    const hit = toolText(
+      await listEventsHandler({ start_date: start, days: 1, query: "v14f extras" }),
+      "list_events(query)"
+    );
+    assert(hit.includes(`${TEST_PREFIX} v14f extras`), `query missed the event: ${hit}`);
+    const miss = toolText(
+      await listEventsHandler({ start_date: start, days: 1, query: "zzz-no-such-event" }),
+      "list_events(query miss)"
+    );
+    assert(/No events matching/.test(miss), `nonsense query still matched: ${miss}`);
+
+    // Attachment on the event.
+    toolText(
+      await addAttachmentHandler({
+        event_id: eventId!,
+        content_base64: Buffer.from("agenda").toString("base64"),
+        attachment_name: "agenda.txt",
+      }),
+      "add_attachment(event)"
+    );
+    const atts = await callGraphServer(
+      `/me/events/${encodeURIComponent(eventId!)}/attachments?$select=id,name`
+    );
+    assert(atts?.value?.[0]?.name === "agenda.txt", "event attachment did not land");
+
+    // Forward the event to the account itself (the one address that emails no one else).
+    const fwd = toolText(
+      await manageEventHandler({ event_id: eventId!, action: "forward", forward_to: [ownAddress] }),
+      "manage_event(forward)"
+    );
+    assert(/forwarded to/.test(fwd), `forward output: ${fwd}`);
+    // The forward arrives as "FW: [MCP TEST] …", which the prefix-based purge
+    // would miss — wait for it (best effort) and remove it explicitly.
+    const fwSubject = `FW: ${TEST_PREFIX} v14f extras`;
+    const forwarded = await poll("the forwarded event to arrive", 90_000, async () => {
+      const found = await callGraphServer(
+        `/me/messages?$filter=${encodeURIComponent(`subject eq '${fwSubject}'`)}&$select=id`
+      );
+      return found?.value?.[0];
+    }).catch(() => undefined);
+    if (forwarded) {
+      await callGraphServer(`/me/messages/${encodeURIComponent(forwarded.id)}/permanentDelete`, {
+        method: "POST",
+      }).catch(() => {});
+    }
+  } finally {
+    if (eventId) {
+      await callGraphServer(`/me/events/${encodeURIComponent(eventId)}`, { method: "DELETE" }).catch(() => {});
+    }
+    await purgeTestCategories();
+    await purgeTestMessages();
+  }
+});
+
+await test("v14g. contact extras (full field set, photo, categories) and search rendering", async () => {
+  let contactId: string | undefined;
+  const categoryName = `${TEST_PREFIX} v14g cat`;
+  try {
+    toolText(
+      await manageCategoriesHandler({ action: "create", display_name: categoryName, color: "preset0" }),
+      "manage_categories create"
+    );
+    // A 1×1 transparent PNG.
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const createText = toolText(
+      await manageContactHandler({
+        action: "create",
+        given_name: `${TEST_PREFIX} v14g`,
+        surname: "Probe",
+        nickname: "Probey",
+        emails: ["v14g.probe@example.com"],
+        mobile_phone: "+1 555 0100",
+        home_phones: ["+1 555 0101"],
+        company: "Probe Co",
+        job_title: "Prober",
+        birthday: "1990-05-15",
+        home_address: { street: "1 Probe St", city: "Toronto", state: "ON", postal_code: "M1M 1M1", country: "Canada" },
+        personal_notes: "probe notes",
+        categories: [categoryName],
+        photo_base64: png,
+      }),
+      "manage_contact(create full)"
+    );
+    contactId = createText.match(/Contact id: (\S+)/)?.[1];
+    assert(contactId, `no contact id in: ${createText}`);
+    assert(/"Probey"/.test(createText), `nickname missing: ${createText}`);
+    assert(/Work: Prober, Probe Co/.test(createText), `work line missing: ${createText}`);
+    assert(/Birthday: 1990-05-1/.test(createText), `birthday missing: ${createText}`);
+    assert(/Home address: 1 Probe St, Toronto/.test(createText), `address missing: ${createText}`);
+    assert(/Photo: set/.test(createText), `photo line missing: ${createText}`);
+
+    const photo = await callGraphServer(`/me/contacts/${encodeURIComponent(contactId!)}/photo`);
+    assert(photo?.width === 1 && photo?.height === 1, "the photo did not land on the contact");
+
+    toolText(
+      await manageContactHandler({ action: "update", contact_id: contactId!, mobile_phone: "+1 555 0199" }),
+      "manage_contact(update mobile)"
+    );
+    const raw = await callGraphServer(
+      `/me/contacts/${encodeURIComponent(contactId!)}?$select=mobilePhone,birthday,jobTitle,categories`
+    );
+    assert(raw.mobilePhone === "+1 555 0199", `mobile is ${raw.mobilePhone}`);
+    assert(String(raw.birthday ?? "").startsWith("1990-05-15"), `birthday stored as ${raw.birthday}`);
+    assert((raw.categories ?? []).includes(categoryName), "contact category missing");
+  } finally {
+    if (contactId) {
+      await manageContactHandler({ action: "delete", contact_id: contactId }).catch(() => {});
+    }
+    await purgeTestCategories();
+  }
+});
+
+await test("v14h. task importance and search_mail unread_only", async () => {
+  // Task importance: create high → listed as important → update to normal.
+  const createText = toolText(
+    await manageTaskHandler({ action: "create", title: `${TEST_PREFIX} v14h important`, importance: "high" }),
+    "manage_task(create high)"
+  );
+  const taskId = createText.match(/Task id: (\S+)/)?.[1]!;
+  assert(/Importance: high/.test(createText), `create output: ${createText}`);
+  try {
+    const listText = toolText(await listTasksHandler({}), "list_tasks");
+    const line = listText.split("\n").find((l) => l.includes("v14h important"));
+    assert(line && /important/.test(line), `list line lacks the importance marker: ${line}`);
+    toolText(
+      await manageTaskHandler({ action: "update", task_id: taskId, importance: "normal" }),
+      "manage_task(update importance)"
+    );
+    const raw = await callGraphServer(
+      `/me/todo/lists/${encodeURIComponent((await resolveTaskList(undefined)).id)}/tasks/${encodeURIComponent(taskId)}`
+    );
+    assert(raw.importance === "normal", `importance is ${raw.importance}`);
+  } finally {
+    await manageTaskHandler({ action: "delete", task_id: taskId }).catch(() => {});
+  }
+
+  // unread_only: every result must be unread, in both modes, and the flag
+  // shows up in the structured filters.
+  const latest = await searchMailHandler({ unread_only: true, max_results: 10 });
+  const latestText = toolText(latest, "search_mail(unread latest)");
+  const latestStructured = latest.structuredContent as any;
+  assert(latestStructured?.filters?.unread_only === true, "structured filters lost unread_only");
+  for (const m of latestStructured?.messages ?? []) {
+    assert(m.isRead === false, `a read message leaked into unread_only: ${JSON.stringify(m)}`);
+  }
+  assert(/unread only/.test(latestText) || latestStructured?.count === 0, `text lost the filter note: ${latestText}`);
+  const search = await searchMailHandler({ query: "the", unread_only: true, max_results: 10 });
+  const searchStructured = search.structuredContent as any;
+  for (const m of searchStructured?.messages ?? []) {
+    assert(m.isRead === false, `query mode leaked a read message: ${JSON.stringify(m)}`);
+  }
+});
+
 // ---- h. stdio protocol smoke test ---------------------------------------
 
 await test("h. stdio smoke test (initialize + tools/prompts/resources lists, clean stdout)", async () => {
@@ -4736,12 +5247,15 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "list_tasks",
       "mailbox_settings",
       "manage_auto_filing",
+      "manage_calendar",
       "manage_categories",
       "manage_contact",
       "manage_event",
       "manage_file",
+      "manage_folder",
       "manage_message",
       "manage_rules",
+      "manage_scheduled_send",
       "manage_senders",
       "manage_task",
       "read_file",
@@ -4755,7 +5269,7 @@ await test("h. stdio smoke test (initialize + tools/prompts/resources lists, cle
       "update_draft",
       "upload_file",
     ];
-    assert(tools.length === 37, `Expected 37 tools, got ${tools.length}`);
+    assert(tools.length === 40, `Expected 40 tools, got ${tools.length}`);
     assert(
       JSON.stringify(names) === JSON.stringify(expected),
       `Expected tools ${expected.join(", ")}; got ${names.join(", ")}`

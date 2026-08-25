@@ -154,6 +154,7 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       const reminder = task.isReminderOn ? localDateTime(task.reminderDateTime) : undefined;
       const subtasks: any[] = task.checklistItems ?? [];
       const details = [
+        task.importance === "high" ? "important" : undefined,
         due ? `due ${stamp(due)}` : undefined,
         reminder ? `reminder ${stamp(reminder)}` : undefined,
         task.recurrence ? "repeating" : undefined,
@@ -189,6 +190,7 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
         ...(due ? { due: stamp(due) } : {}),
         ...(reminder ? { reminder: stamp(reminder) } : {}),
         ...(task.recurrence ? { repeating: true } : {}),
+        ...(task.importance === "high" ? { important: true } : {}),
         ...(task.status === "completed" ? { completed: true } : {}),
         ...(subtasks.length
           ? {

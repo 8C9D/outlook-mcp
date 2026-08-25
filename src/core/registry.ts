@@ -31,6 +31,11 @@ import {
 } from "../tools/update-draft.js";
 import { sendDraftDescription, sendDraftHandler, sendDraftSchema } from "../tools/send-draft.js";
 import {
+  manageScheduledSendDescription,
+  manageScheduledSendHandler,
+  manageScheduledSendSchema,
+} from "../tools/manage-scheduled-send.js";
+import {
   manageMessageDescription,
   manageMessageHandler,
   manageMessageSchema,
@@ -113,6 +118,16 @@ import {
   manageCategoriesHandler,
   manageCategoriesSchema,
 } from "../tools/manage-categories.js";
+import {
+  manageCalendarDescription,
+  manageCalendarHandler,
+  manageCalendarSchema,
+} from "../tools/manage-calendar.js";
+import {
+  manageFolderDescription,
+  manageFolderHandler,
+  manageFolderSchema,
+} from "../tools/manage-folder.js";
 import {
   listTasksDescription,
   listTasksHandler,
@@ -291,6 +306,15 @@ export const TOOLS: ToolDefinition[] = [
     handler: sendDraftHandler,
   },
   {
+    name: "manage_scheduled_send",
+    description: manageScheduledSendDescription,
+    inputSchema: manageScheduledSendSchema,
+    // list only reads Drafts, but cancel DISCARDS the waiting message outright
+    // (verified live: no Deleted Items copy) — destructive, and unrepeatable.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    handler: manageScheduledSendHandler,
+  },
+  {
     name: "manage_message",
     description: manageMessageDescription,
     inputSchema: manageMessageSchema,
@@ -321,6 +345,16 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: listCalendarsSchema,
     annotations: READ_ONLY,
     handler: listCalendarsHandler,
+  },
+  {
+    name: "manage_calendar",
+    description: manageCalendarDescription,
+    inputSchema: manageCalendarSchema,
+    // create/rename/recolor only — delete is deliberately absent, so nothing
+    // here removes anything; renaming the same name twice is the same state,
+    // but create is not repeatable.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    handler: manageCalendarHandler,
   },
   {
     name: "create_event",
@@ -416,6 +450,15 @@ export const TOOLS: ToolDefinition[] = [
     // leave where they were.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     handler: deleteFolderHandler,
+  },
+  {
+    name: "manage_folder",
+    description: manageFolderDescription,
+    inputSchema: manageFolderSchema,
+    // Rename and move destroy nothing (the folder, its messages and its id all
+    // survive), and repeating either call lands in the same state.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    handler: manageFolderHandler,
   },
   {
     name: "manage_categories",

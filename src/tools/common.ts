@@ -121,6 +121,36 @@ export function formatLocal(dateTime: string | undefined): string {
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
+/**
+ * The UTC instant a naive America/Toronto wall-clock datetime means, as an ISO
+ * string. Toronto is UTC-4 or UTC-5; trying both offsets and checking which one
+ * Toronto renders back to the same wall clock is exact year-round (DST shifts
+ * at 02:00, and the skipped/repeated hour resolves to the EDT reading).
+ */
+export function torontoInstantUtc(naive: string): string | undefined {
+  const wall = naive.length === 16 ? `${naive}:00` : naive;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(wall)) return undefined;
+  for (const offset of ["-04:00", "-05:00"]) {
+    const candidate = new Date(`${wall}${offset}`);
+    if (Number.isNaN(candidate.getTime())) return undefined;
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(candidate);
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+    const rendered = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+    if (rendered === wall) return candidate.toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+  // A wall clock inside the spring-forward gap: take the EDT reading.
+  return new Date(`${wall}-04:00`).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 export function formatSender(from: any): string {
   const name = from?.emailAddress?.name;
   const address = from?.emailAddress?.address ?? "(unknown)";

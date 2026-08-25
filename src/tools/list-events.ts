@@ -21,6 +21,13 @@ export const listEventsSchema = {
     .describe(
       "Which calendar to read: its name or id (see list_calendars). Omit for the account's default calendar."
     ),
+  query: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Only events whose subject or location contains this text (case-insensitive) — "when is my dentist appointment?". Searches within the date window, so widen days (up to 31) or set start_date to look further out.'
+    ),
   include_ids: z
     .boolean()
     .default(false)
@@ -37,6 +44,7 @@ export const listEventsOutputSchema = {
   endDate: z.string().optional().describe("Last day of the window, inclusive."),
   timezone: z.string().optional(),
   calendar: z.string().optional(),
+  query: z.string().optional().describe("The subject/location filter, when one was given."),
   count: z.number().optional(),
   days: z
     .array(
@@ -61,7 +69,7 @@ export const listEventsOutputSchema = {
 };
 
 export const listEventsDescription =
-  "List the user's Outlook calendar events for a date window, grouped by day in America/Toronto local time. Shows each event as start–end time, subject, and location; all-day events are listed first within each day, and repeating events appear once per occurrence. Defaults to the next 7 days of the default calendar starting today; set calendar to read another one and include_ids to get the ids manage_event needs.";
+  "List the user's Outlook calendar events for a date window, grouped by day in America/Toronto local time — or search the window with query (subject/location contains, case-insensitive). Shows each event as start–end time, subject, and location; all-day events are listed first within each day, and repeating events appear once per occurrence. Defaults to the next 7 days of the default calendar starting today; set calendar to read another one and include_ids to get the ids manage_event needs.";
 
 /** Today's date in America/Toronto as YYYY-MM-DD. */
 export function torontoToday(): string {
@@ -95,21 +103,37 @@ export async function listEventsHandler(
       `${calendarBasePath(target)}/calendarView?startDateTime=${encodeURIComponent(`${startDate}T00:00:00`)}` +
       `&endDateTime=${encodeURIComponent(`${endDate}T00:00:00`)}` +
       `&$select=id,subject,start,end,location,isAllDay,organizer,type&$orderby=start/dateTime&$top=50`;
-    const events = await fetchPaged(path, EVENT_CAP, { Prefer: TZ_PREFER });
+    const fetched = await fetchPaged(path, EVENT_CAP, { Prefer: TZ_PREFER });
+    // The query filter is client-side: calendarView accepts no $search, and its
+    // $filter support is patchy, so matching here keeps behavior predictable.
+    const needle = parsed.query?.toLowerCase();
+    const events = needle
+      ? fetched.filter(
+          (ev) =>
+            String(ev.subject ?? "").toLowerCase().includes(needle) ||
+            String(ev.location?.displayName ?? "").toLowerCase().includes(needle)
+        )
+      : fetched;
 
     const lastDay = addDays(startDate, parsed.days - 1);
+    const matching = needle ? ` matching ${JSON.stringify(parsed.query)}` : "";
     const structuredBase = {
       startDate,
       endDate: lastDay,
       timezone: TIMEZONE,
       ...(target ? { calendar: target.name } : {}),
+      ...(parsed.query !== undefined ? { query: parsed.query } : {}),
     };
     if (events.length === 0) {
-      return structuredResult(`No events in this window (${startDate} to ${lastDay})${where}.`, {
-        ...structuredBase,
-        count: 0,
-        days: [],
-      });
+      return structuredResult(
+        `No events${matching} in this window (${startDate} to ${lastDay})${where}.` +
+          (needle ? " Try a wider window (days, start_date) or a shorter query." : ""),
+        {
+          ...structuredBase,
+          count: 0,
+          days: [],
+        }
+      );
     }
 
     const byDay = new Map<string, { allDay: any[]; timed: any[] }>();
@@ -136,7 +160,7 @@ export async function listEventsHandler(
       });
     }
     return structuredResult(
-      `Events ${startDate} to ${lastDay}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
+      `Events ${startDate} to ${lastDay}${matching}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
       { ...structuredBase, count: events.length, days: structuredDays }
     );
   });

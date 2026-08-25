@@ -66,6 +66,9 @@ import {
   matchesFilters,
   torontoMidnightUtc,
 } from "./tools/search-mail.js";
+import { resolveSendAt } from "./tools/send-draft.js";
+import { torontoInstantUtc } from "./tools/common.js";
+import { escapeHtml } from "./tools/create-draft.js";
 import { FORCE_MOVE_CAP, deleteFolderRefusal, type FolderFacts } from "./tools/delete-folder.js";
 import {
   baseNameOf,
@@ -1336,7 +1339,7 @@ await test("o22. drive logic: paths, URLs, conflict mapping, type filter, orderi
 });
 
 await test("o16. annotations: all four hints on every tool, and the structural rules hold", async () => {
-  assert(TOOLS.length === 37, `expected 37 tools in the registry, found ${TOOLS.length}`);
+  assert(TOOLS.length === 40, `expected 40 tools in the registry, found ${TOOLS.length}`);
   for (const tool of TOOLS) {
     const { readOnlyHint, destructiveHint, idempotentHint, openWorldHint } = tool.annotations;
     for (const [hint, value] of Object.entries({ readOnlyHint, destructiveHint, idempotentHint, openWorldHint })) {
@@ -1371,6 +1374,83 @@ await test("o16. annotations: all four hints on every tool, and the structural r
   assert(
     get("upload_file").annotations.destructiveHint && get("manage_file").annotations.destructiveHint,
     "upload_file (overwrite capability) and manage_file (delete) must be destructive"
+  );
+  assert(
+    get("manage_scheduled_send").annotations.destructiveHint,
+    "manage_scheduled_send cancel discards the waiting message outright — it must be destructive"
+  );
+  assert(
+    !get("manage_calendar").annotations.destructiveHint && !get("manage_folder").annotations.destructiveHint,
+    "manage_calendar and manage_folder offer no delete — they must not be destructive"
+  );
+});
+
+await test("o23. scheduled send: send_at parsing and windows; unread filters; new compose fields", async () => {
+  // Toronto wall clock → UTC instant, across DST (EDT is UTC-4, EST is UTC-5).
+  assert(torontoInstantUtc("2026-08-26T09:00") === "2026-08-26T13:00:00Z", "EDT conversion wrong");
+  assert(torontoInstantUtc("2026-01-26T09:00:30") === "2026-01-26T14:00:30Z", "EST conversion wrong");
+  assert(torontoInstantUtc("not a date") === undefined, "garbage parsed");
+
+  // send_at validation: naive = Toronto; explicit offsets honored; the window
+  // is [now + 2 min, now + ~1 year].
+  const now = new Date("2026-08-25T12:00:00Z");
+  const ok = resolveSendAt("2026-08-25T09:00", now); // 13:00Z
+  assert(ok.ok && ok.utcIso === "2026-08-25T13:00:00Z", `naive Toronto send_at: ${JSON.stringify(ok)}`);
+  const offset = resolveSendAt("2026-08-25T12:30:00Z", now);
+  assert(offset.ok && offset.utcIso === "2026-08-25T12:30:00Z", "explicit-offset send_at mangled");
+  const millis = resolveSendAt("2026-08-25T12:30:00.280Z", now); // toISOString() output
+  assert(millis.ok && millis.utcIso === "2026-08-25T12:30:00Z", "millisecond ISO send_at refused");
+  const past = resolveSendAt("2026-08-25T07:59", now); // 11:59Z — in the past
+  assert(!past.ok && /2 minutes/.test(past.message), `past send_at: ${JSON.stringify(past)}`);
+  const tooClose = resolveSendAt("2026-08-25T12:01:00Z", now);
+  assert(!tooClose.ok && /2 minutes/.test(tooClose.message), "a 1-minute lead was accepted");
+  const boundary = resolveSendAt("2026-08-25T12:02:00Z", now);
+  assert(boundary.ok, "the exact 2-minute lead was refused");
+  const tooFar = resolveSendAt("2027-09-25T12:00", now);
+  assert(!tooFar.ok && /year/.test(tooFar.message), "a >1-year send_at was accepted");
+  const garbage = resolveSendAt("tomorrow at nine", now);
+  assert(!garbage.ok && /Could not parse/.test(garbage.message), "prose send_at was accepted");
+
+  // Unread filters ride correctly in both search modes, and the client-side
+  // check enforces them.
+  assert(
+    buildLatestFilter({ unreadOnly: true }) ===
+      "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+    `unread-only latest filter: ${buildLatestFilter({ unreadOnly: true })}`
+  );
+  assert(
+    buildLatestFilter({ dateFrom: "2026-08-19", unreadOnly: true }) ===
+      "receivedDateTime ge 2026-08-19T04:00:00.000Z and isRead eq false",
+    "unread clause must follow the leading receivedDateTime clause"
+  );
+  assert(
+    buildSearchKql("invoice", { unreadOnly: true }) === "invoice AND isread:false",
+    `unread KQL: ${buildSearchKql("invoice", { unreadOnly: true })}`
+  );
+  assert(!matchesFilters({ isRead: true }, { unreadOnly: true }), "a read message passed unread_only");
+  assert(matchesFilters({ isRead: false }, { unreadOnly: true }), "an unread message was dropped");
+  assert(matchesFilters({ isRead: true }, {}), "an unfiltered read message was dropped");
+
+  // The Focused/Other tab filter: a $filter clause in latest mode (after the
+  // leading receivedDateTime clause), client-side in query mode.
+  assert(
+    buildLatestFilter({ tab: "other" }) ===
+      "receivedDateTime ge 1900-01-01T00:00:00Z and inferenceClassification eq 'other'",
+    `tab filter: ${buildLatestFilter({ tab: "other" })}`
+  );
+  assert(
+    !matchesFilters({ inferenceClassification: "focused" } as any, { tab: "other" }),
+    "a Focused message passed the Other filter"
+  );
+  assert(
+    matchesFilters({ inferenceClassification: "other" } as any, { tab: "other" }),
+    "an Other message was dropped by its own filter"
+  );
+
+  // HTML signature embedding escapes markup rather than injecting it.
+  assert(
+    escapeHtml("a<b> & \"c\"") === "a&lt;b&gt; &amp; &quot;c&quot;",
+    `escapeHtml: ${escapeHtml("a<b> & \"c\"")}`
   );
 });
 

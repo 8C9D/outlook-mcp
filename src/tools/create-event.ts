@@ -3,6 +3,7 @@ import { callGraphServer } from "../core/graph.js";
 import { TIMEZONE, ToolInputError, ToolResult, errorResult, runTool, textResult } from "./common.js";
 import { addDays } from "./list-events.js";
 import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
+import { resolveCategoryNames } from "./manage-categories.js";
 
 /** Graph's weekday names, indexed by JavaScript's day-of-week. */
 export const WEEKDAYS = [
@@ -156,7 +157,31 @@ export const createEventSchema = {
     .array(z.string().email())
     .optional()
     .describe(
-      "Optional attendee email addresses. CAUTION: when attendees are included, Outlook sends them meeting invitations as soon as the event is created."
+      "Optional attendee email addresses (marked Required on the invitation). CAUTION: when attendees are included, Outlook sends them meeting invitations as soon as the event is created."
+    ),
+  optional_attendees: z
+    .array(z.string().email())
+    .optional()
+    .describe(
+      "Attendees marked Optional on the invitation. The same caution as attendees: they are emailed an invitation immediately."
+    ),
+  show_as: z
+    .enum(["free", "tentative", "busy", "oof", "workingElsewhere"])
+    .optional()
+    .describe(
+      'How the event blocks the free/busy view others see when scheduling with this account ("oof" = out of office). Omit for Outlook\'s default (busy).'
+    ),
+  private: z
+    .boolean()
+    .optional()
+    .describe(
+      "Mark the event Private: people the calendar is shared with see only that the time is blocked, not the subject or details."
+    ),
+  categories: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "Outlook category names for the event. Every name must already exist in the mailbox's category list (manage_categories)."
     ),
   reminder_minutes: z
     .number()
@@ -179,7 +204,7 @@ export const createEventSchema = {
 const createEventArgs = z.object(createEventSchema);
 
 export const createEventDescription =
-  "Create an event on the user's Outlook calendar (times in America/Toronto unless an explicit UTC offset is given; default duration 60 minutes). Optionally set a reminder, target a non-default calendar by name, and make it a repeating series with recurrence. CAUTION: if attendees are provided, Outlook emails them invitations immediately when the event is created — and for a series they are invited to every occurrence. Omit attendees to create a private event with no notifications.";
+  "Create an event on the user's Outlook calendar (times in America/Toronto unless an explicit UTC offset is given; default duration 60 minutes). Optionally set a reminder, a free/busy status (show_as), Private sensitivity, categories, a non-default calendar by name, and a repeating series with recurrence. CAUTION: if attendees or optional_attendees are provided, Outlook emails them invitations immediately when the event is created — and for a series they are invited to every occurrence. Omit both to create an event with no notifications.";
 
 const NAIVE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/;
 const OFFSET_RE = /(Z|[+-]\d{2}:?\d{2})$/;
@@ -218,6 +243,10 @@ export async function createEventHandler(
       location,
       body,
       attendees,
+      optional_attendees,
+      show_as,
+      private: markPrivate,
+      categories,
       reminder_minutes,
       calendar,
       recurrence,
@@ -245,6 +274,13 @@ export async function createEventHandler(
     const graphRecurrence = recurrence
       ? toGraphRecurrence(recurrence, startObj.dateTime.slice(0, 10))
       : undefined;
+    const resolvedCategories = categories?.length
+      ? await resolveCategoryNames(categories)
+      : undefined;
+    const attendeeList = [
+      ...(attendees ?? []).map((a) => ({ emailAddress: { address: a }, type: "required" })),
+      ...(optional_attendees ?? []).map((a) => ({ emailAddress: { address: a }, type: "optional" })),
+    ];
 
     const event = await callGraphServer(`${calendarBasePath(target)}/events`, {
       method: "POST",
@@ -256,9 +292,10 @@ export async function createEventHandler(
         isAllDay: all_day,
         ...(location ? { location: { displayName: location } } : {}),
         ...(body ? { body: { contentType: "Text", content: body } } : {}),
-        ...(attendees?.length
-          ? { attendees: attendees.map((a) => ({ emailAddress: { address: a }, type: "required" })) }
-          : {}),
+        ...(attendeeList.length ? { attendees: attendeeList } : {}),
+        ...(show_as ? { showAs: show_as } : {}),
+        ...(markPrivate !== undefined ? { sensitivity: markPrivate ? "private" : "normal" } : {}),
+        ...(resolvedCategories ? { categories: resolvedCategories } : {}),
         ...(reminder_minutes !== undefined
           ? { isReminderOn: true, reminderMinutesBeforeStart: reminder_minutes }
           : {}),
@@ -281,9 +318,12 @@ export async function createEventHandler(
         (reminder_minutes !== undefined
           ? `Reminder: ${reminder_minutes === 0 ? "at start time" : `${reminder_minutes} min before`}\n`
           : "") +
+        (show_as ? `Shows as: ${show_as}\n` : "") +
+        (markPrivate ? "Sensitivity: private\n" : "") +
+        (resolvedCategories?.length ? `Categories: ${resolvedCategories.join(", ")}\n` : "") +
         `Event id: ${event.id}${graphRecurrence ? " (the series master — use list_events with include_ids for a single occurrence)" : ""}\n` +
-        (attendees?.length
-          ? `Note: ${attendees.length} attendee(s) were included — Outlook is sending them invitations now` +
+        (attendeeList.length
+          ? `Note: ${attendeeList.length} attendee(s) were included (${attendees?.length ?? 0} required, ${optional_attendees?.length ?? 0} optional) — Outlook is sending them invitations now` +
             (graphRecurrence ? ", for the whole series." : ".")
           : "No attendees — no invitations sent.")
     );

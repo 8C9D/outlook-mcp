@@ -51,6 +51,16 @@ export const searchMailSchema = {
     .describe(
       "true: only messages with attachments; false: only messages without. Omit for both."
     ),
+  unread_only: z
+    .boolean()
+    .default(false)
+    .describe("Only unread messages (default false: read and unread alike)."),
+  tab: z
+    .enum(["focused", "other"])
+    .optional()
+    .describe(
+      'Focused-Inbox tab filter: "focused" or "other". Only meaningful for the inbox (elsewhere every message counts as focused). Omit for both tabs.'
+    ),
   max_results: z
     .number()
     .int()
@@ -76,6 +86,8 @@ export const searchMailOutputSchema = {
       date_from: z.string().optional(),
       date_to: z.string().optional(),
       has_attachments: z.boolean().optional(),
+      unread_only: z.boolean().optional(),
+      tab: z.string().optional(),
     })
     .optional(),
   count: z.number().optional(),
@@ -89,6 +101,7 @@ export const searchMailOutputSchema = {
         messageId: z.string().optional(),
         conversationId: z.string().optional(),
         hasAttachments: z.boolean().optional(),
+        isRead: z.boolean().optional(),
         preview: z.string().optional(),
       })
     )
@@ -96,7 +109,7 @@ export const searchMailOutputSchema = {
 };
 
 export const searchMailDescription =
-  "Search the user's Outlook mail, or list a folder's newest messages. With query: full-text search, relevance-ranked (use for topical requests). WITHOUT query: the latest messages, genuinely newest-first (use for \"latest/most recent email\" requests — do not invent a query for those). Both modes accept date_from/date_to (America/Toronto calendar dates), has_attachments, and all_folders (whole-mailbox scope, Sent and Deleted Items included). Returns for each hit: subject, sender, received datetime (America/Toronto), message id, conversation id, attachment flag, and optionally a body preview — as text and as structuredContent. Use the returned conversation id with read_thread to read the full conversation, or the message id with create_draft to draft a reply.";
+  "Search the user's Outlook mail, or list a folder's newest messages. With query: full-text search, relevance-ranked (use for topical requests). WITHOUT query: the latest messages, genuinely newest-first (use for \"latest/most recent email\" requests — do not invent a query for those). Both modes accept date_from/date_to (America/Toronto calendar dates), has_attachments, unread_only, tab (the inbox's Focused/Other tabs), and all_folders (whole-mailbox scope, Sent and Deleted Items included). Returns for each hit: subject, sender, received datetime (America/Toronto), message id, conversation id, attachment and unread flags, and optionally a body preview — as text and as structuredContent. Use the returned conversation id with read_thread to read the full conversation, or the message id with create_draft to draft a reply.";
 
 // ---------------------------------------------------------------------------
 // Query building. Graph's rules for messages, verified live on this mailbox:
@@ -116,6 +129,9 @@ export type SearchFilters = {
   dateFrom?: string;
   dateTo?: string;
   hasAttachments?: boolean;
+  unreadOnly?: boolean;
+  /** Focused-Inbox tab. No KQL equivalent exists, so in query mode this is client-side only. */
+  tab?: "focused" | "other";
 };
 
 /** Shift an ISO date by whole days (pure calendar arithmetic, UTC-safe). */
@@ -174,6 +190,9 @@ export function buildSearchKql(query: string, filters: SearchFilters): string {
   if (filters.hasAttachments !== undefined) {
     terms.push(`hasattachments:${filters.hasAttachments}`);
   }
+  // isread is a valid KQL narrowing term (verified live: isread:true/false and
+  // isread:yes all discriminate correctly on this mailbox).
+  if (filters.unreadOnly) terms.push("isread:false");
   return terms.join(" AND ");
 }
 
@@ -187,19 +206,31 @@ export function buildLatestFilter(filters: SearchFilters): string | undefined {
   const clauses: string[] = [];
   if (fromUtc) clauses.push(`receivedDateTime ge ${fromUtc}`);
   if (toUtcExclusive) clauses.push(`receivedDateTime lt ${toUtcExclusive}`);
-  if (filters.hasAttachments !== undefined) {
+  if (filters.hasAttachments !== undefined || filters.unreadOnly || filters.tab) {
     if (clauses.length === 0) clauses.push("receivedDateTime ge 1900-01-01T00:00:00Z");
-    clauses.push(`hasAttachments eq ${filters.hasAttachments}`);
+    if (filters.hasAttachments !== undefined) {
+      clauses.push(`hasAttachments eq ${filters.hasAttachments}`);
+    }
+    if (filters.unreadOnly) clauses.push("isRead eq false");
+    if (filters.tab) clauses.push(`inferenceClassification eq '${filters.tab}'`);
   }
   return clauses.length > 0 ? clauses.join(" and ") : undefined;
 }
 
 /** The exact client-side check both modes apply to every returned message. */
 export function matchesFilters(
-  message: { receivedDateTime?: string; hasAttachments?: boolean },
+  message: { receivedDateTime?: string; hasAttachments?: boolean; isRead?: boolean },
   filters: SearchFilters
 ): boolean {
   if (filters.hasAttachments !== undefined && Boolean(message.hasAttachments) !== filters.hasAttachments) {
+    return false;
+  }
+  if (filters.unreadOnly && message.isRead === true) return false;
+  if (
+    filters.tab &&
+    (message as any).inferenceClassification !== undefined &&
+    String((message as any).inferenceClassification).toLowerCase() !== filters.tab
+  ) {
     return false;
   }
   const { fromUtc, toUtcExclusive } = utcWindow(filters);
@@ -217,7 +248,7 @@ export async function searchMailHandler(
 ): Promise<ToolResult> {
   return runTool(async () => {
     const parsed = searchMailArgs.parse(input);
-    const { query, folder, all_folders, date_from, date_to, has_attachments, max_results, include_body_preview } =
+    const { query, folder, all_folders, date_from, date_to, has_attachments, unread_only, tab, max_results, include_body_preview } =
       parsed;
     if (date_from && date_to && date_from > date_to) {
       return errorResult(`date_from ${date_from} is after date_to ${date_to}.`);
@@ -226,10 +257,18 @@ export async function searchMailHandler(
       ...(date_from ? { dateFrom: date_from } : {}),
       ...(date_to ? { dateTo: date_to } : {}),
       ...(has_attachments !== undefined ? { hasAttachments: has_attachments } : {}),
+      ...(unread_only ? { unreadOnly: true } : {}),
+      ...(tab ? { tab } : {}),
     };
-    const filtersActive = date_from !== undefined || date_to !== undefined || has_attachments !== undefined;
+    const filtersActive =
+      date_from !== undefined ||
+      date_to !== undefined ||
+      has_attachments !== undefined ||
+      unread_only ||
+      tab !== undefined;
 
-    const select = "id,conversationId,subject,from,receivedDateTime,bodyPreview,hasAttachments";
+    const select =
+      "id,conversationId,subject,from,receivedDateTime,bodyPreview,hasAttachments,isRead,inferenceClassification";
     const base = all_folders
       ? "/me/messages"
       : `/me/mailFolders/${encodeURIComponent(folder)}/messages`;
@@ -264,6 +303,8 @@ export async function searchMailHandler(
       date_from ? `from ${date_from}` : undefined,
       date_to ? `to ${date_to}` : undefined,
       has_attachments === undefined ? undefined : has_attachments ? "with attachments" : "without attachments",
+      unread_only ? "unread only" : undefined,
+      tab ? `${tab.charAt(0).toUpperCase()}${tab.slice(1)} tab` : undefined,
     ]
       .filter(Boolean)
       .join(", ");
@@ -279,6 +320,8 @@ export async function searchMailHandler(
               ...(date_from ? { date_from } : {}),
               ...(date_to ? { date_to } : {}),
               ...(has_attachments !== undefined ? { has_attachments } : {}),
+              ...(unread_only ? { unread_only } : {}),
+              ...(tab ? { tab } : {}),
             },
           }
         : {}),
@@ -297,7 +340,7 @@ export async function searchMailHandler(
       const preview = (m.bodyPreview ?? "").replace(/\s+/g, " ").trim().slice(0, 150);
       return [
         `${i + 1}. ${m.subject || "(no subject)"}`,
-        `   From: ${formatSender(m.from)}  At: ${formatLocal(m.receivedDateTime)}${m.hasAttachments ? "  [has attachments]" : ""}`,
+        `   From: ${formatSender(m.from)}  At: ${formatLocal(m.receivedDateTime)}${m.isRead === false ? "  [unread]" : ""}${m.hasAttachments ? "  [has attachments]" : ""}`,
         `   Message id: ${m.id}`,
         `   Conversation id: ${m.conversationId}`,
         ...(include_body_preview && preview ? [`   Preview: ${preview}`] : []),
@@ -319,6 +362,7 @@ export async function searchMailHandler(
         messageId: m.id,
         conversationId: m.conversationId,
         hasAttachments: Boolean(m.hasAttachments),
+        ...(m.isRead !== undefined ? { isRead: Boolean(m.isRead) } : {}),
         ...(include_body_preview
           ? { preview: (m.bodyPreview ?? "").replace(/\s+/g, " ").trim().slice(0, 150) }
           : {}),

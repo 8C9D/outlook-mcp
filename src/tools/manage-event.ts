@@ -3,13 +3,14 @@ import { callGraphServer } from "../core/graph.js";
 import { TIMEZONE, TZ_PREFER, ToolResult, errorResult, runTool, textResult } from "./common.js";
 import { describeRecurrence, recurrenceSchema, toGraphDateTime, toGraphRecurrence } from "./create-event.js";
 import { addDays } from "./list-events.js";
+import { resolveCategoryNames } from "./manage-categories.js";
 
 export const manageEventSchema = {
   event_id: z.string().min(1).describe("The id of the event to act on."),
   action: z
-    .enum(["update", "cancel", "respond"])
+    .enum(["update", "cancel", "respond", "forward"])
     .describe(
-      "update: change event fields; cancel: cancel/remove the event (as organizer) or decline it (as attendee); respond: accept/decline/tentative an invitation."
+      "update: change event fields; cancel: cancel/remove the event (as organizer) or decline it (as attendee); respond: accept/decline/tentative an invitation, optionally proposing a new time; forward: email the event to forward_to so they can join or copy it."
     ),
   scope: z
     .enum(["this_event_only", "entire_series"])
@@ -37,6 +38,30 @@ export const manageEventSchema = {
     .describe(
       "update: remind this many minutes before the start (0 = at start time, max 40320 = 4 weeks). Use -1 to turn the reminder off."
     ),
+  show_as: z
+    .enum(["free", "tentative", "busy", "oof", "workingElsewhere"])
+    .optional()
+    .describe('update: how the event blocks the free/busy view ("oof" = out of office).'),
+  private: z
+    .boolean()
+    .optional()
+    .describe("update: mark the event Private (true) or Normal (false)."),
+  categories: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "update: REPLACE the event's categories with these names (empty array clears them). Every name must exist in the mailbox's category list (manage_categories)."
+    ),
+  attendees: z
+    .array(z.string().email())
+    .optional()
+    .describe(
+      "update: REPLACE the event's whole attendee list — these become the Required attendees, optional_attendees the Optional ones (pass both together; an empty attendees array with no optional_attendees removes everyone). Added attendees are emailed an invitation; removed ones a cancellation."
+    ),
+  optional_attendees: z
+    .array(z.string().email())
+    .optional()
+    .describe("update: the Optional attendees of the replaced list (see attendees)."),
   recurrence: recurrenceSchema
     .optional()
     .describe(
@@ -54,12 +79,27 @@ export const manageEventSchema = {
     .boolean()
     .default(true)
     .describe("respond: whether to notify the organizer of your response (default true)."),
+  proposed_start: z
+    .string()
+    .optional()
+    .describe(
+      'respond with "tentative" or "decline": propose a different start to the organizer, as an ISO datetime (America/Toronto when no UTC offset is given). Requires proposed_end, and the organizer must allow new-time proposals.'
+    ),
+  proposed_end: z
+    .string()
+    .optional()
+    .describe("respond: the proposed new end, paired with proposed_start."),
+  forward_to: z
+    .array(z.string().email())
+    .min(1)
+    .optional()
+    .describe('forward: who to send the event to (required for action "forward").'),
 };
 
 const manageEventArgs = z.object(manageEventSchema);
 
 export const manageEventDescription =
-  "Update, cancel, or respond to a calendar event, including one occurrence of a repeating event or a whole series. CAUTION — visible to other people: on events with attendees, updates and cancellations send notification emails to every attendee, and responses notify the organizer. Editing or cancelling an entire series notifies every attendee about all of its occurrences (and a changed repeat rule re-issues the whole series); editing one occurrence notifies them about that date only. Before calling, state the event's subject, date, whether you are touching one occurrence or the series, and what will change. cancel picks the right operation automatically: organizer with attendees → cancellation notices; organizer without attendees → the event is removed (to Deleted Items); attendee → decline.";
+  "Update, cancel, respond to, or forward a calendar event, including one occurrence of a repeating event or a whole series. update covers times, subject, location, body, reminder, show_as (free/busy status), private, categories, the repeat rule — and the attendee list (replaced wholesale; changes email the people affected). respond accepts/declines/tentatives an invitation, optionally proposing a new time (proposed_start/proposed_end with tentative or decline). forward emails the event to forward_to. CAUTION — visible to other people: on events with attendees, updates and cancellations send notification emails to every attendee, responses notify the organizer, and forward emails the event to new people. Editing or cancelling an entire series notifies every attendee about all of its occurrences (and a changed repeat rule re-issues the whole series); editing one occurrence notifies them about that date only. Before calling, state the event's subject, date, whether you are touching one occurrence or the series, and what will change. cancel picks the right operation automatically: organizer with attendees → cancellation notices; organizer without attendees → the event is removed (to Deleted Items); attendee → decline.";
 
 const EVENT_SELECT =
   "subject,start,end,isAllDay,isOrganizer,attendees,organizer,type,seriesMasterId,recurrence,isReminderOn,reminderMinutesBeforeStart";
@@ -119,6 +159,28 @@ export async function manageEventHandler(
         if (args.location !== undefined) patch.location = { displayName: args.location };
         if (args.body !== undefined) patch.body = { contentType: "Text", content: args.body };
         if (args.all_day !== undefined) patch.isAllDay = args.all_day;
+        if (args.show_as !== undefined) patch.showAs = args.show_as;
+        if (args.private !== undefined) patch.sensitivity = args.private ? "private" : "normal";
+        if (args.categories !== undefined) {
+          patch.categories = args.categories.length
+            ? await resolveCategoryNames(args.categories)
+            : [];
+        }
+        if (args.optional_attendees !== undefined && args.attendees === undefined) {
+          return errorResult(
+            "optional_attendees replaces the attendee list together with attendees — pass both " +
+              "(attendees may be an empty array), so the required attendees are not wiped by accident."
+          );
+        }
+        if (args.attendees !== undefined) {
+          patch.attendees = [
+            ...args.attendees.map((a) => ({ emailAddress: { address: a }, type: "required" })),
+            ...(args.optional_attendees ?? []).map((a) => ({
+              emailAddress: { address: a },
+              type: "optional",
+            })),
+          ];
+        }
         if (args.reminder_minutes !== undefined) {
           if (args.reminder_minutes < 0) {
             patch.isReminderOn = false;
@@ -160,7 +222,7 @@ export async function manageEventHandler(
         if (Object.keys(patch).length === 0) {
           return errorResult(
             "Nothing to update — provide at least one of subject, start, end, location, body, " +
-              "all_day, reminder_minutes, recurrence."
+              "all_day, reminder_minutes, show_as, private, categories, attendees, recurrence."
           );
         }
         const updated = await callGraphServer(base, {
@@ -183,10 +245,13 @@ export async function manageEventHandler(
                 }\n`
               : "") +
             `Event id: ${updated.id}\n` +
-            (attendeeCount
-              ? `Note: ${attendeeCount} attendee(s) are being notified of this change` +
-                (seriesWide ? " to every occurrence of the series." : ".")
-              : "No attendees — no notifications sent.")
+            (patch.attendees
+              ? `Attendees replaced: now ${(updated.attendees ?? []).length} (was ${attendeeCount}). ` +
+                "Added attendees are being invited; removed ones are being sent cancellations."
+              : attendeeCount
+                ? `Note: ${attendeeCount} attendee(s) are being notified of this change` +
+                  (seriesWide ? " to every occurrence of the series." : ".")
+                : "No attendees — no notifications sent.")
         );
       }
 
@@ -227,6 +292,23 @@ export async function manageEventHandler(
         if (!args.response) {
           return errorResult('Action "respond" requires response (accept | decline | tentative).');
         }
+        let proposedNewTime: { start: any; end: any } | undefined;
+        if (args.proposed_start !== undefined || args.proposed_end !== undefined) {
+          if (!args.proposed_start || !args.proposed_end) {
+            return errorResult("A time proposal needs both proposed_start and proposed_end.");
+          }
+          if (args.response === "accept") {
+            return errorResult(
+              'A new time can only be proposed with response "tentative" or "decline" — accepting ' +
+                "means the current time works."
+            );
+          }
+          const start = toGraphDateTime(args.proposed_start);
+          const end = toGraphDateTime(args.proposed_end);
+          if (!start) return errorResult(`Could not parse proposed_start: ${JSON.stringify(args.proposed_start)}.`);
+          if (!end) return errorResult(`Could not parse proposed_end: ${JSON.stringify(args.proposed_end)}.`);
+          proposedNewTime = { start, end };
+        }
         const graphAction =
           args.response === "accept"
             ? "accept"
@@ -237,15 +319,39 @@ export async function manageEventHandler(
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            sendResponse: args.send_response,
+            // Graph requires sendResponse: true when a new time is proposed —
+            // a proposal the organizer never sees would be no proposal at all.
+            sendResponse: proposedNewTime ? true : args.send_response,
             ...(args.comment ? { comment: args.comment } : {}),
+            ...(proposedNewTime ? { proposedNewTime } : {}),
           }),
         });
         return textResult(
           `Responded "${args.response}" to ${label}.` +
-            (args.send_response
-              ? " The organizer is being notified."
-              : " No response sent to the organizer.")
+            (proposedNewTime
+              ? ` A new time was proposed to the organizer: ${args.proposed_start} to ${args.proposed_end} — they decide whether to take it.`
+              : args.send_response
+                ? " The organizer is being notified."
+                : " No response sent to the organizer.")
+        );
+      }
+
+      case "forward": {
+        if (!args.forward_to?.length) {
+          return errorResult('Action "forward" requires forward_to (email addresses).');
+        }
+        await callGraphServer(`${base}/forward`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            toRecipients: args.forward_to.map((a) => ({ emailAddress: { address: a } })),
+            ...(args.comment ? { comment: args.comment } : {}),
+          }),
+        });
+        return textResult(
+          `Event ${label} forwarded to ${args.forward_to.join(", ")} — they receive it by email ` +
+            "and can add it to their calendar. (On a personal account the organizer is not " +
+            "otherwise notified of the forward.)"
         );
       }
     }

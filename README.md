@@ -1,10 +1,14 @@
 # outlook-mcp
 
 An MCP server that connects Claude to a **personal** Microsoft (outlook.com) mailbox through Microsoft
-Graph. Thirty-one tools, two prompts and two resources, served from one shared registry over **two
+Graph. Forty tools, two prompts and two resources, served from one shared registry over **two
 transports**: a local stdio server, and a Cloudflare Worker that claude.ai can use as a custom
 connector. All datetimes are America/Toronto unless a caller supplies an explicit UTC offset.
 
+> **How complete is it?** [**CAPABILITIES.md**](CAPABILITIES.md) audits everything a person can do
+> in personal Outlook against this tool surface — 96 capabilities, each marked supported, newly
+> implemented (v1.3), infeasible through Graph (with the live probe cited), or excluded by design.
+>
 > **New here?** [**SETUP.md**](SETUP.md) goes from an empty directory to a working server — including
 > the Microsoft app registration, which is the only genuinely fiddly part, and the three sign-in errors
 > it is easy to hit. If an install is misbehaving, `npm run doctor` says which part and what to do.
@@ -22,10 +26,10 @@ reply. No secrets ever enter this repository. The reasoning is in
 | Area | Tools | What you get |
 | --- | --- | --- |
 | **Read mail** | `search_mail`, `read_thread`, `read_message`, `check_new_mail`, `get_mailbox_activity` | full-text search or newest-first listing, whole conversations, one message with its attachment inventory and forensic headers, and two ways to ask "what's new" — a delta query anywhere, or Graph's pushed notifications on the hosted server |
-| **Write mail** | `create_draft`, `update_draft`, `add_attachment`, `send_draft` | compose, reply, forward and attach — and send **only** by naming an existing draft, never in one call ([why](#two-step-send-by-design)) |
-| **Organize** | `manage_message`, `list_folders`, `create_folder`, `delete_folder`, `manage_categories`, `manage_rules`, `manage_senders` | batch move/archive/delete/flag/categorize in one Graph round-trip, the folder tree, folder create and guarded soft delete, the category master list, inbox rules with exceptions (and deliberately no forwarding action), and junk-sender blocking |
-| **Calendar** | `list_calendars`, `list_events`, `create_event`, `manage_event` | multiple calendars, repeating events and reminders, single-occurrence or whole-series edits, and invitation responses |
-| **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts, out-of-office, working hours, Focused-Inbox overrides |
+| **Write mail** | `create_draft`, `update_draft`, `add_attachment`, `send_draft`, `manage_scheduled_send` | compose (text or HTML, to/cc/bcc, importance, receipts, a stored signature), reply, forward and attach — send **only** by naming an existing draft, never in one call ([why](#two-step-send-by-design)) — **immediately or at a scheduled future time**, with waiting sends listable and cancellable ([detail](#scheduled-send-delayed-delivery)) |
+| **Organize** | `manage_message`, `list_folders`, `create_folder`, `manage_folder`, `delete_folder`, `manage_categories`, `manage_rules`, `manage_senders` | batch move/archive/delete/flag/categorize in one Graph round-trip, the folder tree, folder create/rename/move and guarded soft delete, the category master list, inbox rules with exceptions (and deliberately no forwarding action), and junk-sender blocking |
+| **Calendar** | `list_calendars`, `manage_calendar`, `list_events`, `create_event`, `manage_event` | multiple calendars (create/rename/recolor), event search, repeating events and reminders, free/busy status and Private events, categories, required and optional attendees, single-occurrence or whole-series edits, invitation responses with new-time proposals, and event forwarding |
+| **People & settings** | `search_contacts`, `manage_contact`, `auto_reply`, `mailbox_settings` | saved contacts with the full card (phones, birthday, addresses, notes, categories, photo), out-of-office, working hours, Focused-Inbox overrides, and the compose signature |
 | **Tasks** | `list_tasks`, `manage_task` | Microsoft To Do with subtasks, repeat rules, task lists, and mail turned into a task |
 | **Evidence** | `export_message`, `get_attachment` | attachment bytes and a message's raw `.eml` — saved to disk on stdio, handed out as an expiring sign-in-required link on the hosted server, or dropped straight into OneDrive (`save_to_onedrive`) |
 | **OneDrive files** | `search_files`, `list_folder`, `read_file`, `upload_file`, `manage_file`, `share_link` | search by name or content, exact folder listings, reading and uploading files (rename-not-overwrite by default), move/rename/soft delete into the recycle bin, and anonymous sharing links with revocation — plus attachments that flow both ways between mail and OneDrive ([detail](#onedrive-files)) |
@@ -66,7 +70,7 @@ The full reasoning, including what third parties can observe and which approvals
 ## Architecture
 
 ```
-                    src/core/registry.ts  ── one table of 37 tools, 2 prompts, 2 resources
+                    src/core/registry.ts  ── one table of 40 tools, 2 prompts, 2 resources
                               │
         ┌─────────────────────┴─────────────────────┐
    src/server.ts                            src/worker/index.ts
@@ -75,7 +79,7 @@ The full reasoning, including what third parties can observe and which approvals
    state in .mcp-state.json                 state in KV, /notifications, cron triggers
         └─────────────────────┬─────────────────────┘
                               │
-                     src/tools/* (37 handlers)
+                     src/tools/* (40 handlers)
                               │
                        src/core/graph.ts  ──►  Microsoft Graph
 ```
@@ -86,36 +90,39 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 `core/state.ts` hold indirections each host installs (MSAL and a file locally, KV on the Worker).
 [More detail](#architecture-in-detail), including why the Worker needs no Durable Objects.
 
-## Tools (v1.2)
+## Tools (v1.3)
 
 | Tool | What it does |
 | --- | --- |
-| `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Both modes take `date_from`/`date_to` (America/Toronto calendar dates), `has_attachments`, and `all_folders` (the whole mailbox, Sent and Deleted Items included). Returns subject, sender, local datetime, message id, conversation id, attachment flag, optional body preview — as text and as [structured content](#structured-tool-output). |
+| `search_mail` | With `query`: full-text search over a mail folder (default inbox), relevance-ranked. **Without `query`: the folder's latest messages, genuinely newest-first** — the right call for "what's my latest email". Both modes take `date_from`/`date_to` (America/Toronto calendar dates), `has_attachments`, `unread_only`, `tab` (the inbox's Focused/Other tabs), and `all_folders` (the whole mailbox, Sent and Deleted Items included). Returns subject, sender, local datetime, message id, conversation id, attachment and unread flags, optional body preview — as text and as [structured content](#structured-tool-output). |
 | `read_thread` | Renders a conversation oldest-to-newest as plain text given a conversation id, quoted tails trimmed. |
 | `read_message` | One full message: headers, plain-text body, and an attachment inventory (name/size/type/attachment id). `include_headers` adds the forensic view — SPF/DKIM/DMARC verdict, the Received chain oldest-first, and a flag when Reply-To or Return-Path disagrees with From. |
 | `export_message` | The message's raw MIME as a `.eml` — a phishing sample to forward to a security team, or an evidential copy. **stdio**: saved to `~/Downloads/outlook-mcp-attachments/`. **Hosted**: the same expiring, sign-in-required download link `get_attachment` uses. |
 | `get_attachment` | Small text/JSON attachments come back inline on both transports. Otherwise the **stdio** server saves the file to `~/Downloads/outlook-mcp-attachments/` (collision-safe names) and the **hosted** server, having no filesystem, returns a sign-in-required download link that expires within 15 minutes (`link_ttl_minutes`). `save_to_onedrive` stores the attachment in a OneDrive folder instead, on both transports — never overwriting an existing file. |
-| `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`). Never sends. |
-| `update_draft` | Edits a draft's body/subject/to/cc (recipient arrays replace, not append). Rejects non-drafts. |
-| `send_draft` | **The only send path.** Sends an existing draft by id after verifying it really is a draft. |
-| `add_attachment` | Attaches a file to a draft from **exactly one** of `file_path` (a local file — stdio server only), `url` (an `https` link the server downloads, ≤ 25 MB), `content_base64` (bytes inline, ≤ 3 MB) or `onedrive_path` (a OneDrive file's bytes, both servers). Uploads in a single request under 3 MB, chunked upload session for 3–25 MB. Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
+| `create_draft` | Creates a draft: new message (`to` + `subject`), reply (`reply_to_message_id`, optional `reply_all`), or forward (`forward_message_id` + `to`) — plain text or HTML (`body_format`), with `cc`/`bcc`, `importance`, read/delivery receipt requests, and the stored [signature](#the-compose-signature) appended unless `omit_signature`. Never sends. |
+| `update_draft` | Edits a draft's body (text or HTML)/subject/to/cc/bcc/importance/receipt requests (recipient arrays replace, not append), and removes attachments by id (`remove_attachments`). Rejects non-drafts. |
+| `send_draft` | **The only send path.** Sends an existing draft by id after verifying it really is a draft — immediately, or at a future `send_at` (**scheduled send**: the message waits in Drafts and dispatches itself at that moment, [detail](#scheduled-send-delayed-delivery)). |
+| `manage_scheduled_send` | Lists the messages waiting for a scheduled send with their send times, and cancels one before it goes. **Cancel discards the message completely** — verified live, Exchange keeps no Deleted Items copy of a cancelled deferred send — and the tool says so before anyone approves it. |
+| `add_attachment` | Attaches a file to a draft (`draft_id`) or a calendar event (`event_id`) from **exactly one** of `file_path` (a local file — stdio server only), `url` (an `https` link the server downloads, ≤ 25 MB), `content_base64` (bytes inline, ≤ 3 MB) or `onedrive_path` (a OneDrive file's bytes, both servers). Uploads in a single request under 3 MB, chunked upload session for 3–25 MB. Natural flow: `create_draft` → `add_attachment` → `send_draft`. |
+| `manage_folder` | Renames a mail folder, or moves it (messages and subfolders included) under another folder or back to the mailbox root. The folder's id survives both. Well-known folders and sibling name collisions are refused. |
 | `manage_message` | Batch (1–20 ids): move, archive, delete (soft), mark read/unread, flag/unflag, categorize, with per-message results. `categorize` **replaces** a message's categories rather than appending, and validates every name against the mailbox's category list first. All ids go out as **one Graph `$batch` request** (one HTTP round-trip instead of up to 20); throttled items are retried once per their `Retry-After`. |
 | `list_folders` | Mail folder tree (2 levels) with unread/total counts and folder ids. |
 | `create_folder` | Creates a mail folder at the mailbox root or under `parent_folder`. Rejects a duplicate name at the same level, naming the existing folder's id. |
 | `delete_folder` | Soft-deletes a user-created folder by **moving it into Deleted Items** — never Graph's own folder DELETE, which on a personal account permanently destroys the folder and its contents with no Deleted Items copy (verified live). Well-known folders are always refused; a folder with messages needs `force`, which first moves the messages into Deleted Items individually and says so; a folder with subfolders is always refused. |
 | `list_calendars` | The account's calendars with ids, marking the default one and any that are read-only. Supplies the names `calendar` accepts elsewhere. |
-| `list_events` | Calendar events for a date window (default: next 7 days) of the default or a named `calendar`, grouped by day; repeating events appear once per occurrence. `include_ids` adds the event ids `manage_event` needs, flagging occurrences of a series. |
-| `create_event` | Creates an event, optionally with a `reminder_minutes`, on a named `calendar`, and repeating (`recurrence`: daily/weekly/monthly/yearly, `interval`, `weekdays`, ending by `until` or after `count`). **If attendees are given, Outlook emails them invitations immediately — for a series, to every occurrence.** |
-| `manage_event` | Update / cancel / respond (accept, decline, tentative), on a single event, **one occurrence** of a repeating event, or the **entire series** (`scope`). Also sets `reminder_minutes` (`-1` turns the reminder off) and replaces the `recurrence` rule. Updates and cancellations on events with attendees notify them — series-wide edits notify about every occurrence. |
-| `search_contacts` | Search saved contacts by name prefix; returns name, emails, phones, contact id. |
-| `manage_contact` | Create / update / delete (soft) a saved contact. |
+| `manage_calendar` | Creates an additional calendar, renames one, or changes its colour. **Deliberately cannot delete a calendar** — a calendar delete permanently destroys every event in it with no recoverable copy, the same reasoning that keeps list-deletion out of `manage_task`. |
+| `list_events` | Calendar events for a date window (default: next 7 days) of the default or a named `calendar`, grouped by day; repeating events appear once per occurrence. `query` narrows the window to events whose subject or location contains the text ("when is my dentist appointment?"). `include_ids` adds the event ids `manage_event` needs, flagging occurrences of a series. |
+| `create_event` | Creates an event, optionally with a `reminder_minutes`, a free/busy status (`show_as`: free/tentative/busy/oof/workingElsewhere), `private` sensitivity, `categories`, on a named `calendar`, and repeating (`recurrence`: daily/weekly/monthly/yearly, `interval`, `weekdays`, ending by `until` or after `count`). **If `attendees` or `optional_attendees` are given, Outlook emails them invitations immediately — for a series, to every occurrence.** |
+| `manage_event` | Update / cancel / respond (accept, decline, tentative — optionally **proposing a new time** with tentative/decline) / **forward** the event by email, on a single event, **one occurrence** of a repeating event, or the **entire series** (`scope`). update also covers `show_as`, `private`, `categories`, and **replacing the attendee list** (added people are invited, removed ones sent cancellations); `reminder_minutes` (`-1` turns the reminder off) and the `recurrence` rule as before. Updates and cancellations on events with attendees notify them — series-wide edits notify about every occurrence. |
+| `search_contacts` | Search saved contacts by name prefix; returns the full card — name, nickname, emails, phones, work, birthday, addresses, categories, notes — and the contact id. |
+| `manage_contact` | Create / update / delete (soft) a saved contact, with the whole card: names, emails, business/home/mobile phones, company and job title, birthday, home and business addresses, notes, categories, and the **contact photo** (set from `photo_url` or `photo_base64`, ≤4 MB). List-shaped fields replace rather than append on update. |
 | `auto_reply` | Get / set / clear the mailbox automatic reply (out-of-office). `mailbox_settings` covers the *other* settings rather than absorbing this one. |
-| `mailbox_settings` | Get the mailbox's time zone, working hours, Focused-Inbox overrides and auto-reply status; set working hours (`days`, `start_time`, `end_time`); pin a sender to the Focused or Other tab, or clear that override. |
+| `mailbox_settings` | Get the mailbox's time zone, working hours, Focused-Inbox overrides, auto-reply status and stored signature; set working hours (`days`, `start_time`, `end_time`); pin a sender to the Focused or Other tab, or clear that override; store or clear the [compose signature](#the-compose-signature) `create_draft` appends. |
 | `manage_senders` | Block / unblock the sender of a given message (Graph `markAsJunk` / `markAsNotJunk`). Message-scoped, and the blocked/safe lists **cannot be read back** — see [Junk senders](#junk-senders-what-graph-will-and-will-not-do). |
 | `manage_rules` | List / create / **update (in place)** / delete inbox rules (conditions and **exceptions**: from/sender/subject/body; actions: move, mark read, soft delete). **Rules act automatically on all future incoming mail** — see below. |
 | `manage_categories` | List / create / delete the mailbox's Outlook categories (Graph's fixed `preset0`–`preset24` palette). Applying them to mail is `manage_message`'s `categorize`. |
-| `list_tasks` | Microsoft To Do tasks grouped overdue / today / upcoming / no due date (America/Toronto). Shows the repeat rule and subtask tally; `include_subtasks` lists each checklist item with its id. Open tasks by default; `include_completed` and `due_within_days` narrow or widen it. |
-| `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task; add, complete and remove **subtasks** (checklist items); create and rename a **task list** (deleting a list is deliberately not offered). `recurrence` on create makes the task repeat (`due_date` required); `clear_recurrence` on update stops it. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
+| `list_tasks` | Microsoft To Do tasks grouped overdue / today / upcoming / no due date (America/Toronto). Shows importance ("important" = To Do's star), the repeat rule and subtask tally; `include_subtasks` lists each checklist item with its id. Open tasks by default; `include_completed` and `due_within_days` narrow or widen it. |
+| `manage_task` | Create / complete / reopen / update / **delete (permanent)** a To Do task; set its `importance` (To Do's starred/Important marking); add, complete and remove **subtasks** (checklist items); create and rename a **task list** (deleting a list is deliberately not offered). `recurrence` on create makes the task repeat (`due_date` required); `clear_recurrence` on update stops it. `linked_message_id` on create turns an email into a task, copying its subject, sender, and an Outlook link into the task notes. |
 | `check_new_mail` | What changed in a folder **since the last call**, via a Graph delta query. The first call (or one with `reset`) only records a starting position and lists nothing; every later call returns just the added/changed/removed messages. Works on both transports. |
 | `get_mailbox_activity` | Mail that arrived recently, from change notifications Graph **pushed** to the server as it happened — no polling. **Remote only**; on the stdio server it returns an error pointing at `check_new_mail`. |
 | `manage_auto_filing` | Turns the two **opt-in LLM features** on and off and tunes them: auto-filing (a model classifies arriving mail against your existing folders and files it) and the morning digest (a brief left as an unsent draft at 07:00). Confidence threshold, daily API-call cap, extra never-classify subject patterns — and the **learned preferences** the filer picks up from your corrections (`list_preferences` / `remove_preference`, see [the feedback loop](#the-feedback-loop-corrections-become-preferences)). **Both ship disabled**, and both cost money — see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff). **Remote only.** |
@@ -132,8 +139,8 @@ tool layer never knows where its Graph token or its state comes from: `core/toke
 
 Every tool states **all four** MCP annotation hints, on both transports, rather than leaving them to
 the protocol's defaults — which are "destructive and open-world unless told otherwise" and would be
-wrong here far more often than right. One rule defines each hint, so thirty-seven tools cannot drift
-into thirty-seven readings of the same word:
+wrong here far more often than right. One rule defines each hint, so forty tools cannot drift
+into forty readings of the same word:
 
 - **`readOnlyHint`** — the call changes nothing: not the mailbox, not the server's own state, not the
   local disk.
@@ -155,11 +162,14 @@ into thirty-seven readings of the same word:
 | `create_draft` | — | — | — | — |
 | `update_draft` | — | — | **yes** | — |
 | `send_draft` | — | **yes** | — | **yes** |
+| `manage_scheduled_send` | — | **yes** | — | — |
 | `manage_message` | — | **yes** | — | — |
 | `list_folders` | **yes** | — | **yes** | — |
 | `create_folder` | — | — | — | — |
+| `manage_folder` | — | — | **yes** | — |
 | `delete_folder` | — | **yes** | — | — |
 | `list_calendars` | **yes** | — | **yes** | — |
+| `manage_calendar` | — | — | — | — |
 | `list_events` | **yes** | — | **yes** | — |
 | `create_event` | — | — | — | **yes** |
 | `manage_event` | — | **yes** | — | **yes** |
@@ -189,6 +199,13 @@ The calls worth explaining:
 
 - **`send_draft` is the only thing flagged both destructive and open-world.** Mail that has left cannot
   be recalled, and the draft is no longer a draft.
+- **`manage_scheduled_send` is destructive but not open-world.** cancel stops mail from going out —
+  nothing is sent — but it discards the waiting message outright (Exchange keeps no Deleted Items
+  copy of a cancelled deferred send, verified live), which is exactly what destructive means here.
+- **`manage_folder` and `manage_calendar` are the write tools that destroy nothing.** Rename and
+  move keep the folder, its messages and its id; calendar create/rename/recolor never touch an
+  event — and both tools deliberately omit delete. Folder rename/move is also idempotent
+  (set-shaped); calendar create is not.
 - **`manage_rules` is destructive but not open-world** — precisely because forwarding actions are
   deliberately absent. A rule can soft-delete future mail, but it cannot send any of it anywhere.
 - **`check_new_mail` is not read-only.** Every successful call advances the stored delta position,
@@ -211,7 +228,7 @@ The calls worth explaining:
 
 These are hints, not a security boundary — the MCP spec is explicit that a client must not make trust
 decisions on annotations from an untrusted server. Here they exist so a client you *do* trust can
-prompt proportionately: reads without ceremony, the ten destructive tools with a real look.
+prompt proportionately: reads without ceremony, the twelve destructive tools with a real look.
 
 ## Inbox rules (`manage_rules`)
 
@@ -301,6 +318,8 @@ no gain — the reasoning is in ASSUMPTIONS.md.)
   suggests to people scheduling with the account — so the tool description says so and the answer
   prints before/after. The time zone is never set from here: Graph normalises whatever is sent to the
   mailbox's own zone (`America/Toronto` went in, `Eastern Standard Time` came back).
+- **The compose signature** (`set_signature` / `clear_signature`) is stored by this server, not by
+  Graph — see [The compose signature](#the-compose-signature). `get` prints it alongside the rest.
 - **Focused-Inbox overrides** (`/me/inferenceClassification/overrides`) pin one sender to Focused or
   Other. Verified live on this consumer account: `GET`, `POST` and `DELETE` all work. Setting an
   override for a sender that already has one PATCHes the existing record — Graph refuses a duplicate.
@@ -455,9 +474,8 @@ Two MCP prompts ship with the server (visible in a client's prompt picker; zero-
 | `morning_brief` | Start-of-day briefing from `search_mail` (get_latest, last 24 h), `list_events` (today), and `list_tasks` (`due_within_days: 3`), rendered as calendar / mail / tasks plus an **actions-needed** section. Read-only. |
 
 Both are prompts, not automation: they instruct the calling model, and every write still goes through a
-normal tool call with whatever approval the client enforces. `search_mail`'s listing does not carry
-read/unread state, so `morning_brief` tells the model to call `read_message` rather than guess when that
-distinction matters.
+normal tool call with whatever approval the client enforces. `search_mail`'s listing carries an
+`[unread]` marker (v1.3), and `morning_brief` tells the model to lead with unread mail.
 
 ## Structured tool output
 
@@ -467,7 +485,7 @@ Seven tools whose answers a client may want to render — `search_mail`, `list_f
 advertised in `tools/list` (identically on both transports, since both build from the shared
 registry). The text remains the fallback for clients that ignore structured content, and the schemas
 are deliberately permissive — every field optional, unknown keys tolerated — so a schema-validating
-client can never see a previously-working call start failing. The other thirty tools are
+client can never see a previously-working call start failing. The other thirty-three tools are
 prose-shaped (confirmations, per-item OK/FAILED lists) and stay text-only on purpose.
 
 ## Resources
@@ -666,6 +684,41 @@ and `add_attachment`), then send that exact draft with `send_draft(draft_id)`. T
 - The calling model must present the draft (subject, recipients) and take a second deliberate action to send.
 - A single confused or injected tool call can at worst create a draft, not dispatch mail.
 
+## Scheduled send (delayed delivery)
+
+`send_draft` takes an optional `send_at` (an ISO datetime — America/Toronto when no UTC offset is
+given — at least 2 minutes and at most a year ahead). The mechanics, all verified live on this
+consumer mailbox before the tool shipped:
+
+- The implementation is MAPI's deferred-send-time property (`PR_DEFERRED_SEND_TIME`, `SystemTime
+  0x3FEF`), PATCHed onto the draft before the one `/send` call — the same two-step, single-send-path
+  discipline as an immediate send, so scheduling adds **no** new way to compose-and-send.
+- After `/send`, the message **stays in the Drafts folder** (still a draft, same id) until the
+  deferred instant, then dispatches itself and moves to Sent Items. Verified end to end: a probe
+  deferred by four minutes sat in Drafts, sent at its exact second, and arrived.
+- `manage_scheduled_send list` shows everything waiting (subject, recipients, send time, id);
+  `cancel` stops one before its time. **Cancellation discards the message completely** — deleting a
+  submitted deferred message removes it with no Deleted Items copy (verified live; it is the one
+  delete in the mail surface that cannot be soft, because Exchange itself offers no soft form), so
+  the tool's description tells the model to read the message first if the text is worth keeping.
+- A scheduled send whose time has already passed cannot be cancelled, and the tool says so rather
+  than pretending.
+
+Scheduled send also serves as the closest honest form of "undo send": schedule a few minutes out,
+and the window before `send_at` is a real cancellation window — unlike Outlook's own client-side
+undo, which this server cannot offer (and Exchange message recall does not exist for personal
+accounts).
+
+## The compose signature
+
+`mailbox_settings set_signature` stores a plain-text signature; from then on `create_draft` appends
+it under the new text of every draft (above the quoted tail in replies and forwards, HTML-escaped in
+HTML drafts), `omit_signature` skips it per draft, and `clear_signature` stops it. The signature
+lives in this server's own state store (the local `.mcp-state.json` file on stdio, KV on the
+Worker), because **Microsoft Graph exposes no API for the signature Outlook's own clients keep** —
+the two are independent, and the tool's output says so. A consequence worth knowing: the local and
+hosted servers each keep their own signature.
+
 ## Soft-delete policy
 
 Every *mailbox* delete in the tool surface (messages, events, contacts) is a **soft delete**: items move
@@ -790,7 +843,7 @@ what a fresh clone can run.
 
 ## Remote deployment
 
-The same 37 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
+The same 40 tools, 2 prompts and 2 resources are also served over MCP Streamable HTTP from a
 Cloudflare Worker, so claude.ai can reach the mailbox as a custom connector without this laptop being
 on. The Worker additionally does the two things a laptop cannot: receive Graph change notifications,
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
@@ -990,7 +1043,7 @@ runtime. The server resolves its own project root from its module location, so i
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.
 - **Checking server status:** Settings → Developer → MCP servers shows the `outlook` server and whether
-  it started; in a chat, the tools icon lists its thirty tools when connected, and the prompt
+  it started; in a chat, the tools icon lists its forty tools when connected, and the prompt
   picker offers `triage_inbox` and `morning_brief`.
 - **Logs:** `~/Library/Logs/Claude/mcp-server-outlook.log` (this server's stderr) and
   `~/Library/Logs/Claude/mcp.log` (general MCP lifecycle) — first place to look when the server shows as failed.

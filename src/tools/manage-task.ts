@@ -66,6 +66,12 @@ export const manageTaskSchema = {
     .describe(
       "Reminder time as YYYY-MM-DDTHH:MM in America/Toronto (no timezone suffix). Setting it turns the task's reminder on."
     ),
+  importance: z
+    .enum(["low", "normal", "high"])
+    .optional()
+    .describe(
+      'For create/update: the task\'s importance — "high" is the starred/Important marking in Microsoft To Do; "normal" clears it.'
+    ),
   linked_message_id: z
     .string()
     .min(1)
@@ -110,7 +116,7 @@ export const manageTaskSchema = {
 const manageTaskArgs = z.object(manageTaskSchema);
 
 export const manageTaskDescription =
-  "Create, complete, reopen, update, or delete a Microsoft To Do task; manage its subtasks (checklist items); create or rename a To Do list. Dates are America/Toronto. Pass linked_message_id on create to turn an email into a task — the mail's subject, sender, and an Outlook link go into the task notes. Pass recurrence on create for a repeating task (due_date required). WARNING: delete here is PERMANENT — unlike mail, a deleted To Do task does not go to a recoverable folder and cannot be restored, so state the task's title to the user and get agreement before deleting. To finish a task while keeping it, use complete instead of delete. This tool deliberately CANNOT delete a To Do list: deleting a list destroys every task in it with no recoverable copy, which no soft-delete convention can undo — delete a list in the Microsoft To Do app if that is really what the user wants.";
+  "Create, complete, reopen, update, or delete a Microsoft To Do task; manage its subtasks (checklist items); create or rename a To Do list. importance \"high\" is To Do's starred/Important marking. Dates are America/Toronto. Pass linked_message_id on create to turn an email into a task — the mail's subject, sender, and an Outlook link go into the task notes. Pass recurrence on create for a repeating task (due_date required). WARNING: delete here is PERMANENT — unlike mail, a deleted To Do task does not go to a recoverable folder and cannot be restored, so state the task's title to the user and get agreement before deleting. To finish a task while keeping it, use complete instead of delete. This tool deliberately CANNOT delete a To Do list: deleting a list destroys every task in it with no recoverable copy, which no soft-delete convention can undo — delete a list in the Microsoft To Do app if that is really what the user wants.";
 
 /** A Graph dateTimeTimeZone for a naive local wall-clock value. */
 function localStamp(dateTime: string): { dateTime: string; timeZone: string } {
@@ -202,6 +208,7 @@ export async function manageTaskHandler(
       due_date,
       body,
       reminder,
+      importance,
       linked_message_id,
       recurrence,
       clear_recurrence,
@@ -294,12 +301,14 @@ export async function manageTaskHandler(
           ...(reminder
             ? { reminderDateTime: localStamp(`${reminder}:00`), isReminderOn: true }
             : {}),
+          ...(importance ? { importance } : {}),
           ...(recurrence ? { recurrence: toGraphRecurrence(recurrence, due_date!) } : {}),
         }),
       });
       return textResult(
         `Task created in "${list.displayName}".\n` +
           `Title: ${created.title}\n` +
+          (importance && importance !== "normal" ? `Importance: ${importance}\n` : "") +
           (due_date ? `Due: ${due_date} (${TIMEZONE})\n` : "") +
           (reminder ? `Reminder: ${reminder.replace("T", " ")} (${TIMEZONE})\n` : "") +
           (created.recurrence ? `${describeRecurrence(created.recurrence)}\n` : "") +
@@ -411,12 +420,13 @@ export async function manageTaskHandler(
         patch.reminderDateTime = localStamp(`${reminder}:00`);
         patch.isReminderOn = true;
       }
+      if (importance !== undefined) patch.importance = importance;
       // Graph accepts recurrence: null on an existing task (it refuses every
       // other recurrence change), which is what makes "stop repeating" possible.
       if (clear_recurrence) patch.recurrence = null;
       if (Object.keys(patch).length === 0) {
         return errorResult(
-          'Action "update" needs at least one of title, due_date, body, reminder, or clear_recurrence.'
+          'Action "update" needs at least one of title, due_date, body, reminder, importance, or clear_recurrence.'
         );
       }
       summary = `updated (${Object.keys(patch).join(", ")})`;

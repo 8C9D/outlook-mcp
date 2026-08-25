@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
-import { ToolResult, errorResult, runTool, textResult } from "./common.js";
+import { ToolInputError, ToolResult, errorResult, runTool, textResult } from "./common.js";
 
 const CATEGORIES_PATH = "/me/outlook/masterCategories";
 
@@ -74,6 +74,27 @@ export const manageCategoriesDescription =
 export async function fetchMasterCategories(): Promise<any[]> {
   const data = await callGraphServer(`${CATEGORIES_PATH}?$top=100`);
   return data?.value ?? [];
+}
+
+/**
+ * Validate category names against the master list (Graph silently accepts
+ * unknown names, leaving colourless labels behind) and return them in the
+ * master list's exact spelling. Shared by every tool that applies categories.
+ */
+export async function resolveCategoryNames(names: string[]): Promise<string[]> {
+  const master = await fetchMasterCategories();
+  const byLower = new Map<string, string>(
+    master.map((c: any) => [String(c.displayName ?? "").toLowerCase(), c.displayName])
+  );
+  const unknown = names.filter((name) => !byLower.has(name.toLowerCase()));
+  if (unknown.length > 0) {
+    const available = master.map((c: any) => JSON.stringify(c.displayName)).join(", ");
+    throw new ToolInputError(
+      `Unknown categor(y/ies): ${unknown.map((n) => JSON.stringify(n)).join(", ")}. ` +
+        `This mailbox has: ${available || "(none)"}. Create it with manage_categories first.`
+    );
+  }
+  return names.map((name) => byLower.get(name.toLowerCase())!);
 }
 
 export async function manageCategoriesHandler(

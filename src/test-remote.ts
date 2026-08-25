@@ -1898,23 +1898,38 @@ await test("r20. cleanup: the probe message, its notifications and the delta pos
 
   // The ring buffer: drop what this run put there, keep everything else. The
   // subscription itself stays — it is the point of the feature, not an artifact.
-  const current = JSON.parse((await kvGet(outlookNs, STATE_ACTIVITY)) || "[]") as ActivityEntry[];
-  const kept = current.filter(
-    (entry) => !String(entry.subject ?? "").startsWith(TEST_PREFIX)
-  );
-  await kvPut(outlookNs, STATE_ACTIVITY, JSON.stringify(kept));
-
-  const after = await poll("the ring buffer to lose the test entries", 60_000, 5_000, async () => {
-    const raw = (await kvGet(outlookNs, STATE_ACTIVITY)) || "[]";
-    return raw.includes(TEST_PREFIX) ? undefined : (JSON.parse(raw) as ActivityEntry[]);
-  });
+  //
+  // Scrub-until-stable, not write-once: the Worker's appendActivity is a
+  // read-modify-write over eventually-consistent KV, so a notification landing
+  // near the scrub (this run's own probes, or Graph's delayed retries of
+  // earlier ones) can be appended onto a PRE-scrub read and resurrect the test
+  // entries — which a single write followed by a 60 s wait mistakes for
+  // failure (observed live, three runs in a row, 2026-08-25). Re-scrubbing on
+  // every poll converges as soon as the straggler traffic stops.
+  const deadline = Date.now() + 180_000;
+  let cleanStreak = 0;
+  let lastRing: ActivityEntry[] = [];
+  while (Date.now() < deadline && cleanStreak < 2) {
+    const ring = JSON.parse((await kvGet(outlookNs, STATE_ACTIVITY)) || "[]") as ActivityEntry[];
+    const scrubbed = ring.filter(
+      (entry) => !String(entry.subject ?? "").startsWith(TEST_PREFIX)
+    );
+    if (scrubbed.length !== ring.length) {
+      cleanStreak = 0;
+      await kvPut(outlookNs, STATE_ACTIVITY, JSON.stringify(scrubbed));
+    } else {
+      cleanStreak++;
+      lastRing = ring;
+    }
+    if (cleanStreak < 2) await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
   assert(
-    !after.some((entry) => String(entry.subject ?? "").startsWith(TEST_PREFIX)),
+    cleanStreak >= 2,
+    "the ring buffer still resurrects test notifications after 180 s of re-scrubbing"
+  );
+  assert(
+    !lastRing.some((entry) => String(entry.subject ?? "").startsWith(TEST_PREFIX)),
     "the ring buffer still holds test notifications"
-  );
-  assert(
-    after.length === kept.length,
-    `ring buffer holds ${after.length} entries, expected the ${kept.length} that predate this run`
   );
 
   // The delta position: put back exactly what was there, or remove ours.

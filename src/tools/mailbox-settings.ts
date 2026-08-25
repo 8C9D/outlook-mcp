@@ -9,14 +9,23 @@
 // at auto_reply for changes. See ASSUMPTIONS.md (Batch B) for the decision.
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
+import { getStateStore } from "../core/state.js";
+import { STATE_SIGNATURE } from "../core/kv-keys.js";
 import { ToolResult, errorResult, runTool, textResult } from "./common.js";
 import { WEEKDAYS } from "./create-event.js";
 
 export const mailboxSettingsSchema = {
   action: z
-    .enum(["get", "set_working_hours", "set_focus_override", "clear_focus_override"])
+    .enum([
+      "get",
+      "set_working_hours",
+      "set_focus_override",
+      "clear_focus_override",
+      "set_signature",
+      "clear_signature",
+    ])
     .describe(
-      "get: read the mailbox's time zone, working hours, Focused-Inbox overrides and auto-reply status; set_working_hours: change the working days and hours; set_focus_override: always file a sender's mail in Focused or Other; clear_focus_override: drop that sender's override and let Outlook decide again."
+      "get: read the mailbox's time zone, working hours, Focused-Inbox overrides, auto-reply status, and the stored signature; set_working_hours: change the working days and hours; set_focus_override: always file a sender's mail in Focused or Other; clear_focus_override: drop that sender's override and let Outlook decide again; set_signature: store the email signature create_draft appends to new drafts; clear_signature: stop appending one."
     ),
   days: z
     .array(z.enum(WEEKDAYS))
@@ -48,12 +57,20 @@ export const mailboxSettingsSchema = {
     .describe(
       'set_focus_override: where this sender\'s mail always lands — "focused" (the Focused tab) or "other". Required for set_focus_override.'
     ),
+  signature: z
+    .string()
+    .min(1)
+    .max(2000)
+    .optional()
+    .describe(
+      'set_signature: the signature text (plain text; newlines allowed), e.g. "Best,\\nYour Name". Required for set_signature.'
+    ),
 };
 
 const mailboxSettingsArgs = z.object(mailboxSettingsSchema);
 
 export const mailboxSettingsDescription =
-  "Read and change mailbox settings: working hours (which days and hours the user works) and Focused-Inbox overrides (senders pinned to the Focused or Other tab). CAUTION — working hours are not private: they drive the free/busy view and the meeting times Outlook suggests, so anyone who can schedule with this account sees the effect of a change. Focused-Inbox overrides are local to this mailbox and invisible to senders, but they change where mail lands, so a sender pinned to \"other\" will be easy to miss. Use get before changing anything, and state the exact before/after to the user. The automatic reply (out-of-office) is reported here read-only — change it with the auto_reply tool.";
+  "Read and change mailbox settings: working hours (which days and hours the user works), Focused-Inbox overrides (senders pinned to the Focused or Other tab), and the email signature create_draft appends to drafts (stored by this server — Microsoft Graph exposes no API for the signature Outlook's own apps keep, so the two are independent). CAUTION — working hours are not private: they drive the free/busy view and the meeting times Outlook suggests, so anyone who can schedule with this account sees the effect of a change. Focused-Inbox overrides are local to this mailbox and invisible to senders, but they change where mail lands, so a sender pinned to \"other\" will be easy to miss. Use get before changing anything, and state the exact before/after to the user. The automatic reply (out-of-office) is reported here read-only — change it with the auto_reply tool.";
 
 /** "08:00:00.0000000" → "08:00"; anything unexpected is passed through. */
 function shortTime(value: string | undefined): string {
@@ -88,6 +105,20 @@ function describeOverrides(overrides: any[]): string {
   return `Focused-Inbox overrides (${overrides.length}):\n${lines.join("\n")}`;
 }
 
+/** The stored signature text, or undefined (no store, none set, unparseable). */
+async function readStoredSignature(): Promise<string | undefined> {
+  const store = getStateStore();
+  if (!store) return undefined;
+  const raw = await store.get(STATE_SIGNATURE).catch(() => null);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.text === "string" && parsed.text ? parsed.text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Every override, paged; the collection is small on a personal mailbox. */
 async function readOverrides(): Promise<any[]> {
   const data = await callGraphServer("/me/inferenceClassification/overrides?$top=100");
@@ -98,7 +129,7 @@ export async function mailboxSettingsHandler(
   input: z.input<typeof mailboxSettingsArgs>
 ): Promise<ToolResult> {
   return runTool(async () => {
-    const { action, days, start_time, end_time, sender, classify_as } =
+    const { action, days, start_time, end_time, sender, classify_as, signature } =
       mailboxSettingsArgs.parse(input);
 
     if (action === "get") {
@@ -107,11 +138,49 @@ export async function mailboxSettingsHandler(
       );
       const overrides = await readOverrides();
       const autoReply = settings?.automaticRepliesSetting?.status ?? "disabled";
+      const storedSignature = await readStoredSignature();
       return textResult(
         `Mailbox time zone: ${settings?.timeZone ?? "(unknown)"}\n` +
           `${describeWorkingHours(settings?.workingHours)}\n` +
           `${describeOverrides(overrides)}\n` +
+          (storedSignature
+            ? `Signature: set (appended to new drafts by create_draft):\n  ${storedSignature.split("\n").join("\n  ")}\n`
+            : "Signature: none stored — set_signature makes create_draft append one.\n") +
           `Auto-reply: ${autoReply === "disabled" ? "OFF" : `ON (${autoReply})`} — read/change it with the auto_reply tool.`
+      );
+    }
+
+    if (action === "set_signature") {
+      if (!signature) return errorResult('Action "set_signature" requires signature (the text).');
+      const store = getStateStore();
+      if (!store) {
+        return errorResult(
+          "This server has no state store, so it cannot remember a signature between calls."
+        );
+      }
+      await store.put(STATE_SIGNATURE, JSON.stringify({ text: signature }));
+      return textResult(
+        "Signature stored. create_draft now appends it under the new text of every draft " +
+          "(omit_signature per draft skips it; clear_signature stops it).\n" +
+          `Signature:\n  ${signature.split("\n").join("\n  ")}\n` +
+          "Note: this signature lives in this server, independent of the one Outlook's own apps " +
+          "keep — Microsoft Graph offers no way to read or write that one."
+      );
+    }
+
+    if (action === "clear_signature") {
+      const store = getStateStore();
+      if (!store) {
+        return errorResult(
+          "This server has no state store, so there is no stored signature to clear."
+        );
+      }
+      const existing = await readStoredSignature();
+      await store.delete(STATE_SIGNATURE);
+      return textResult(
+        existing
+          ? "Signature cleared — create_draft no longer appends one."
+          : "There was no stored signature; nothing to clear."
       );
     }
 

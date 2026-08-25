@@ -39,6 +39,13 @@ export function llmBudgetKey(torontoDate: string): string {
   return `llm:budget:${torontoDate}`;
 }
 
+/**
+ * The user's email signature, appended by create_draft. Stored per state store
+ * (the local file on stdio, KV on the Worker), because Graph exposes no API for
+ * the signature Outlook's own clients keep.
+ */
+export const STATE_SIGNATURE = "compose:signature";
+
 /** The latest health-check report: timestamp, verdict, per-check results. */
 export const STATE_HEALTH = "health:last";
 

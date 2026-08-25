@@ -19,7 +19,7 @@ Do not call create_folder, create_draft, manage_message, manage_categories, mana
 
 const MORNING_BRIEF = `Give me my morning brief. Gather all three of these first, then write the brief:
 
-1. Recent mail: call search_mail with NO query (get_latest mode) on the inbox, max_results 25. Keep only messages received within the last 24 hours, judging by the "At:" timestamps (America/Toronto). Note that this listing does not report read/unread state — if whether I have already read something changes what you would say about it, call read_message on that message rather than guessing.
+1. Recent mail: call search_mail with NO query (get_latest mode) on the inbox, max_results 25. Keep only messages received within the last 24 hours, judging by the "At:" timestamps (America/Toronto). Each hit carries an [unread] marker when I have not read it — weight unread mail accordingly, and lead with it in the brief.
 2. Today's calendar: call list_events with days 1 for today's schedule.
 3. Open tasks: call list_tasks with due_within_days 3 (open tasks only) — this returns overdue, today, and upcoming groups.
 
