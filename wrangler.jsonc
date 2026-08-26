@@ -35,8 +35,12 @@
   //                  human, remains the only send path in this server).
   "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *"] },
   "vars": {
-    // Public origin of this Worker. Graph is told to deliver notifications to
-    // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname.
+    // Public origin of this Worker, and the ONLY place the deployed hostname is
+    // written down — nothing under src/ carries a default, so a fork changes
+    // this line and nothing else. Graph is told to deliver notifications to
+    // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname;
+    // it is also the resource this server advertises under RFC 9728. The Node
+    // harnesses and `npm run doctor` read it from here (project-root.ts).
     "PUBLIC_BASE_URL": "<PUBLIC_BASE_URL>"
   },
   "kv_namespaces": [

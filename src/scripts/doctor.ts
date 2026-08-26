@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SCOPES, TOKEN_CACHE_PATH, getAccessTokenSilent, getGrantedScopes } from "../auth.js";
 import { GraphError, callGraphWithToken } from "../core/graph.js";
-import { PROJECT_ROOT } from "../project-root.js";
+import { PROJECT_ROOT, deployedBaseUrl } from "../project-root.js";
 import { VERSION } from "../core/version.js";
 
 /** WARN is a fact worth knowing that does not stop the server working. */
@@ -277,14 +277,7 @@ export async function liveChecks(): Promise<Check[]> {
  * here can fail the run.
  */
 export async function deploymentChecks(): Promise<Check[]> {
-  const raw = await fs
-    .readFile(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8")
-    .catch(() => undefined);
-  if (!raw) return [];
-  const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as {
-    vars?: { PUBLIC_BASE_URL?: string };
-  };
-  const baseUrl = config.vars?.PUBLIC_BASE_URL;
+  const baseUrl = deployedBaseUrl();
   if (!baseUrl) return [];
 
   try {

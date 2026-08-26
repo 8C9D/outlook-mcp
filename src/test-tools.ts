@@ -10,7 +10,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GraphError, callGraphServer, graphRequestLog } from "./core/graph.js";
-import { PROJECT_ROOT } from "./project-root.js";
+import { PROJECT_ROOT, deployedBaseUrl } from "./project-root.js";
 import { searchMailHandler, torontoMidnightUtc } from "./tools/search-mail.js";
 import { deleteFolderHandler } from "./tools/delete-folder.js";
 import { downloadDriveItem } from "./core/drive.js";
@@ -1818,84 +1818,102 @@ await test("v5e. get_mailbox_activity refuses to pretend on the local stdio serv
 // A small, public, always-on https resource this project owns: the deployed
 // Worker's health endpoint. Attaching it exercises the url source end to end
 // (fetch, size cap, content-type from the response, name from the URL path).
-const PROBE_URL = "<PUBLIC_BASE_URL>/health";
+// The origin comes from wrangler.jsonc, so a checkout with nothing deployed
+// has no probe to fetch and skips rather than failing.
+const PROBE_BASE = deployedBaseUrl();
+/**
+ * Only v7a below actually fetches this. The other two uses are "exactly one
+ * source" guards that reject before any download starts, so they just need a
+ * syntactically valid https URL and work on a checkout with nothing deployed.
+ */
+const PROBE_URL = `${PROBE_BASE ?? "https://mcp-test.invalid"}/health`;
+const V7A_NAME =
+  "v7a. add_attachment url (https fetch, name and type from the response, guards)";
 
-await test("v7a. add_attachment url (https fetch, name and type from the response, guards)", async () => {
-  const expected = await fetch(PROBE_URL);
-  assert(expected.ok, `the probe URL is not serving: HTTP ${expected.status}`);
-  const expectedBody = await expected.text();
-
-  const draftId = extractDraftId(
-    toolText(
-      await createDraftHandler({
-        to: [ownAddress],
-        subject: `${TEST_PREFIX} attach url`,
-        body: "URL-attachment test draft. Safe to delete.",
-      }),
-      "create_draft attach url"
-    )
+if (!PROBE_BASE) {
+  skip(
+    V7A_NAME,
+    "no PUBLIC_BASE_URL in wrangler.jsonc, so this checkout has no deployed health " +
+      "endpoint to attach. Deploy the Worker (npm run deploy) to exercise the url source."
   );
-  try {
-    const attachText = toolText(
-      await addAttachmentHandler({ draft_id: draftId, url: PROBE_URL }),
-      "add_attachment url"
-    );
-    assert(/Name: health/.test(attachText), `Name not taken from the URL path: ${attachText}`);
-    assert(
-      /Type: application\/json/.test(attachText),
-      `Content type not taken from the response: ${attachText}`
-    );
+} else {
+  await test(V7A_NAME, async () => {
+    const expected = await fetch(PROBE_URL);
+    assert(expected.ok, `the probe URL is not serving: HTTP ${expected.status}`);
+    const expectedBody = await expected.text();
 
-    const listed = await callGraphServer(
-      `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name,contentType`
+    const draftId = extractDraftId(
+      toolText(
+        await createDraftHandler({
+          to: [ownAddress],
+          subject: `${TEST_PREFIX} attach url`,
+          body: "URL-attachment test draft. Safe to delete.",
+        }),
+        "create_draft attach url"
+      )
     );
-    const att = (listed?.value ?? []).find((a: any) => a.name === "health");
-    assert(att, `URL attachment not in the inventory: ${JSON.stringify(listed?.value)}`);
-    const full = await callGraphServer(
-      `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
-    );
-    assert(
-      Buffer.from(full.contentBytes ?? "", "base64").toString("utf8") === expectedBody,
-      "the attached bytes differ from what the URL served"
-    );
+    try {
+      const attachText = toolText(
+        await addAttachmentHandler({ draft_id: draftId, url: PROBE_URL }),
+        "add_attachment url"
+      );
+      assert(/Name: health/.test(attachText), `Name not taken from the URL path: ${attachText}`);
+      assert(
+        /Type: application\/json/.test(attachText),
+        `Content type not taken from the response: ${attachText}`
+      );
 
-    // attachment_name overrides the URL-derived name, and drives the type.
-    const named = toolText(
-      await addAttachmentHandler({
-        draft_id: draftId,
-        url: PROBE_URL,
-        attachment_name: "health-check.json",
-      }),
-      "add_attachment url (named)"
-    );
-    assert(/Name: health-check\.json/.test(named), `attachment_name ignored: ${named}`);
+      const listed = await callGraphServer(
+        `/me/messages/${encodeURIComponent(draftId)}/attachments?$select=id,name,contentType`
+      );
+      const att = (listed?.value ?? []).find((a: any) => a.name === "health");
+      assert(att, `URL attachment not in the inventory: ${JSON.stringify(listed?.value)}`);
+      const full = await callGraphServer(
+        `/me/messages/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(att.id)}`
+      );
+      assert(
+        Buffer.from(full.contentBytes ?? "", "base64").toString("utf8") === expectedBody,
+        "the attached bytes differ from what the URL served"
+      );
 
-    // Guards: scheme, unparseable URL, and a URL that does not resolve.
-    const plaintext = expectError(
-      await addAttachmentHandler({ draft_id: draftId, url: "http://example.com/x.txt" }),
-      "add_attachment(http url)"
-    );
-    assert(/https/i.test(plaintext), `Unexpected scheme error: ${plaintext}`);
-    const nonsense = expectError(
-      await addAttachmentHandler({ draft_id: draftId, url: "not a url" }),
-      "add_attachment(bad url)"
-    );
-    assert(/not a valid url/i.test(nonsense), `Unexpected parse error: ${nonsense}`);
-    const unreachable = expectError(
-      await addAttachmentHandler({
-        draft_id: draftId,
-        url: "https://mcp-test.invalid/nothing.txt",
-      }),
-      "add_attachment(unreachable url)"
-    );
-    assert(
-      /download|fetch|failed/i.test(unreachable),
-      `Unexpected fetch failure text: ${unreachable}`
-    );
-  } finally {
-    await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
-  }
-});
+      // attachment_name overrides the URL-derived name, and drives the type.
+      const named = toolText(
+        await addAttachmentHandler({
+          draft_id: draftId,
+          url: PROBE_URL,
+          attachment_name: "health-check.json",
+        }),
+        "add_attachment url (named)"
+      );
+      assert(/Name: health-check\.json/.test(named), `attachment_name ignored: ${named}`);
+
+      // Guards: scheme, unparseable URL, and a URL that does not resolve.
+      const plaintext = expectError(
+        await addAttachmentHandler({ draft_id: draftId, url: "http://example.com/x.txt" }),
+        "add_attachment(http url)"
+      );
+      assert(/https/i.test(plaintext), `Unexpected scheme error: ${plaintext}`);
+      const nonsense = expectError(
+        await addAttachmentHandler({ draft_id: draftId, url: "not a url" }),
+        "add_attachment(bad url)"
+      );
+      assert(/not a valid url/i.test(nonsense), `Unexpected parse error: ${nonsense}`);
+      const unreachable = expectError(
+        await addAttachmentHandler({
+          draft_id: draftId,
+          url: "https://mcp-test.invalid/nothing.txt",
+        }),
+        "add_attachment(unreachable url)"
+      );
+      assert(
+        /download|fetch|failed/i.test(unreachable),
+        `Unexpected fetch failure text: ${unreachable}`
+      );
+    } finally {
+      await callGraphServer(`/me/messages/${encodeURIComponent(draftId)}`, { method: "DELETE" });
+    }
+  });
+}
 
 // ---- v7b. add_attachment from inline base64 ------------------------------
 
@@ -4352,7 +4370,7 @@ await test("v13a. OneDrive lifecycle (upload → list → search → read → re
     assert((root.structuredContent as any)?.path === "/", "root listing path is not /");
 
     // search_files: poll patiently — the index typically catches up in ~15-60 s
-    // but personal OneDrive has been observed to lag minutes (ASSUMPTIONS v13).
+    // but personal OneDrive has been observed live to lag by minutes.
     const SEARCH_DEADLINE_MS = 5 * 60 * 1000;
     const started = Date.now();
     let found: any = null;
@@ -4375,7 +4393,7 @@ await test("v13a. OneDrive lifecycle (upload → list → search → read → re
     } else {
       // The index simply has not caught up; the file's existence is already
       // proven by list_folder above. Recorded as an indexing-lag observation
-      // (ASSUMPTIONS v13) rather than failing the suite on Microsoft's index.
+      // rather than failing the suite on Microsoft's index.
       console.log(`      (WARN: search index did not surface the new file within ${lag}s — lag recorded)`);
     }
 
@@ -5549,8 +5567,8 @@ await test("i. final sweep: no [MCP TEST] artifacts anywhere, auto-reply restore
   // listing is exact and current, unlike search, whose index lags). Search is
   // still swept as best-effort: any indexed leftover is purged, and only
   // still-listable leftovers fail the run. The recycle bin cannot be listed on
-  // a personal drive; tests that soft-delete restore + permanently delete
-  // their own items instead (ASSUMPTIONS v13).
+  // a personal drive — verified live, every documented endpoint for it refuses
+  // — so tests that soft-delete restore + permanently delete their own items.
   const driveKids = await callGraphServer("/me/drive/root/children?$select=id,name&$top=200");
   const driveLeftovers = (driveKids?.value ?? []).filter((c: any) =>
     String(c.name ?? "").startsWith(TEST_PREFIX)

@@ -17,12 +17,30 @@ import { kvStateStore } from "./state-kv.js";
 /** The path Graph is told to deliver to. Part of the subscription record. */
 export const NOTIFICATIONS_PATH = "/notifications";
 
-/** Fallback for the deployed origin when PUBLIC_BASE_URL is not configured. */
-export const DEFAULT_PUBLIC_BASE_URL = "<PUBLIC_BASE_URL>";
+/** The deployed origin, with any trailing slashes removed. */
+export function publicBaseUrl(env: Env): string | undefined {
+  const configured = env.PUBLIC_BASE_URL?.trim();
+  return configured ? configured.replace(/\/+$/, "") : undefined;
+}
 
-/** The absolute URL Graph must post notifications to. */
+/**
+ * The absolute URL Graph must post notifications to.
+ *
+ * There is deliberately no compiled-in fallback: the origin belongs to the
+ * deployment, not to the source, so it comes from the PUBLIC_BASE_URL wrangler
+ * var and nowhere else. A deploy that forgot it cannot guess its own hostname,
+ * and a guess would silently point Graph at someone else's Worker — so this
+ * throws, and the scheduled handler logs it.
+ */
 export function notificationUrl(env: Env): string {
-  return (env.PUBLIC_BASE_URL ?? DEFAULT_PUBLIC_BASE_URL).replace(/\/+$/, "") + NOTIFICATIONS_PATH;
+  const base = publicBaseUrl(env);
+  if (!base) {
+    throw new Error(
+      "PUBLIC_BASE_URL is not set, so Graph cannot be told where to deliver change " +
+        "notifications. Set it in wrangler.jsonc to this Worker's public origin and redeploy."
+    );
+  }
+  return base + NOTIFICATIONS_PATH;
 }
 
 const GRAPH_MESSAGE = "https://graph.microsoft.com/v1.0/me/messages";

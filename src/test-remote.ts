@@ -32,7 +32,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
-import { PROJECT_ROOT } from "./project-root.js";
+import { PROJECT_ROOT, deployedBaseUrl } from "./project-root.js";
 import { installMsalTokenProvider } from "./auth.js";
 import { callGraphServer, callGraphServerBytes, callGraphWithToken } from "./core/graph.js";
 import {
@@ -65,7 +65,17 @@ import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
 import { SUBSCRIPTION_RESOURCE, type SubscriptionRecord } from "./core/subscriptions.js";
 import { VERSION } from "./core/version.js";
 
-const BASE_URL = process.env.MCP_REMOTE_URL ?? "<PUBLIC_BASE_URL>";
+// The deployment under test comes from wrangler.jsonc's PUBLIC_BASE_URL (or
+// MCP_REMOTE_URL, to aim at another one). Nothing here hardcodes a hostname:
+// this suite belongs to whoever deployed the checkout it is running in.
+const BASE_URL = deployedBaseUrl();
+if (!BASE_URL) {
+  console.error(
+    "No deployment to test: set PUBLIC_BASE_URL in wrangler.jsonc (or MCP_REMOTE_URL) " +
+      "to the Worker's public origin, then `npm run deploy`."
+  );
+  process.exit(1);
+}
 const MCP_URL = `${BASE_URL}/mcp`;
 const TEST_CLIENT_NAME = "[MCP TEST] remote harness";
 

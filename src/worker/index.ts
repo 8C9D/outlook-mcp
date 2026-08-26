@@ -18,7 +18,7 @@ import { DOWNLOAD_ROUTE_PREFIX } from "../core/downloads.js";
 import { defaultHandler } from "./authorize.js";
 import { downloadHandler } from "./download.js";
 import { mcpHandler } from "./mcp-handler.js";
-import { keepSubscriptionAlive } from "./notifications.js";
+import { keepSubscriptionAlive, publicBaseUrl } from "./notifications.js";
 import { draftMorningBrief, reconcileFilingCorrections } from "./llm.js";
 import { runWorkerHealthCheck } from "./health.js";
 import { torontoHourOf } from "../core/auto-filing.js";
@@ -56,32 +56,49 @@ const apiHandler = {
   },
 };
 
-const oauthProvider = new OAuthProvider<Env>({
-  apiRoute: "/mcp",
-  apiHandler,
-  defaultHandler,
+/**
+ * RFC 9728 requires the advertised resource to match the URL pasted into the
+ * client exactly, so it has to be this deployment's own origin — which lives in
+ * the PUBLIC_BASE_URL wrangler var, not in this file. Bindings are not readable
+ * at module scope, so the provider is built on the first request and memoized
+ * per origin (a Worker isolate only ever sees one).
+ */
+let cached: { origin: string; provider: OAuthProvider<Env> } | undefined;
 
-  authorizeEndpoint: "/authorize",
-  tokenEndpoint: "/oauth/token",
-  // claude.ai registers itself as a public client via RFC 7591; without this
-  // endpoint the connector has no way to obtain a client_id.
-  clientRegistrationEndpoint: "/oauth/register",
+function providerFor(request: Request, env: Env): OAuthProvider<Env> {
+  // Falling back to the request's own origin keeps `wrangler dev` and any fork
+  // working with no configuration; a deployment sets the var so the value does
+  // not depend on which hostname a caller happened to use.
+  const origin = publicBaseUrl(env) ?? new URL(request.url).origin;
+  if (cached?.origin === origin) return cached.provider;
 
-  scopesSupported: SCOPES_SUPPORTED,
+  const provider = new OAuthProvider<Env>({
+    apiRoute: "/mcp",
+    apiHandler,
+    defaultHandler,
 
-  resourceMetadata: {
-    // Filled from the wrangler var so the advertised resource matches the URL
-    // pasted into the client exactly, which RFC 9728 requires.
-    resource: "<PUBLIC_BASE_URL>/mcp",
-    scopes_supported: SCOPES_SUPPORTED,
-    bearer_methods_supported: ["header"],
-    resource_name: "Outlook MCP",
-  },
-});
+    authorizeEndpoint: "/authorize",
+    tokenEndpoint: "/oauth/token",
+    // claude.ai registers itself as a public client via RFC 7591; without this
+    // endpoint the connector has no way to obtain a client_id.
+    clientRegistrationEndpoint: "/oauth/register",
+
+    scopesSupported: SCOPES_SUPPORTED,
+
+    resourceMetadata: {
+      resource: `${origin}/mcp`,
+      scopes_supported: SCOPES_SUPPORTED,
+      bearer_methods_supported: ["header"],
+      resource_name: "Outlook MCP",
+    },
+  });
+  cached = { origin, provider };
+  return provider;
+}
 
 export default {
   fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
-    oauthProvider.fetch(request, env, ctx),
+    providerFor(request, env).fetch(request, env, ctx),
 
   /**
    * Cron triggers (see `triggers.crons` in wrangler.jsonc). Three jobs share
