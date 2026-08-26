@@ -3,7 +3,8 @@
 The v1.3 audit: every capability a normal human user of personal Outlook (outlook.com — Mail,
 Calendar, People, To Do, plus the OneDrive surface Outlook attachments touch) exercises, and where
 this server stands on each. Compiled against the Outlook web UI surface; every "newly implemented"
-and "not feasible" verdict below was probed live against this account (see ASSUMPTIONS.md Batch 6).
+and "not feasible" verdict below was probed live against this account, and cites what the probe
+returned.
 
 **Statuses**
 

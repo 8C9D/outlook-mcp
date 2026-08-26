@@ -310,7 +310,7 @@ Tasks live in Microsoft To Do (Graph `/me/todo`), reached with the `Tasks.ReadWr
 keeps its own `get`/`set`/`clear` vocabulary and its own outward-facing caution, and
 `mailbox_settings get` reports the auto-reply status read-only and points at it. (Folding auto-reply
 in would have made one `set` action mean four different things and broken every existing caller for
-no gain — the reasoning is in ASSUMPTIONS.md.)
+no gain.)
 
 - **Working hours** (`workingHours` on `/me/mailboxSettings`). `set_working_hours` changes `days`,
   `start_time`, `end_time`; anything not passed is carried over from what is there, because Graph
@@ -1021,24 +1021,27 @@ only the allowlisted account can complete it.
 
 ## Claude Desktop
 
-The server is registered in `~/Library/Application Support/Claude/claude_desktop_config.json` under
-`mcpServers` (installed 2026-08-18; unchanged for v2 — same command and args):
+Register the server in `~/Library/Application Support/Claude/claude_desktop_config.json` under
+`mcpServers`, with both paths absolute:
 
 ```json
 "outlook": {
-  "command": "/Users/<user>/.nvm/versions/node/v24.15.0/bin/node",
-  "args": ["/Users/<user>/dev/outlook-mcp/dist/server.js"]
+  "command": "/absolute/path/to/node",
+  "args": ["/absolute/path/to/outlook-mcp/dist/server.js"]
 }
 ```
+
+Get the two values with `which node` and `pwd` from this checkout. Both must be absolute — see the
+Node path caveat below for why the `command` cannot just be `node`.
 
 It runs the compiled build (`npm run build` → `dist/server.js`) under a plain `node` — no `tsx` needed at
 runtime. The server resolves its own project root from its module location, so it finds `.env` and
 `.token-cache.json` regardless of the working directory Claude Desktop launches it with.
 
-> **Node path caveat:** the `command` is the absolute path to the node binary (resolved via `which node`
-> at install time) because Claude Desktop does not inherit the shell `PATH`. This machine uses nvm, so
-> **upgrading or switching the default node version changes this path** — if the server stops launching
-> after a node upgrade, re-run `which node` and update `command` accordingly.
+> **Node path caveat:** the `command` must be the absolute path to the node binary (resolved via
+> `which node` at install time) because Claude Desktop does not inherit the shell `PATH`. Under a
+> version manager such as nvm, **upgrading or switching the default node version changes this path** —
+> if the server stops launching after a node upgrade, re-run `which node` and update `command`.
 
 - **Picking up config changes:** Claude Desktop reads the config only at launch. Fully quit it (Cmd+Q —
   closing the window is not enough) and reopen.

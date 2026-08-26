@@ -2,7 +2,8 @@
 //
 // What Microsoft Graph actually offers a consumer (outlook.com) mailbox here is
 // far less than the Outlook web UI suggests, and every alternative was probed
-// live against this account before this tool was written (see ASSUMPTIONS.md):
+// live against this account before this tool was written. What each one
+// returned, verbatim:
 //
 //   GET  /beta/me/blockedSenders                    404 UnknownError
 //   GET  /beta/me/safeSenders                       404 UnknownError

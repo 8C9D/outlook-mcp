@@ -1299,7 +1299,8 @@ await test("o22. drive logic: paths, URLs, conflict mapping, type filter, orderi
 
   // The overwrite flag maps to Graph's vocabulary — and the default MUST be
   // rename, because Graph's own default (replace) silently destroys the
-  // existing file (verified live; ASSUMPTIONS v13).
+  // existing file. Verified live against a personal drive before this mapping
+  // was chosen; test v13b exercises both behaviours end to end.
   assert(conflictBehaviorFor(false) === "rename", "default must be rename");
   assert(conflictBehaviorFor(true) === "replace", "overwrite must be replace");
 

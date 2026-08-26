@@ -5,3 +5,14 @@ dist/
 .mcp-state.json
 .dev.vars
 .wrangler/
+# Working notes from live mailbox runs. These quote real mail — senders,
+# subjects, folder counts, exported inbox rules — and this repository is
+# public. They are deliberately never committed.
+cleanup-progress.md
+recover_deletions.py
+# Build journals: the decision log and run report kept while this was built.
+# Private engineering notes, not documentation — what a reader needs is in
+# README.md, SETUP.md and CAPABILITIES.md. They also quote live probe output
+# from the owner's account.
+ASSUMPTIONS.md
+RUN-REPORT.md

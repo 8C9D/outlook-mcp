@@ -2,7 +2,7 @@
 // both transports. Free of Node-only imports, like the rest of core/.
 //
 // Live behaviour this module is built on, verified against the real personal
-// drive before anything was designed in (details in ASSUMPTIONS.md "v13"):
+// drive before anything was designed in (tests v13a-v13c re-verify each one):
 //   * PUT …:/content DEFAULTS TO REPLACE on a name collision — silently. Every
 //     upload therefore states @microsoft.graph.conflictBehavior explicitly:
 //     "rename" unless the caller asked to overwrite.

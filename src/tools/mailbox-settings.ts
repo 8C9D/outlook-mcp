@@ -6,7 +6,7 @@
 // caution that belongs to that tool alone; folding it in here would have made
 // "set" mean four different things and would have broken every existing caller.
 // This tool's "get" therefore reports the auto-reply state read-only and points
-// at auto_reply for changes. See ASSUMPTIONS.md (Batch B) for the decision.
+// at auto_reply for changes.
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
 import { getStateStore } from "../core/state.js";

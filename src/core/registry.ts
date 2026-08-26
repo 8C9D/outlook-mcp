@@ -218,7 +218,8 @@ type ToolDefinition = {
  * tools cannot drift into thirty different readings of the same word. Each hint
  * is stated on every tool rather than left to the protocol's defaults, which are
  * "destructive and open-world unless told otherwise" and would be wrong here far
- * more often than right. ASSUMPTIONS.md (v10) records the judgment calls.
+ * more often than right. Offline test o16 enforces every rule below, so a new
+ * tool cannot ship with a hint that contradicts them.
  *
  *   readOnlyHint     the call changes nothing: not the mailbox, not this
  *                    server's own state, not the local disk.

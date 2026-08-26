@@ -2,12 +2,11 @@
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities **privately** — do not open a public issue:
+Please report vulnerabilities **privately** — do not open a public issue.
 
-- **Preferred:** GitHub's private vulnerability reporting on this repository
-  (*Security → Report a vulnerability*), which opens a private advisory thread.
-- **Or by email:** <owner-email> with `[outlook-mcp security]`
-  in the subject.
+Use GitHub's private vulnerability reporting on this repository
+(*Security → Report a vulnerability*), which opens a private advisory thread
+visible only to you and the maintainer.
 
 This is a personal project with a single maintainer; expect an acknowledgement
 within a few days rather than hours. Please include enough detail to reproduce

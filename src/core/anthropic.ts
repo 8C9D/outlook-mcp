@@ -20,8 +20,9 @@ const API_VERSION = "2023-06-01";
  * classification and a one-paragraph brief are exactly what it is good at and
  * the workload is per-message. Input $1 / output $5 per million tokens.
  *
- * Recorded here as the canonical alias rather than a dated snapshot id — see
- * ASSUMPTIONS.md (Batch C) for the live verification.
+ * Recorded here as the canonical alias rather than a dated snapshot id. Test
+ * v9e sends the real classification prompt to this model id, so a rename or a
+ * retirement fails the suite rather than surfacing as a runtime error.
  */
 export const LLM_MODEL = "claude-haiku-4-5";
 
