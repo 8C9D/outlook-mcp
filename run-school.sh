@@ -12,7 +12,7 @@ cd "$(dirname "$0")" || exit 1
 
 export AZURE_CLIENT_ID="<school-client-id>"
 export OUTLOOK_MCP_AUTHORITY="organizations"
-export OUTLOOK_MCP_TOKEN_CACHE=".token-cache.school.json"
+export OUTLOOK_MCP_TOKEN_CACHE="token-cache.school.json"
 # The school registration deliberately omits Mail.Send and Files.ReadWrite.
 export OUTLOOK_MCP_SCOPES="User.Read,Mail.Read,Mail.ReadWrite,Calendars.ReadWrite,Contacts.ReadWrite,MailboxSettings.ReadWrite,Tasks.ReadWrite"
 

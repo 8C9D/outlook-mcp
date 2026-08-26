@@ -45,7 +45,7 @@ The full reasoning lives in the README's
   removed from its folder allowlist; a test walks the import graph and fails if
   that ever stops being true. Both LLM features ship disabled.
 - **No secrets in the repo.** Tokens live in the local MSAL cache
-  (`.token-cache.json`, gitignored, mode 0600) or in Cloudflare KV; CI runs
+  (`~/.config/outlook-mcp/token-cache.json`, outside the repo, mode 0600) or in Cloudflare KV; CI runs
   only the offline test tier and needs no credentials.
 
 Reports about weaknesses in any of these boundaries are very welcome.

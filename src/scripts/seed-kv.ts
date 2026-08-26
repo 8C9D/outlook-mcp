@@ -1,7 +1,7 @@
 // One-time (and re-runnable) seeding of the Worker's Microsoft token store.
 //
 // Runs locally, where the MSAL disk cache lives. It lifts the current refresh
-// token out of .token-cache.json and writes it to Workers KV via wrangler, so
+// token out of the local token cache and writes it to Workers KV via wrangler, so
 // the Worker can mint mailbox access tokens without MSAL and without asking the
 // user to consent again. Nothing is printed that would reveal the token, and it
 // is handed to wrangler through a 0600 temp file rather than argv, which would
@@ -12,11 +12,10 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { PROJECT_ROOT } from "../project-root.js";
-import { installMsalTokenProvider } from "../auth.js";
+import { TOKEN_CACHE_PATH, installMsalTokenProvider } from "../auth.js";
 import { callGraphServer } from "../core/graph.js";
 import { KV_ACCESS_TOKEN, KV_REFRESH_TOKEN } from "../core/kv-keys.js";
 
-const CACHE_PATH = path.join(PROJECT_ROOT, ".token-cache.json");
 const WRANGLER_CONFIG = path.join(PROJECT_ROOT, "wrangler.jsonc");
 
 function fingerprint(secret: string): string {
@@ -51,21 +50,21 @@ async function outlookNamespaceId(): Promise<string> {
 async function readRefreshToken(): Promise<string> {
   let raw: string;
   try {
-    raw = await fs.readFile(CACHE_PATH, "utf8");
+    raw = await fs.readFile(TOKEN_CACHE_PATH, "utf8");
   } catch {
-    throw new Error(`No token cache at ${CACHE_PATH}. Run \`npm run login\` first.`);
+    throw new Error(`No token cache at ${TOKEN_CACHE_PATH}. Run \`npm run login\` first.`);
   }
   const cache = JSON.parse(raw) as { RefreshToken?: Record<string, { secret?: string }> };
   const entries = Object.values(cache.RefreshToken ?? {});
   const secret = entries[0]?.secret;
   if (!secret) {
     throw new Error(
-      `${CACHE_PATH} contains no refresh token. Run \`npm run login\` to re-authenticate.`
+      `${TOKEN_CACHE_PATH} contains no refresh token. Run \`npm run login\` to re-authenticate.`
     );
   }
   if (entries.length > 1) {
     throw new Error(
-      `${CACHE_PATH} holds ${entries.length} refresh tokens (more than one account). ` +
+      `${TOKEN_CACHE_PATH} holds ${entries.length} refresh tokens (more than one account). ` +
         "Delete the cache and run `npm run login` with the single intended account."
     );
   }

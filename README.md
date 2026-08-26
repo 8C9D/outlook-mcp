@@ -75,7 +75,7 @@ The full reasoning, including what third parties can observe and which approvals
         ┌─────────────────────┴─────────────────────┐
    src/server.ts                            src/worker/index.ts
    stdio transport                          Cloudflare Worker, Streamable HTTP
-   MSAL + .token-cache.json                 OAuth (workers-oauth-provider) + tokens in KV
+   MSAL + ~/.config/outlook-mcp/token-cache.json   OAuth (workers-oauth-provider) + tokens in KV
    state in .mcp-state.json                 state in KV, /notifications, cron triggers
         └─────────────────────┬─────────────────────┘
                               │
@@ -781,13 +781,13 @@ can contain text that tries to instruct the model into sending, deleting, or for
 ## Login and re-authentication
 
 The MCP server runs headless and **never prompts for sign-in** — it only uses tokens silently refreshed
-from the local cache (`.token-cache.json`, mode 0600, gitignored).
+from the local cache (`~/.config/outlook-mcp/token-cache.json`, mode 0600, outside the repo).
 
 - First-time setup or after the refresh token expires/revokes: run `npm run login` in a terminal in this
   directory and complete the device-code sign-in. The script caches tokens and exits.
 - When the cache is unusable, every tool call returns: *"Authentication expired. Run `npm run login` in a
   terminal in ~/dev/outlook-mcp, then retry."*
-- To force a fresh sign-in, delete `.token-cache.json` and run `npm run login`.
+- To force a fresh sign-in, delete `~/.config/outlook-mcp/token-cache.json` and run `npm run login`.
 
 ## Setup
 
@@ -830,7 +830,7 @@ what a fresh clone can run.
 - `npm run verify` — the original auth/Graph foundation check.
 - `npm run typecheck` / `npm run build` — type-check (both the Node and Worker configs) / compile to `dist/`.
 - `npm run cf-types` — regenerate `worker-configuration.d.ts` after editing `wrangler.jsonc`.
-- `npm run seed:kv` — push the current Microsoft refresh token from `.token-cache.json` into Workers KV.
+- `npm run seed:kv` — push the current Microsoft refresh token from the local token cache into Workers KV.
 - `npm run deploy` — deploy the Worker to Cloudflare.
 - `npm run test:remote` — live tests against the deployed endpoint (discovery, anonymous rejection,
   refusal of the direct authorize path, a full OAuth exchange, an MCP round-trip, refresh-token
@@ -863,7 +863,7 @@ deployed tool list equals the local registry.
 src/core/*            transport-agnostic: registry, Graph calls, prompts, resources,
                       token + state indirection, notification and subscription logic
 src/tools/*           the 30 tool handlers (unchanged by transport)
-src/server.ts         stdio entry  -> MSAL + .token-cache.json, state in .mcp-state.json
+src/server.ts         stdio entry  -> MSAL + ~/.config/outlook-mcp/token-cache.json, state in .mcp-state.json
 src/worker/index.ts   Worker entry -> OAuth + tokens and state in KV, /notifications, cron
 ```
 
@@ -913,7 +913,8 @@ with `fetch`, requesting exactly the scopes already consented (so no new consent
 test `r12` proves this by forcing a refresh and comparing the stored value before and after.
 Access tokens are cached under `ms:access_token` with a TTL so most calls skip the exchange.
 
-Local stdio mode is untouched by all of this: it still uses MSAL and `.token-cache.json`. The two
+Local stdio mode is untouched by all of this: it still uses MSAL and a local token cache at
+`~/.config/outlook-mcp/token-cache.json` (outside the repo; `OUTLOOK_MCP_TOKEN_CACHE` overrides it). The two
 credential chains are independent (Microsoft does not revoke an old refresh token when it issues a
 new one), so the Worker rotating its copy does not disturb the local one.
 
@@ -987,7 +988,7 @@ Step by step in [SETUP.md §4](SETUP.md#4-optional-deploy-the-hosted-server): tw
 `PUBLIC_BASE_URL` var, three secrets, `npm run deploy`, `npm run seed:kv`, `npm run test:remote`.
 Three things about it are worth repeating here, because getting them wrong fails in confusing ways:
 
-- `npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local cache is
+- `npm run seed:kv` reads the local token cache, so run `npm run login` first if it is
   stale. It hands the token to wrangler through a `0600` temp file rather than argv, and prints only a
   SHA-256 fingerprint. Re-run it **only** after a fresh `npm run login` — at any other time it would
   overwrite the Worker's rotated token with an older one.
@@ -1035,8 +1036,9 @@ Get the two values with `which node` and `pwd` from this checkout. Both must be 
 Node path caveat below for why the `command` cannot just be `node`.
 
 It runs the compiled build (`npm run build` → `dist/server.js`) under a plain `node` — no `tsx` needed at
-runtime. The server resolves its own project root from its module location, so it finds `.env` and
-`.token-cache.json` regardless of the working directory Claude Desktop launches it with.
+runtime. The server resolves its own project root from its module location, so it finds `.env`
+regardless of the working directory Claude Desktop launches it with; the token cache lives under
+`~/.config/outlook-mcp/`, which is independent of both.
 
 > **Node path caveat:** the `command` must be the absolute path to the node binary (resolved via
 > `which node` at install time) because Claude Desktop does not inherit the shell `PATH`. Under a

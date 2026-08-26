@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   PublicClientApplication,
@@ -25,10 +26,24 @@ dotenv.config({ path: path.join(PROJECT_ROOT, ".env"), quiet: true });
  * defaults below preserve the personal-account behavior exactly.
  */
 
-/** Where MSAL's serialized cache lives. `npm run doctor` reports on this file. */
+/**
+ * `${XDG_CONFIG_HOME:-~/.config}/outlook-mcp` — the per-user, per-machine
+ * directory the token cache lives in. Not `PROJECT_ROOT`: this is a live
+ * credential, not project state, and this repo is public.
+ */
+function configDir(): string {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "outlook-mcp");
+}
+
+/**
+ * Where MSAL's serialized cache lives. `npm run doctor` reports on this file.
+ * An absolute `OUTLOOK_MCP_TOKEN_CACHE` is used as-is (escape hatch); a
+ * relative one resolves against `configDir()`, not `PROJECT_ROOT`, so wrapper
+ * scripts like `run-school.sh` also land outside the repo.
+ */
 export const TOKEN_CACHE_PATH = path.resolve(
-  PROJECT_ROOT,
-  process.env.OUTLOOK_MCP_TOKEN_CACHE ?? ".token-cache.json"
+  configDir(),
+  process.env.OUTLOOK_MCP_TOKEN_CACHE ?? "token-cache.json"
 );
 
 /** Entra authority audience: "consumers" (personal, default) or "organizations". */
@@ -73,6 +88,7 @@ const cachePlugin: ICachePlugin = {
   },
   async afterCacheAccess(context: TokenCacheContext): Promise<void> {
     if (context.cacheHasChanged) {
+      await fs.mkdir(path.dirname(TOKEN_CACHE_PATH), { recursive: true, mode: 0o700 });
       await fs.writeFile(TOKEN_CACHE_PATH, context.tokenCache.serialize(), { mode: 0o600 });
       await fs.chmod(TOKEN_CACHE_PATH, 0o600);
     }

@@ -79,9 +79,10 @@ npm run login     # prints a code; enter it at https://microsoft.com/devicelogin
 npm run doctor    # every check should say PASS
 ```
 
-`.env` and the sign-in cache `.token-cache.json` (mode `0600`) are both gitignored and never leave the
-machine. The MCP server itself **never** prompts for sign-in — it only refreshes the cached token
-silently — so `npm run login` is the one command that can open a sign-in, and you run it deliberately.
+`.env` is gitignored and the sign-in cache lives at `~/.config/outlook-mcp/token-cache.json` (mode
+`0600`, outside the repo entirely) — neither ever leaves the machine. The MCP server itself **never**
+prompts for sign-in — it only refreshes the cached token silently — so `npm run login` is the one
+command that can open a sign-in, and you run it deliberately.
 
 If the doctor is unhappy, its output names the fix. The common ones:
 
@@ -172,7 +173,7 @@ Microsoft identity can complete an authorization.
 
 Notes that matter:
 
-- `npm run seed:kv` reads `.token-cache.json`, so run `npm run login` first if the local sign-in is
+- `npm run seed:kv` reads the local token cache, so run `npm run login` first if the local sign-in is
   stale. Re-run it **only** after a fresh login: at any other time it would overwrite the Worker's
   rotated refresh token with an older one.
 - Do **not** set `ALLOW_DIRECT_AUTHORIZE` on the deployed Worker. Leaving it unset is what keeps the
@@ -208,7 +209,7 @@ Notes that matter:
   invalidates the local cache and the Worker's KV token together.
 - **Take the endpoint down**: `npx wrangler delete`. The KV namespaces survive and must be deleted
   separately if you want the stored tokens gone.
-- **Locally**: delete `.token-cache.json`.
+- **Locally**: delete `~/.config/outlook-mcp/token-cache.json`.
 
 ## 7. Second instance for a work/school account (multi-instance)
 
@@ -219,7 +220,7 @@ env-selected, so a second account is just a second process with its own env:
 | --- | --- | --- |
 | `AZURE_CLIENT_ID` | from `.env` (`outlook-mcp` app) | `outlook-mcp-school` app (multi-tenant) |
 | `OUTLOOK_MCP_AUTHORITY` | `consumers` | `organizations` |
-| `OUTLOOK_MCP_TOKEN_CACHE` | `.token-cache.json` | `.token-cache.school.json` |
+| `OUTLOOK_MCP_TOKEN_CACHE` | `token-cache.json` (default, under `~/.config/outlook-mcp/`) | `token-cache.school.json` |
 | `OUTLOOK_MCP_SCOPES` | full built-in list | list minus `Mail.Send`, `Files.ReadWrite` |
 
 `src/auth.ts` reads these at startup; dotenv never overrides already-set
