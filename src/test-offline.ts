@@ -83,7 +83,7 @@ import {
 import { getHealthHandler } from "./tools/get-health.js";
 import { runWithStateStore } from "./core/state.js";
 import { handleNotificationRequest } from "./core/notifications.js";
-import { TOOLS } from "./core/registry.js";
+import { TOOLS, TOOL_PROFILES } from "./core/registry.js";
 import {
   RULES_BACKUP_FORMAT,
   buildRulesBackup,
@@ -1384,6 +1384,16 @@ await test("o16. annotations: all four hints on every tool, and the structural r
     !get("manage_calendar").annotations.destructiveHint && !get("manage_folder").annotations.destructiveHint,
     "manage_calendar and manage_folder offer no delete — they must not be destructive"
   );
+
+  // A profile naming a tool that does not exist would silently register fewer
+  // tools than intended, so a rename must break here rather than in the wild.
+  const registered = new Set(TOOLS.map((t) => t.name));
+  for (const [profile, names] of Object.entries(TOOL_PROFILES)) {
+    assert(names.length > 0, `profile ${profile} is empty`);
+    for (const name of names) {
+      assert(registered.has(name), `profile ${profile} names ${name}, which is not in the registry`);
+    }
+  }
 });
 
 await test("o23. scheduled send: send_at parsing and windows; unread filters; new compose fields", async () => {

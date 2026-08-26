@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { installMsalTokenProvider } from "./auth.js";
-import { createMcpServer } from "./core/registry.js";
+import { createMcpServer, resolveToolProfile, toolsForProfile } from "./core/registry.js";
 import { PROJECT_ROOT } from "./project-root.js";
 import { installFileStateStore } from "./state-file.js";
 
@@ -22,7 +22,12 @@ installMsalTokenProvider();
 // Worker the same keys are KV entries.
 installFileStateStore();
 
-const server = createMcpServer(version);
+// OUTLOOK_TOOL_PROFILE trims the registered surface for clients that pay for
+// every tool in context; unset means the full forty.
+const profile = resolveToolProfile(process.env.OUTLOOK_TOOL_PROFILE);
+const server = createMcpServer(version, profile);
 
 await server.connect(new StdioServerTransport());
-console.error(`outlook MCP server v${version} ready (stdio).`);
+console.error(
+  `outlook MCP server v${version} ready (stdio), profile ${profile}: ${toolsForProfile(profile).length} tools.`
+);

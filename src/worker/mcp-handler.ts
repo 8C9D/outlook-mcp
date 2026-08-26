@@ -45,7 +45,10 @@ export const mcpHandler = {
       return jsonRpcError(403, "Forbidden: this grant is not for the allowlisted account.");
     }
 
-    const server = createMcpServer(VERSION);
+    // ?profile=mail trims the registered surface. OAuthProvider prefix-matches
+    // the route on pathname alone, so the query string arrives untouched.
+    const profile = new URL(request.url).searchParams.get("profile") ?? undefined;
+    const server = createMcpServer(VERSION, profile);
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

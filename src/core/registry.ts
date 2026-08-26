@@ -587,9 +587,68 @@ export const TOOLS: ToolDefinition[] = [
   },
 ];
 
-/** Register every tool and prompt on a freshly constructed McpServer. */
-export function registerAll(server: McpServer): void {
-  for (const tool of TOOLS) {
+/**
+ * Named subsets of TOOLS, for clients that pay for the whole surface in context
+ * on every turn. A profile only decides what gets REGISTERED — TOOLS itself is
+ * the full forty, and the tools left out are unchanged code, not removed code.
+ *
+ * "full" is the default and needs no list here: saying nothing must keep every
+ * existing client exactly as it was.
+ */
+export const TOOL_PROFILES: Record<string, readonly string[]> = {
+  // Mail and the filing machinery around it: everything needed to read, write,
+  // send, file and rule on messages, and nothing from calendar, contacts,
+  // tasks or OneDrive.
+  mail: [
+    "search_mail",
+    "read_message",
+    "read_thread",
+    "manage_message",
+    "list_folders",
+    "list_folder",
+    "create_draft",
+    "update_draft",
+    "send_draft",
+    "get_attachment",
+    "export_message",
+    "manage_rules",
+    "manage_senders",
+    "manage_auto_filing",
+    "get_auto_filing_log",
+    "create_folder",
+    "delete_folder",
+    "get_health",
+  ],
+};
+
+/**
+ * An unknown name resolves to "full" rather than to nothing: a typo in a URL or
+ * an env var must never quietly leave the caller without a mailbox.
+ */
+export function resolveToolProfile(profile: string | undefined): string {
+  if (!profile || profile === "full") return "full";
+  if (!(profile in TOOL_PROFILES)) {
+    console.error(
+      `Unknown tool profile "${profile}"; serving the full tool set. Known profiles: full, ${Object.keys(TOOL_PROFILES).join(", ")}.`
+    );
+    return "full";
+  }
+  return profile;
+}
+
+/** The tools a profile registers, after that fallback. */
+export function toolsForProfile(profile?: string): ToolDefinition[] {
+  const names = TOOL_PROFILES[resolveToolProfile(profile)];
+  return names ? TOOLS.filter((tool) => names.includes(tool.name)) : TOOLS;
+}
+
+/**
+ * Register the tools of the named profile, plus every prompt and resource, on a
+ * freshly constructed McpServer. Prompts and resources are cheap and stay
+ * unconditional.
+ */
+export function registerAll(server: McpServer, profile?: string): void {
+  for (const tool of toolsForProfile(profile)) {
     server.registerTool(
       tool.name,
       {
@@ -605,9 +664,9 @@ export function registerAll(server: McpServer): void {
   registerResources(server);
 }
 
-/** Build the fully-populated MCP server for either transport. */
-export function createMcpServer(version: string): McpServer {
+/** Build the populated MCP server for either transport; no profile means all of it. */
+export function createMcpServer(version: string, profile?: string): McpServer {
   const server = new McpServer({ name: "outlook", version });
-  registerAll(server);
+  registerAll(server, profile);
   return server;
 }
