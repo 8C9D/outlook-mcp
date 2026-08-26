@@ -1,7 +1,7 @@
 node_modules/
 dist/
 .env
-.token-cache.json
+.token-cache*
 .mcp-state.json
 .dev.vars
 .wrangler/
