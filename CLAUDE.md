@@ -3,11 +3,6 @@
 MCP server connecting Claude to a **personal** outlook.com mailbox through Microsoft Graph. One shared tool registry is served over two transports: a local stdio server (Node + MSAL, on-disk token cache) and a Cloudflare Worker that claude.ai adds as a custom connector. **This repo is public.**
 `README.md` is the tool surface and security model, `SETUP.md` the install from zero, `CAPABILITIES.md` the Outlook-parity audit — read those rather than restating them here.
 
-## Layout
-
-- `src/core/registry.ts` — the single source of the tool/prompt/resource surface; both transports build their server from it, so a tool not registered there (with its MCP annotations) exists on neither.
-- `src/tools/` one file per tool; `src/core/` transport-agnostic logic; `src/worker/` Worker-only (KV tokens, OAuth, notifications, LLM); `src/scripts/` doctor and seed-kv.
-
 ## Commands worth knowing
 
 - `npm run doctor` — first thing to run when anything is broken; `-- --env-only` needs no credentials.
@@ -19,6 +14,7 @@ MCP server connecting Claude to a **personal** outlook.com mailbox through Micro
 
 ## Standing rules
 
+- `src/core/registry.ts` is the single source of the tool/prompt/resource surface; both transports build their server from it, so a tool not registered there (with its MCP annotations) exists on neither.
 - No secret, token or live mailbox content ever enters this repo. `ASSUMPTIONS.md`, `RUN-REPORT.md` and `cleanup-progress.md` are gitignored build journals quoting real mail — never commit them, and never lift their content into a tracked file.
 - `send_draft` is the only send path and it takes an existing draft id. Never add a compose-and-send tool, never call `/me/sendMail`, and never let an autonomous path send, delete or reply.
 - Mailbox deletes stay soft; `manage_task` delete is the one documented exception and says so loudly.
