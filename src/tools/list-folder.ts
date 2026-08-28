@@ -4,7 +4,6 @@ import {
   LIST_FOLDER_CAP,
   compareDriveChildren,
   describeDriveItem,
-  drivePathUrl,
   getDriveItemById,
   getDriveItemByPath,
   itemDisplayPath,

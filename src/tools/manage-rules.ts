@@ -9,7 +9,6 @@ import {
   hasAnyCondition,
   normalizeForDiff,
   parseRulesBackup,
-  type PortableRule,
   type RulesDiff,
 } from "../core/rules-backup.js";
 import { getStateStore } from "../core/state.js";

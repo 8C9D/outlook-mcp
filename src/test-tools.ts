@@ -52,7 +52,7 @@ import { checkNewMailHandler } from "./tools/check-new-mail.js";
 import { getMailboxActivityHandler } from "./tools/get-mailbox-activity.js";
 import { getAutoFilingLogHandler } from "./tools/get-auto-filing-log.js";
 import { manageAutoFilingHandler } from "./tools/manage-auto-filing.js";
-import { LLM_MODEL, callAnthropic } from "./core/anthropic.js";
+import { LLM_MODEL } from "./core/anthropic.js";
 import {
   AUDIT_CAP,
   DEFAULT_LLM_CONFIG,

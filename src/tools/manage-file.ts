@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
 import {
-  drivePathUrl,
   getDriveItemById,
   getDriveItemByPath,
   itemDisplayPath,
