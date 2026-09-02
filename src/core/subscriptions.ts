@@ -16,10 +16,7 @@ import { readJson, writeJson, type StateStore } from "./state.js";
 /** Only the inbox is watched; that is where "what just arrived" means anything. */
 export const SUBSCRIPTION_RESOURCE = "/me/mailFolders('inbox')/messages";
 
-/** Graph's own ceiling for message subscriptions. */
-export const MAX_EXPIRY_MINUTES = 4230;
-
-/** Ask for slightly less than the ceiling so clock skew can never be rejected. */
+/** Ask for slightly less than Graph's 4230-minute ceiling so clock skew can never be rejected. */
 export const REQUESTED_EXPIRY_MINUTES = 4200;
 
 /** Renew once less than this much life is left. The cron runs far more often. */
