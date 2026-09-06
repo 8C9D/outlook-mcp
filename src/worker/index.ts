@@ -59,7 +59,7 @@ const apiHandler = {
 /**
  * RFC 9728 requires the advertised resource to match the URL pasted into the
  * client exactly, so it has to be this deployment's own origin — which lives in
- * the PUBLIC_BASE_URL wrangler var, not in this file. Bindings are not readable
+ * the PUBLIC_BASE_URL binding (injected at deploy time), not in this file. Bindings are not readable
  * at module scope, so the provider is built on the first request and memoized
  * per origin (a Worker isolate only ever sees one).
  */

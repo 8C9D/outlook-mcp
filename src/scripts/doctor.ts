@@ -340,7 +340,7 @@ async function main(): Promise<void> {
     console.log("\n-- deployment --");
     const deployment = await deploymentChecks();
     if (deployment.length) report(deployment);
-    else console.log("      no PUBLIC_BASE_URL in wrangler.jsonc — nothing deployed to check.");
+    else console.log("      no PUBLIC_BASE_URL in .env — nothing deployed to check.");
     checks.push(...deployment);
   }
 

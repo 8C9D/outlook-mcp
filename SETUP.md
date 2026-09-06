@@ -146,10 +146,18 @@ npx wrangler kv namespace create OAUTH_KV     # likewise
 Edit `wrangler.jsonc`:
 
 - put the two namespace ids in `kv_namespaces`;
-- set `vars.PUBLIC_BASE_URL` to the URL your Worker will have
-  (`https://<worker-name>.<your-subdomain>.workers.dev`) — Microsoft is told to deliver notifications
-  to `PUBLIC_BASE_URL + /notifications`, so it must match exactly;
 - change `name` if you want a different hostname.
+
+Then add the URL your Worker will have to `.env`. It is deliberately not a `vars` entry in
+`wrangler.jsonc` — the hostname names your account and the config file is public — so `npm run deploy`
+(`scripts/deploy.sh`) reads it from `.env` and injects it with `wrangler deploy --var`:
+
+```bash
+printf 'PUBLIC_BASE_URL=%s\n' "https://<worker-name>.<your-subdomain>.workers.dev" >> .env
+```
+
+Microsoft is told to deliver notifications to `PUBLIC_BASE_URL + /notifications`, so it must match
+exactly.
 
 Then set the same URL, path included, as `resourceMetadata.resource` in `src/worker/index.ts`
 (`https://…/mcp`). RFC 9728 discovery requires it to match the URL a client is given, character for
@@ -218,7 +226,7 @@ env-selected, so a second account is just a second process with its own env:
 
 | Variable | Personal default | School instance |
 | --- | --- | --- |
-| `AZURE_CLIENT_ID` | from `.env` (`outlook-mcp` app) | `outlook-mcp-school` app (multi-tenant) |
+| `AZURE_CLIENT_ID` | from `.env` (`outlook-mcp` app) | `outlook-mcp-school` app (multi-tenant), read from `OUTLOOK_MCP_SCHOOL_CLIENT_ID` in `.env` |
 | `OUTLOOK_MCP_AUTHORITY` | `consumers` | `organizations` |
 | `OUTLOOK_MCP_TOKEN_CACHE` | `token-cache.json` (default, under `~/.config/outlook-mcp/`) | `token-cache.school.json` |
 | `OUTLOOK_MCP_SCOPES` | full built-in list | list minus `Mail.Send`, `Files.ReadWrite` |

@@ -849,7 +849,8 @@ on. The Worker additionally does the two things a laptop cannot: receive Graph c
 and hand out short-lived authenticated links to attachment bytes it has nowhere to save (see
 [Attachments on both transports](#attachments-on-both-transports)).
 
-**Deployed endpoint:** `<PUBLIC_BASE_URL>/mcp`
+**Deployed endpoint:** `<PUBLIC_BASE_URL>/mcp` — the Worker's public origin, which `npm run deploy` takes
+from the gitignored `.env` (the hostname names the owner's account, so it is not in the tracked config).
 
 ### Architecture in detail
 
@@ -951,7 +952,9 @@ cron "17 */6 * * *"  --> create / renew the subscription       get_mailbox_activ
   stale KV read (KV is eventually consistent) can never grow a pile of subscriptions. A listed
   subscription comes back with `clientState: null`, so a foreign one is never adopted — it is
   replaced, because its deliveries could never be validated.
-- **`PUBLIC_BASE_URL`.** A `vars` entry in `wrangler.jsonc` (not a secret): the notification URL is
+- **`PUBLIC_BASE_URL`.** Set in the gitignored `.env`, not in `wrangler.jsonc`: it is not a secret, but
+  the hostname names the owner's account and the config file is public, so `npm run deploy`
+  (`scripts/deploy.sh`) injects it with `wrangler deploy --var`. The notification URL is
   `PUBLIC_BASE_URL + /notifications`, so it must match the deployed hostname exactly or Graph will
   validate against the wrong origin.
 - Because `OAuthProvider` exposes only a `fetch` handler, `src/worker/index.ts` wraps it in an object
@@ -985,7 +988,7 @@ locally instead of pretending.
 ### Setting it up from scratch
 
 Step by step in [SETUP.md §4](SETUP.md#4-optional-deploy-the-hosted-server): two KV namespaces, the
-`PUBLIC_BASE_URL` var, three secrets, `npm run deploy`, `npm run seed:kv`, `npm run test:remote`.
+`PUBLIC_BASE_URL` in `.env`, three secrets, `npm run deploy`, `npm run seed:kv`, `npm run test:remote`.
 Three things about it are worth repeating here, because getting them wrong fails in confusing ways:
 
 - `npm run seed:kv` reads the local token cache, so run `npm run login` first if it is

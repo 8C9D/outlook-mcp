@@ -27,8 +27,8 @@ export function publicBaseUrl(env: Env): string | undefined {
  * The absolute URL Graph must post notifications to.
  *
  * There is deliberately no compiled-in fallback: the origin belongs to the
- * deployment, not to the source, so it comes from the PUBLIC_BASE_URL wrangler
- * var and nowhere else. A deploy that forgot it cannot guess its own hostname,
+ * deployment, not to the source, so it comes from the PUBLIC_BASE_URL binding
+ * (injected at deploy time from .env by scripts/deploy.sh) and nowhere else. A deploy that forgot it cannot guess its own hostname,
  * and a guess would silently point Graph at someone else's Worker — so this
  * throws, and the scheduled handler logs it.
  */
@@ -37,7 +37,7 @@ export function notificationUrl(env: Env): string {
   if (!base) {
     throw new Error(
       "PUBLIC_BASE_URL is not set, so Graph cannot be told where to deliver change " +
-        "notifications. Set it in wrangler.jsonc to this Worker's public origin and redeploy."
+        "notifications. Set it in .env to this Worker's public origin and redeploy (npm run deploy)."
     );
   }
   return base + NOTIFICATIONS_PATH;

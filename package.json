@@ -15,7 +15,7 @@
     "test:offline": "tsx src/test-offline.ts",
     "cf-types": "wrangler types",
     "seed:kv": "tsx src/scripts/seed-kv.ts",
-    "deploy": "wrangler deploy",
+    "deploy": "sh scripts/deploy.sh",
     "test:remote": "tsx src/test-remote.ts"
   },
   "dependencies": {

@@ -65,13 +65,13 @@ import { FOLDERS_URI, RECENT_INBOX_URI } from "./core/resources.js";
 import { SUBSCRIPTION_RESOURCE, type SubscriptionRecord } from "./core/subscriptions.js";
 import { VERSION } from "./core/version.js";
 
-// The deployment under test comes from wrangler.jsonc's PUBLIC_BASE_URL (or
+// The deployment under test comes from PUBLIC_BASE_URL in .env (or
 // MCP_REMOTE_URL, to aim at another one). Nothing here hardcodes a hostname:
 // this suite belongs to whoever deployed the checkout it is running in.
 const BASE_URL = deployedBaseUrl();
 if (!BASE_URL) {
   console.error(
-    "No deployment to test: set PUBLIC_BASE_URL in wrangler.jsonc (or MCP_REMOTE_URL) " +
+    "No deployment to test: set PUBLIC_BASE_URL in .env (or MCP_REMOTE_URL) " +
       "to the Worker's public origin, then `npm run deploy`."
   );
   process.exit(1);

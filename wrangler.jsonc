@@ -34,15 +34,14 @@
   //                  draft in the inbox (never sent — send_draft, driven by a
   //                  human, remains the only send path in this server).
   "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *"] },
-  "vars": {
-    // Public origin of this Worker, and the ONLY place the deployed hostname is
-    // written down — nothing under src/ carries a default, so a fork changes
-    // this line and nothing else. Graph is told to deliver notifications to
-    // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname;
-    // it is also the resource this server advertises under RFC 9728. The Node
-    // harnesses and `npm run doctor` read it from here (project-root.ts).
-    "PUBLIC_BASE_URL": "<PUBLIC_BASE_URL>"
-  },
+  // PUBLIC_BASE_URL — the public origin of this Worker — is deliberately NOT a
+  // `vars` entry here: the hostname names the owner's account and this file is
+  // public. It lives in the gitignored .env, and `npm run deploy`
+  // (scripts/deploy.sh) injects it with `wrangler deploy --var`; nothing under
+  // src/ carries a default. Graph is told to deliver notifications to
+  // PUBLIC_BASE_URL + /notifications, so it must match the deployed hostname;
+  // it is also the resource this server advertises under RFC 9728. The Node
+  // harnesses and `npm run doctor` read the same .env (project-root.ts).
   "kv_namespaces": [
     // Microsoft tokens: the rotating refresh token, the cached access token,
     // and short-lived device-code authorization flows.

@@ -10,7 +10,15 @@
 # the personal instance (plain `npm run serve` etc.) is untouched.
 cd "$(dirname "$0")" || exit 1
 
-export AZURE_CLIENT_ID="<school-client-id>"
+# The school registration's Application (client) ID lives in the gitignored
+# .env as OUTLOOK_MCP_SCHOOL_CLIENT_ID; the personal AZURE_CLIENT_ID there is
+# left alone and simply overridden for this process.
+school_client_id=$(sed -n 's/^OUTLOOK_MCP_SCHOOL_CLIENT_ID=//p' .env 2>/dev/null | tr -d '"' | tail -n 1)
+if [ -z "$school_client_id" ]; then
+  echo "OUTLOOK_MCP_SCHOOL_CLIENT_ID is not set in .env (see SETUP.md §7)" >&2
+  exit 1
+fi
+export AZURE_CLIENT_ID="$school_client_id"
 export OUTLOOK_MCP_AUTHORITY="organizations"
 export OUTLOOK_MCP_TOKEN_CACHE="token-cache.school.json"
 # The school registration deliberately omits Mail.Send and Files.ReadWrite.

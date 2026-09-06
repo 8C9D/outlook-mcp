@@ -24,6 +24,6 @@ MCP server connecting Claude to a **personal** outlook.com mailbox through Micro
 
 - Claude Code runs this as `node dist/server.js` with `OUTLOOK_TOOL_PROFILE=mail`: src edits stay invisible until `npm run build`, and the session sees the mail subset, not all forty tools.
 - The Worker rotates the Microsoft refresh token on every exchange and Microsoft invalidates the previous one — a local `npm run login` breaks the KV chain until `npm run seed:kv` reseeds it.
-- `wrangler.jsonc`'s `PUBLIC_BASE_URL` is the only place the deployed hostname is written down.
+- The deployed hostname is written down in exactly one place: `PUBLIC_BASE_URL` in the gitignored `.env`. `npm run deploy` (`scripts/deploy.sh`) injects it with `wrangler deploy --var`; it is deliberately not a `vars` entry in `wrangler.jsonc`, because the hostname names the owner's account and this repo is public.
 - Never resolve a path from `process.cwd()` — MCP clients launch with an arbitrary one. Use `PROJECT_ROOT`.
 - `ALLOW_DIRECT_AUTHORIZE` is local-only by design; remote test r5 asserts the deployment refuses it.

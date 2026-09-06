@@ -22,18 +22,24 @@ function findProjectRoot(startDir: string): string {
 export const PROJECT_ROOT = findProjectRoot(path.dirname(fileURLToPath(import.meta.url)));
 
 /**
- * The public origin of this checkout's deployed Worker, read from the
- * PUBLIC_BASE_URL var in wrangler.jsonc — the one place the deployed hostname
- * is written down. Node-side callers only (the test harnesses and the doctor);
- * inside the Worker the same value arrives as a binding.
+ * The public origin of this checkout's deployed Worker. It is written down in
+ * one place: PUBLIC_BASE_URL in the gitignored .env (the hostname names the
+ * owner's account, so it is kept out of the tracked wrangler.jsonc, and
+ * scripts/deploy.sh injects it at deploy time). Node-side callers only (the
+ * test harnesses and the doctor, whose src/auth.ts import loads .env); inside
+ * the Worker the same value arrives as a binding.
  *
- * Returns undefined for a checkout with no wrangler.jsonc, no var, or a config
- * this crude comment-stripper cannot parse, so a caller can degrade rather than
- * fail. MCP_REMOTE_URL overrides it for pointing a suite at another deployment.
+ * Resolution order: MCP_REMOTE_URL (to aim a suite at another deployment),
+ * then PUBLIC_BASE_URL from the environment, then a `vars` entry in
+ * wrangler.jsonc for a checkout that chose to keep it there. Returns undefined
+ * when none is set, or the config cannot be parsed by this crude
+ * comment-stripper, so a caller can degrade rather than fail.
  */
 export function deployedBaseUrl(): string | undefined {
   const override = process.env.MCP_REMOTE_URL?.trim();
   if (override) return override.replace(/\/+$/, "");
+  const fromEnv = process.env.PUBLIC_BASE_URL?.trim();
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
   try {
     const raw = readFileSync(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8");
     const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as {
