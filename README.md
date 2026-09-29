@@ -1015,10 +1015,12 @@ this mailbox. Both are answered before OAuth, authenticate with `Authorization: 
   nothing is sent; a Graph refusal is `502` (logged, never echoed).
 - **`POST /self-alert/heartbeat`** with `{"source", "job", "max_age_hours"}` (1–720) records that the
   job ran (`selfalert:hb:<source>:<job>` in `OUTLOOK_KV`) and answers `204`; it sends nothing. That
-  record is the job's registration: a fifth cron, **`47 * * * *`**, lists the records hourly and, for a
-  job silent longer than its `max_age_hours`, sends one self-alert (source `self-alert-watchdog`) per
-  lapse, not one per hour; the job's next heartbeat re-arms it. A job that never sent a heartbeat is
-  not watched; deleting a retired job's key stops the watching.
+  record is the job's registration: on every tick of the subscription-upkeep cron, **`17 */6 * * *`**,
+  a watchdog lists the records and, for a job silent longer than its `max_age_hours`, sends one
+  self-alert (source `self-alert-watchdog`) per lapse, not one per tick; the job's next heartbeat
+  re-arms it. A lapse is therefore noticed within 6 hours of the limit passing. The watchdog has no
+  cron of its own: Workers Free allows 5 cron triggers per account, and all of them are in use. A job
+  that never sent a heartbeat is not watched; deleting a retired job's key stops the watching.
 
 ### Setting it up from scratch
 

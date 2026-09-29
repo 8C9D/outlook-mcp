@@ -25,11 +25,12 @@ The full reasoning lives in the README's
   two-step — the complete message must exist as a reviewable draft before
   `send_draft` can name it.
 - **One opt-in route sends without a draft, and only to the owner.**
-  `POST /self-alert` (and the hourly heartbeat watchdog behind
-  `POST /self-alert/heartbeat`) lets a scheduled job the owner runs elsewhere
-  email the owner. It is off — both routes answer `404` — unless the
-  `SELF_ALERT_SECRET` Worker secret is set; it requires that secret as a bearer
-  token, compared in constant time; the recipient is always `ALLOWED_MS_UPN`,
+  `POST /self-alert` (and the heartbeat watchdog behind
+  `POST /self-alert/heartbeat`, run every 6 hours on the subscription-upkeep
+  cron) lets a scheduled job the owner runs elsewhere email the owner. It is
+  off — both routes answer `404` — unless the `SELF_ALERT_SECRET` Worker
+  secret is set; it requires that secret as a bearer token, compared in
+  constant time; the recipient is always `ALLOWED_MS_UPN`,
   with no recipient, cc, bcc or reply-to field in the request and unknown
   fields refused; and it stops at 20 mails per UTC day.
 - **Mailbox deletes are soft** (Deleted Items, recoverable). The one

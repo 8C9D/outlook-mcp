@@ -40,11 +40,11 @@ export interface Env {
   ALLOW_DIRECT_AUTHORIZE?: string;
   /**
    * Bearer secret for the opt-in self-alert routes (POST /self-alert and
-   * POST /self-alert/heartbeat) and the hourly heartbeat watchdog — see
-   * core/self-alert.js. Unset (the default), empty or shorter than 32
-   * characters means the feature is off: both routes answer 404 and the
-   * watchdog does nothing. Its mail goes only to ALLOWED_MS_UPN. Never logged,
-   * never returned, never written to KV.
+   * POST /self-alert/heartbeat) and the heartbeat watchdog that runs on every
+   * subscription-upkeep tick, 6 hours apart — see core/self-alert.js. Unset
+   * (the default), empty or shorter than 32 characters means the feature is
+   * off: both routes answer 404 and the watchdog does nothing. Its mail goes
+   * only to ALLOWED_MS_UPN. Never logged, never returned, never written to KV.
    */
   SELF_ALERT_SECRET?: string;
 }

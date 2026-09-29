@@ -24,12 +24,12 @@ import { keepSubscriptionAlive, publicBaseUrl } from "./notifications.js";
 import { draftMorningBrief, reconcileFilingCorrections } from "./llm.js";
 import { runWorkerHealthCheck } from "./health.js";
 import { handleSelfAlert, isSelfAlertPath, runWorkerSelfAlertWatchdog } from "./self-alert.js";
-import { scheduledJobFor } from "../core/schedule.js";
+import { runJobsInOrder, scheduledJobsFor, type ScheduledJob } from "../core/schedule.js";
 import type { Env } from "./env.js";
 
 // The schedule constants (which must match wrangler.jsonc) and the tick →
-// job dispatch live in core/schedule.js, where the offline tier can test them.
-export { DIGEST_HOUR_TORONTO, HEALTH_CRON, SELF_ALERT_WATCHDOG_CRON } from "../core/schedule.js";
+// jobs dispatch live in core/schedule.js, where the offline tier can test them.
+export { DIGEST_HOUR_TORONTO, HEALTH_CRON, UPKEEP_CRON } from "../core/schedule.js";
 
 /** The only scope this server issues; the mailbox permissions are fixed at consent time. */
 const SCOPES_SUPPORTED = ["outlook"];
@@ -90,6 +90,68 @@ function providerFor(request: Request, env: Env): OAuthProvider<Env> {
   return provider;
 }
 
+/**
+ * Run one scheduled job to completion, logging its outcome. Its own failures
+ * are caught and logged here, so the promise settles either way; runJobsInOrder
+ * catches anything that still escapes, so the next job on the tick always runs.
+ */
+async function runScheduledJob(job: ScheduledJob, cron: string, env: Env): Promise<void> {
+  switch (job) {
+    case "health":
+      await runWorkerHealthCheck(env).then(
+        (report) =>
+          console.log(
+            `Cron ${cron}: health check ${report.healthy ? "healthy" : "UNHEALTHY"}` +
+              (report.alertDraftId ? ` — alert draft ${report.alertDraftId}` : "") +
+              (report.alertError ? ` — ${report.alertError}` : "")
+          ),
+        (err) => console.error(`Cron ${cron}: health check failed: ${String(err)}`)
+      );
+      return;
+
+    case "self-alert-watchdog":
+      await runWorkerSelfAlertWatchdog(env).then(
+        (result) => {
+          if (!result.enabled) return; // off: stay quiet on every tick
+          console.log(
+            `Cron ${cron}: self-alert watchdog — ${result.watched} watched, ` +
+              `${result.stale} stale, ${result.alerted.length} alerted` +
+              (result.alerted.length ? ` (${result.alerted.join(", ")})` : "") +
+              "."
+          );
+          for (const problem of result.problems) {
+            console.error(`Cron ${cron}: self-alert watchdog: ${problem}`);
+          }
+        },
+        (err) => console.error(`Cron ${cron}: self-alert watchdog failed: ${String(err)}`)
+      );
+      return;
+
+    case "digest":
+      await draftMorningBrief(env).then(
+        (outcome) => console.log(`Cron ${cron}: morning brief — ${outcome.reason}.`),
+        (err) => console.error(`Cron ${cron}: morning brief failed: ${String(err)}`)
+      );
+      return;
+
+    case "upkeep":
+      // The auto-filer's feedback loop also reconciles on every accepted
+      // notification delivery; this tick covers quiet stretches. No-op while
+      // filing is disabled. It runs alongside the subscription upkeep, as it
+      // always has; the job settles once both have.
+      await Promise.all([
+        keepSubscriptionAlive(env).then(
+          (result) => console.log(`Cron ${cron}: mail subscription ${result.action}.`),
+          (err) => console.error(`Cron ${cron}: subscription upkeep failed: ${String(err)}`)
+        ),
+        reconcileFilingCorrections(env).catch((err) =>
+          console.error(`Cron ${cron}: correction reconcile failed: ${String(err)}`)
+        ),
+      ]);
+      return;
+  }
+}
+
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Shared-secret routes, not OAuth ones: answered before the provider, which
@@ -101,22 +163,19 @@ export default {
 
   /**
    * Cron triggers (see `triggers.crons` in wrangler.jsonc). Four jobs share
-   * the handler, dispatched by scheduledJobFor (core/schedule.js): the health
-   * check and the self-alert watchdog on their exact cron expressions, first,
-   * and the remaining ticks by the hour America/Toronto is actually on:
+   * the handler, and scheduledJobsFor (core/schedule.js) names the ones a tick
+   * runs: the health check on its exact cron expression, alone; otherwise the
+   * digest or upkeep by the hour America/Toronto is actually on — plus the
+   * self-alert watchdog on every UPKEEP_CRON tick, whichever of the two it got.
    *
    *  - The health check, daily at 13:37 UTC (HEALTH_CRON). Verifies
    *    KV, a forced token rotation, the Graph subscription and the two LLM
    *    error counters; healthy runs write a heartbeat, failing ones also leave
    *    an unsent alert draft in the inbox.
-   *  - The self-alert watchdog, hourly at minute 47 (SELF_ALERT_WATCHDOG_CRON).
-   *    Emails the owner once when a job that registered a heartbeat has gone
-   *    quiet for longer than it asked. Does nothing unless SELF_ALERT_SECRET is
-   *    set. One of its 11:47/12:47 UTC ticks falls in Toronto's 07:00 hour,
-   *    which is why it is dispatched before the hour check below.
-   *  - Subscription upkeep, every 6 hours. Mail subscriptions expire after ~2.9
-   *    days and Graph drops them silently, so this runs far more often than
-   *    that and creates, renews or leaves the subscription alone as needed.
+   *  - Subscription upkeep, every 6 hours (UPKEEP_CRON). Mail subscriptions
+   *    expire after ~2.9 days and Graph drops them silently, so this runs far
+   *    more often than that and creates, renews or leaves the subscription
+   *    alone as needed.
    *  - The morning digest, at 07:00 America/Toronto. Cloudflare crons are UTC
    *    only, and 07:00 Toronto is 11:00 UTC in EDT and 12:00 UTC in EST, so
    *    BOTH are scheduled and this guard drops the one that is not 07:00 right
@@ -124,71 +183,27 @@ export default {
    *    with no redeploy; core/digest.js additionally refuses to draft a second
    *    brief for a date it has already covered, so a double fire cannot double
    *    up either.
+   *  - The self-alert watchdog, on every UPKEEP_CRON tick (00:17, 06:17, 12:17
+   *    and 18:17 UTC), after that tick's upkeep or digest. The account is on
+   *    Workers Free, whose 5 cron triggers are all taken, so it rides this tick
+   *    instead of having its own and notices a lapse within 6 hours. Emails the
+   *    owner once when a job that registered a heartbeat has gone quiet for
+   *    longer than it asked. Does nothing unless SELF_ALERT_SECRET is set.
    *
-   * A failure must not throw out of the scheduled handler — it would be retried
-   * on the next tick anyway — so everything is logged instead.
+   * A tick's jobs run in order under one ctx.waitUntil (runJobsInOrder): the
+   * watchdog starts only once the upkeep or digest has settled, succeeded or
+   * failed, so the two never refresh the rotating mailbox token at the same
+   * time, and a failure in the first never stops the second. A failure must not
+   * throw out of the scheduled handler — it would be retried on the next tick
+   * anyway — so everything is logged instead.
    */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const job = scheduledJobFor(event.cron, new Date(event.scheduledTime));
-
-    if (job === "health") {
-      ctx.waitUntil(
-        runWorkerHealthCheck(env).then(
-          (report) =>
-            console.log(
-              `Cron ${event.cron}: health check ${report.healthy ? "healthy" : "UNHEALTHY"}` +
-                (report.alertDraftId ? ` — alert draft ${report.alertDraftId}` : "") +
-                (report.alertError ? ` — ${report.alertError}` : "")
-            ),
-          (err) => console.error(`Cron ${event.cron}: health check failed: ${String(err)}`)
-        )
-      );
-      return;
-    }
-
-    if (job === "self-alert-watchdog") {
-      ctx.waitUntil(
-        runWorkerSelfAlertWatchdog(env).then(
-          (result) => {
-            if (!result.enabled) return; // off: stay quiet every hour
-            console.log(
-              `Cron ${event.cron}: self-alert watchdog — ${result.watched} watched, ` +
-                `${result.stale} stale, ${result.alerted.length} alerted` +
-                (result.alerted.length ? ` (${result.alerted.join(", ")})` : "") +
-                "."
-            );
-            for (const problem of result.problems) {
-              console.error(`Cron ${event.cron}: self-alert watchdog: ${problem}`);
-            }
-          },
-          (err) => console.error(`Cron ${event.cron}: self-alert watchdog failed: ${String(err)}`)
-        )
-      );
-      return;
-    }
-
-    if (job === "digest") {
-      ctx.waitUntil(
-        draftMorningBrief(env).then(
-          (outcome) => console.log(`Cron ${event.cron}: morning brief — ${outcome.reason}.`),
-          (err) => console.error(`Cron ${event.cron}: morning brief failed: ${String(err)}`)
-        )
-      );
-      return;
-    }
-
+    const jobs = scheduledJobsFor(event.cron, new Date(event.scheduledTime));
     ctx.waitUntil(
-      keepSubscriptionAlive(env).then(
-        (result) => console.log(`Cron ${event.cron}: mail subscription ${result.action}.`),
-        (err) => console.error(`Cron ${event.cron}: subscription upkeep failed: ${String(err)}`)
-      )
-    );
-    // The auto-filer's feedback loop also reconciles on every accepted
-    // notification delivery; this tick covers quiet stretches. No-op while
-    // filing is disabled.
-    ctx.waitUntil(
-      reconcileFilingCorrections(env).catch((err) =>
-        console.error(`Cron ${event.cron}: correction reconcile failed: ${String(err)}`)
+      runJobsInOrder(
+        jobs,
+        (job) => runScheduledJob(job, event.cron, env),
+        (job, err) => console.error(`Cron ${event.cron}: ${job} failed: ${String(err)}`)
       )
     );
   },

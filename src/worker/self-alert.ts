@@ -1,4 +1,4 @@
-// Worker wiring for the opt-in self-alert route and its hourly watchdog. The
+// Worker wiring for the opt-in self-alert route and its heartbeat watchdog. The
 // logic — the secret gate, body validation, the fixed recipient, the daily cap,
 // staleness — lives in core/self-alert.js and is tested offline; this module
 // supplies only the real KV namespace and the one Graph call.
@@ -43,7 +43,7 @@ export function handleSelfAlert(request: Request, env: Env): Promise<Response> {
   return handleSelfAlertRequest(request, selfAlertDeps(env));
 }
 
-/** One watchdog pass, driven by SELF_ALERT_WATCHDOG_CRON. */
+/** One watchdog pass, run on every UPKEEP_CRON tick (core/schedule.js). */
 export function runWorkerSelfAlertWatchdog(env: Env): Promise<WatchdogResult> {
   return runSelfAlertWatchdog(selfAlertDeps(env));
 }

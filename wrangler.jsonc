@@ -7,16 +7,30 @@
   // node:async_hooks, which nodejs_compat provides on workerd.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // The jobs below share one scheduled handler (scheduledJobFor in
-  // src/core/schedule.ts): the health check and the self-alert watchdog are
-  // dispatched on their exact cron expressions, first; the rest are told apart
-  // by the America/Toronto hour:
+  // The jobs below share one scheduled handler (scheduledJobsFor in
+  // src/core/schedule.ts): the health check is dispatched on its exact cron
+  // expression; the rest are told apart by the America/Toronto hour, and the
+  // "17 */6" tick also runs the self-alert watchdog.
+  //
+  // The account is on Workers Free, which allows 5 cron triggers per ACCOUNT
+  // (not per Worker), and all 5 are in use: these 4 plus one on another
+  // Worker. A new scheduled job must therefore share an existing tick, as the
+  // watchdog does; adding a cron here exceeds the limit and the deploy fails.
   //
   //  "17 */6 * * *"  Keeps the Graph change-notification subscription alive.
   //                  Mail subscriptions expire after at most 4230 minutes
   //                  (~2.9 days) and Graph deletes them silently, so this runs
   //                  every 6 hours and renews once less than a day is left —
   //                  many chances to recover before anything lapses.
+  //                  Every one of these ticks ALSO runs the self-alert
+  //                  heartbeat watchdog (UPKEEP_CRON in src/core/schedule.ts),
+  //                  once the upkeep has settled — or the digest, on the
+  //                  winter 12:17 UTC tick that falls in Toronto's 07:00 hour.
+  //                  So a lapsed job is noticed within 6 hours. The watchdog
+  //                  is inert unless SELF_ALERT_SECRET is set and a job has
+  //                  sent a heartbeat; a job silent for longer than the
+  //                  max_age_hours it registered gets one self-alert to the
+  //                  owner per lapse, counted against the daily cap.
   //
   //  "0 11 * * *"    The morning digest, at 07:00 America/Toronto. Cloudflare
   //  "0 12 * * *"    crons are UTC only and Toronto is UTC-4 in EDT, UTC-5 in
@@ -35,20 +49,10 @@
   //                  ticks above. Healthy runs write the health:last heartbeat
   //                  to KV; any failing check also leaves an UNSENT alert
   //                  draft in the inbox (never sent — the health check only
-  //                  ever drafts).
-  //
-  //  "47 * * * *"    The self-alert heartbeat watchdog (SELF_ALERT_WATCHDOG_CRON
-  //                  in src/core/schedule.ts), hourly at a minute no other tick
-  //                  uses. Dispatched on the cron expression, before the hour
-  //                  check: one of its 11:47/12:47 UTC ticks (which, depends
-  //                  on DST) falls in Toronto's 07:00 hour and would otherwise
-  //                  be taken for the digest.
-  //                  Inert unless SELF_ALERT_SECRET is set and a job has sent
-  //                  a heartbeat; a job silent for longer than the
-  //                  max_age_hours it registered gets one self-alert to the
-  //                  owner per lapse, counted against the daily cap.
+  //                  ever drafts). Does not run the watchdog; nor do the two
+  //                  digest ticks above.
   "triggers": {
-    "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *", "47 * * * *"]
+    "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *"]
   },
   // PUBLIC_BASE_URL — the public origin of this Worker — is deliberately NOT a
   // `vars` entry here: the hostname names the owner's account and this file is
@@ -78,7 +82,7 @@
   //   SELF_ALERT_SECRET  OPTIONAL. Bearer secret for POST /self-alert and
   //                      POST /self-alert/heartbeat (core/self-alert.ts), at
   //                      least 32 characters — e.g. `openssl rand -hex 32`.
-  //                      Unset, both routes answer 404 and the watchdog cron
+  //                      Unset, both routes answer 404 and the watchdog
   //                      does nothing. Alerts go only to ALLOWED_MS_UPN, at
   //                      most 20 per UTC day.
   //

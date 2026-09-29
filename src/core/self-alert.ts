@@ -22,7 +22,8 @@
 //
 // The watchdog: POST /self-alert/heartbeat records {at, max_age_hours} for a
 // source+job, and that record is the job's registration — a job that never
-// sent a heartbeat is never watched. An hourly cron lists the records and
+// sent a heartbeat is never watched. The watchdog rides the subscription-upkeep
+// cron (UPKEEP_CRON in core/schedule.js, every 6 hours), lists the records and
 // alerts once per stale episode on any job silent for longer than it asked;
 // the job's next heartbeat clears the flag.
 //
@@ -489,7 +490,7 @@ export type WatchdogResult =
       stale: number;
       /** "source/job" for each alert sent on this run. */
       alerted: string[];
-      /** Anything that went wrong; an unsent alert is retried next hour. */
+      /** Anything that went wrong; an unsent alert is retried on the next tick. */
       problems: string[];
     };
 
@@ -508,9 +509,10 @@ async function listHeartbeatKeys(kv: SelfAlertKv): Promise<string[]> {
 }
 
 /**
- * One watchdog pass (hourly cron). Alerts at most once per stale episode: the
- * flag records which heartbeat it alerted on, the next heartbeat deletes it,
- * and a failed or over-cap send sets no flag, so it is retried next hour.
+ * One watchdog pass, run on every UPKEEP_CRON tick (every 6 hours). Alerts at
+ * most once per stale episode: the flag records which heartbeat it alerted on,
+ * the next heartbeat deletes it, and a failed or over-cap send sets no flag, so
+ * it is retried on the next tick.
  * Per-job failures are collected, not thrown; a KV list failure does throw,
  * and the scheduled handler logs it.
  */

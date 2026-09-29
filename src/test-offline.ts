@@ -67,7 +67,13 @@ import {
   selfAlertHeartbeatKey,
   selfAlertStaleKey,
 } from "./core/kv-keys.js";
-import { HEALTH_CRON, SELF_ALERT_WATCHDOG_CRON, scheduledJobFor } from "./core/schedule.js";
+import {
+  HEALTH_CRON,
+  UPKEEP_CRON,
+  runJobsInOrder,
+  scheduledJobsFor,
+  type ScheduledJob,
+} from "./core/schedule.js";
 import {
   SELF_ALERT_DAILY_CAP,
   SELF_ALERT_HEARTBEAT_PATH,
@@ -1920,7 +1926,7 @@ await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Gr
   // Four jobs across two list pages; only the two past their own limit alert.
   // A job that never sent a heartbeat is not watched, even with a flag lying around.
   const many = selfAlertFixture();
-  await register(many, "a-hourly", 1);
+  await register(many, "a-onehour", 1);
   await register(many, "b-daily", 48);
   await register(many, "c-twohour", 2);
   await register(many, "d-monthly", 720);
@@ -1929,7 +1935,7 @@ await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Gr
   const swept = await runSelfAlertWatchdog(many.deps);
   assert(swept.enabled && swept.watched === 4 && swept.stale === 2, `swept: ${JSON.stringify(swept)}`);
   assert(
-    JSON.stringify(swept.alerted) === '["research-job/a-hourly","research-job/c-twohour"]',
+    JSON.stringify(swept.alerted) === '["research-job/a-onehour","research-job/c-twohour"]',
     `alerted: ${JSON.stringify(swept.alerted)}`
   );
   assert(
@@ -1938,7 +1944,7 @@ await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Gr
   );
 
   // Watchdog alerts share the daily cap; an over-cap alert sets no flag and
-  // goes out on the next hour that has room.
+  // goes out on the next tick that has room.
   const capped = selfAlertFixture();
   await register(capped, "daily-scan", 1);
   await capped.kv.put(selfAlertCountKey("2026-08-19"), String(SELF_ALERT_DAILY_CAP));
@@ -1952,7 +1958,7 @@ await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Gr
   const unblocked = await runSelfAlertWatchdog(capped.deps);
   assert(unblocked.enabled && unblocked.alerted.length === 1, "the capped alert was lost, not retried");
 
-  // Graph failure: no flag, so the next hour tries again.
+  // Graph failure: no flag, so the next tick tries again.
   const flaky = selfAlertFixture();
   await register(flaky, "daily-scan", 1);
   flaky.deps.sendMail = async () => {
@@ -1980,33 +1986,91 @@ await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Gr
   assert(!offResult.enabled && off.sent.length === 0, "the watchdog ran without its secret");
 });
 
-await test("o30. schedule: the watchdog tick is never the digest or upkeep, and no two crons in wrangler.jsonc collide", async () => {
-  // Every hour of an EDT day and an EST day, including 11:47 and 12:47 UTC,
-  // which fall in Toronto's 07:00 hour.
-  for (const day of ["2026-08-19", "2026-01-19"]) {
-    for (let hour = 0; hour < 24; hour++) {
-      const when = new Date(`${day}T${String(hour).padStart(2, "0")}:47:00Z`);
-      const job = scheduledJobFor(SELF_ALERT_WATCHDOG_CRON, when);
-      assert(job === "self-alert-watchdog", `${when.toISOString()}: the watchdog tick ran ${job}`);
-    }
-  }
-  // The hazard the ordering avoids: by hour alone, 11:47 UTC in EDT is the digest.
-  assert(
-    scheduledJobFor("0 11 * * *", new Date("2026-08-19T11:47:00Z")) === "digest",
-    "the hour-based branch no longer claims Toronto's 07:00 hour"
-  );
-  assert(scheduledJobFor(HEALTH_CRON, new Date("2026-08-19T13:37:00Z")) === "health", "health");
-  assert(
-    scheduledJobFor("17 */6 * * *", new Date("2026-08-19T18:17:00Z")) === "upkeep",
-    "an upkeep tick is no longer upkeep"
-  );
-
+await test("o30. schedule: every upkeep tick also runs the watchdog, no other does, and wrangler.jsonc stays under the account's cron limit", async () => {
   const raw = await fs.readFile(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8");
   const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as { triggers?: { crons?: string[] } };
   const crons = config.triggers?.crons ?? [];
-  assert(crons.includes(HEALTH_CRON), "wrangler.jsonc lost HEALTH_CRON");
-  assert(crons.includes(SELF_ALERT_WATCHDOG_CRON), "wrangler.jsonc lacks SELF_ALERT_WATCHDOG_CRON");
+  const DIGEST_CRONS = ["0 11 * * *", "0 12 * * *"];
 
+  // The account is on Workers Free, which allows 5 cron triggers per ACCOUNT,
+  // not per Worker, and another Worker on it holds one. So this Worker gets 4:
+  // one more and `wrangler deploy` is refused, which is why the watchdog rides
+  // the upkeep tick instead of having its own. Raise these only after the
+  // account's limit or the other Worker's usage has actually changed.
+  const ACCOUNT_CRON_LIMIT = 5;
+  const OTHER_WORKERS_CRONS = 1;
+  assert(crons.length === 4, `wrangler.jsonc declares ${crons.length} crons, not 4: ${crons.join(" | ")}`);
+  assert(
+    crons.length + OTHER_WORKERS_CRONS <= ACCOUNT_CRON_LIMIT,
+    `${crons.length} crons here plus ${OTHER_WORKERS_CRONS} elsewhere exceed the account's ${ACCOUNT_CRON_LIMIT}`
+  );
+  assert(new Set(crons).size === crons.length, "wrangler.jsonc lists a cron twice");
+  for (const cron of [UPKEEP_CRON, ...DIGEST_CRONS, HEALTH_CRON]) {
+    assert(crons.includes(cron), `wrangler.jsonc lacks "${cron}"`);
+  }
+
+  const show = (jobs: string[]) => JSON.stringify(jobs);
+  const utc = (day: string, hour: number, minute: number) =>
+    new Date(`${day}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00Z`);
+  // Toronto's 07:00 hour is 11:xx UTC in EDT and 12:xx UTC in EST.
+  const DAYS = [
+    { day: "2026-08-19", digestHourUtc: 11 }, // EDT, UTC-4
+    { day: "2026-01-19", digestHourUtc: 12 }, // EST, UTC-5
+  ];
+
+  // Every UTC hour of both days, a superset of the hours each cron really
+  // fires: the upkeep tick always adds the watchdog to what the Toronto hour
+  // selects, and the health and digest ticks never run it.
+  for (const { day, digestHourUtc } of DAYS) {
+    for (let hour = 0; hour < 24; hour++) {
+      const primary = hour === digestHourUtc ? "digest" : "upkeep";
+      const upkeepAt = utc(day, hour, 17);
+      assert(
+        show(scheduledJobsFor(UPKEEP_CRON, upkeepAt)) === show([primary, "self-alert-watchdog"]),
+        `${upkeepAt.toISOString()}: the upkeep tick ran ${show(scheduledJobsFor(UPKEEP_CRON, upkeepAt))}`
+      );
+      for (const cron of DIGEST_CRONS) {
+        const digestAt = utc(day, hour, 0);
+        assert(
+          show(scheduledJobsFor(cron, digestAt)) === show([primary]),
+          `${digestAt.toISOString()}: "${cron}" ran ${show(scheduledJobsFor(cron, digestAt))}`
+        );
+      }
+      const healthAt = utc(day, hour, 37);
+      assert(
+        show(scheduledJobsFor(HEALTH_CRON, healthAt)) === show(["health"]),
+        `${healthAt.toISOString()}: the health tick ran ${show(scheduledJobsFor(HEALTH_CRON, healthAt))}`
+      );
+    }
+  }
+
+  // The real ticks, spelled out. In EST the 12:17 upkeep tick is 07:17 Toronto
+  // and runs the digest — alongside the watchdog, still — and the digest tick
+  // that is not 07:00 locally falls back to upkeep, as it always has.
+  const summer = "2026-08-19";
+  const winter = "2026-01-19";
+  const expected: [string, Date, string[]][] = [
+    [UPKEEP_CRON, utc(summer, 0, 17), ["upkeep", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(summer, 6, 17), ["upkeep", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(summer, 12, 17), ["upkeep", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(summer, 18, 17), ["upkeep", "self-alert-watchdog"]],
+    ["0 11 * * *", utc(summer, 11, 0), ["digest"]],
+    ["0 12 * * *", utc(summer, 12, 0), ["upkeep"]],
+    [HEALTH_CRON, utc(summer, 13, 37), ["health"]],
+    [UPKEEP_CRON, utc(winter, 0, 17), ["upkeep", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(winter, 6, 17), ["upkeep", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(winter, 12, 17), ["digest", "self-alert-watchdog"]],
+    [UPKEEP_CRON, utc(winter, 18, 17), ["upkeep", "self-alert-watchdog"]],
+    ["0 11 * * *", utc(winter, 11, 0), ["upkeep"]],
+    ["0 12 * * *", utc(winter, 12, 0), ["digest"]],
+    [HEALTH_CRON, utc(winter, 13, 37), ["health"]],
+  ];
+  for (const [cron, when, jobs] of expected) {
+    const got = scheduledJobsFor(cron, when);
+    assert(show(got) === show(jobs), `${when.toISOString()} "${cron}": ${show(got)}, expected ${show(jobs)}`);
+  }
+
+  // Minute-of-day (UTC) at which a cron fires; day fields must all be *.
   const range = (size: number) => Array.from({ length: size }, (_, i) => i);
   const expand = (field: string, size: number): number[] =>
     field === "*"
@@ -2026,6 +2090,27 @@ await test("o30. schedule: the watchdog tick is never the digest or upkeep, and 
     }
     return out;
   };
+
+  // Over every tick wrangler.jsonc really schedules, the watchdog runs only on
+  // the upkeep ticks, and never more than 6 hours apart.
+  for (const { day } of DAYS) {
+    const watchdogMinutes: number[] = [];
+    for (const cron of crons) {
+      for (const slot of slots(cron)) {
+        const jobs = scheduledJobsFor(cron, utc(day, Math.floor(slot / 60), slot % 60));
+        assert(new Set(jobs).size === jobs.length, `"${cron}" at ${slot}: a job listed twice`);
+        if (!jobs.includes("self-alert-watchdog")) continue;
+        assert(cron === UPKEEP_CRON, `"${cron}" ran the watchdog at minute-of-day ${slot}`);
+        watchdogMinutes.push(slot);
+      }
+    }
+    watchdogMinutes.sort((a, b) => a - b);
+    assert(watchdogMinutes.length === 4, `${day}: the watchdog ran ${watchdogMinutes.length} times, not 4`);
+    const gaps = watchdogMinutes.map((m, i) => (watchdogMinutes[(i + 1) % 4]! - m + 1440) % 1440);
+    assert(Math.max(...gaps) <= 6 * 60, `${day}: the watchdog goes ${Math.max(...gaps)} minutes unrun`);
+  }
+
+  // No two crons fire in the same minute.
   for (let i = 0; i < crons.length; i++) {
     for (let j = i + 1; j < crons.length; j++) {
       const a = slots(crons[i]!);
@@ -2065,6 +2150,79 @@ await test("o31. boundary: /me/sendMail is called from exactly one module, the s
   for (const field of ["ccRecipients", "bccRecipients", "replyTo", "attachments", '"from"', "sender"]) {
     assert(!core.includes(field), `core/self-alert.ts mentions ${field}`);
   }
+});
+
+await test("o32. schedule: the watchdog starts only after the tick's upkeep or digest settles, and runs even when it fails", async () => {
+  const show = (value: unknown) => JSON.stringify(value);
+  const drain = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
+  const summerUpkeep = scheduledJobsFor(UPKEEP_CRON, new Date("2026-08-19T06:17:00Z"));
+  const winterDigest = scheduledJobsFor(UPKEEP_CRON, new Date("2026-01-19T12:17:00Z"));
+  assert(show(summerUpkeep) === show(["upkeep", "self-alert-watchdog"]), `summer: ${show(summerUpkeep)}`);
+  assert(show(winterDigest) === show(["digest", "self-alert-watchdog"]), `winter: ${show(winterDigest)}`);
+
+  type Outcome = "resolve" | "reject" | "throw";
+  for (const jobs of [summerUpkeep, winterDigest]) {
+    const first = jobs[0]!;
+    for (const outcome of ["resolve", "reject", "throw"] as Outcome[]) {
+      const events: string[] = [];
+      const errors: string[] = [];
+      let settleFirst: () => void = () => {
+        throw new Error("the first job never started");
+      };
+      const run = (job: ScheduledJob): Promise<void> => {
+        events.push(`start ${job}`);
+        if (job !== first) {
+          return Promise.resolve().then(() => {
+            events.push(`settle ${job}`);
+          });
+        }
+        if (outcome === "throw") {
+          events.push(`settle ${job}`);
+          throw new Error(`${job} threw`);
+        }
+        return new Promise<void>((resolve, reject) => {
+          settleFirst = () => {
+            events.push(`settle ${job}`);
+            if (outcome === "resolve") resolve();
+            else reject(new Error(`${job} rejected`));
+          };
+        });
+      };
+      const done = runJobsInOrder(jobs, run, (job, err) => {
+        errors.push(`${job}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+
+      if (outcome !== "throw") {
+        // The first job is still running: the watchdog must not have started.
+        await drain();
+        assert(
+          show(events) === show([`start ${first}`]),
+          `${first} (${outcome}) still pending, yet: ${show(events)}`
+        );
+        settleFirst();
+      }
+      await done; // never rejects
+      assert(
+        show(events) ===
+          show([`start ${first}`, `settle ${first}`, "start self-alert-watchdog", "settle self-alert-watchdog"]),
+        `${first} (${outcome}): ${show(events)}`
+      );
+      const expectedErrors =
+        outcome === "resolve" ? [] : [`${first}: ${first} ${outcome === "throw" ? "threw" : "rejected"}`];
+      assert(show(errors) === show(expectedErrors), `${first} (${outcome}) errors: ${show(errors)}`);
+    }
+  }
+
+  // A failing watchdog is reported too, and the chain still settles.
+  const errors: string[] = [];
+  await runJobsInOrder(
+    summerUpkeep,
+    async (job) => {
+      if (job === "self-alert-watchdog") throw new Error("KV list failed");
+    },
+    (job, err) => errors.push(`${job}: ${String(err)}`)
+  );
+  assert(show(errors) === show(["self-alert-watchdog: Error: KV list failed"]), `errors: ${show(errors)}`);
 });
 
 // ------------------------------------------------------------------ summary
