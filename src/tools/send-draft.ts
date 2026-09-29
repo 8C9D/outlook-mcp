@@ -2,8 +2,9 @@ import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
 import { ToolResult, errorResult, formatLocal, runTool, textResult, torontoInstantUtc } from "./common.js";
 
-// This is the ONLY send path in the codebase: an existing draft, by id.
-// One-shot compose-and-send (e.g. /me/sendMail) is deliberately not implemented.
+// This is the ONLY send path to anyone but the owner: an existing draft, by id.
+// No tool does one-shot compose-and-send; the only /me/sendMail caller is the
+// self-alert route (core/self-alert.js), fixed to the owner's own address.
 
 /**
  * MAPI PR_DEFERRED_SEND_TIME (0x3FEF, SystemTime), the property behind

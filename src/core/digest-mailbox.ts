@@ -3,8 +3,9 @@
 // Kept separate from core/mail-actions.js so that neither LLM feature can reach
 // the other's capabilities — the classifier cannot create a draft, and the
 // digest cannot move or categorize anything. Neither can send: there is no
-// /sendMail and no /send here, and there never may be. The only send path in
-// this codebase is the send_draft tool, driven by a human.
+// /sendMail and no /send here, and there never may be. Mail leaves only through
+// the send_draft tool, driven by a human, or the self-alert route
+// (core/self-alert.js), which can address only the owner.
 import { callGraphServer } from "./graph.js";
 import type { DigestEvent, DigestMail, DigestMailbox, DigestTask } from "./digest.js";
 

@@ -9,8 +9,8 @@
 // check produces a DRAFT in the owner's own inbox — subject
 // "outlook-mcp health: <failing checks>" — naming what failed, since when, and
 // how to fix it. The draft is NEVER sent: it is created directly in the inbox
-// as an unsent message, so send_draft remains the only send path in this
-// codebase and a dead server cannot mail anyone.
+// as an unsent message, so the health check never sends and a dead server
+// cannot mail anyone.
 //
 // Everything is injectable (store, Graph transport, the rotation, the drafting)
 // so every failure mode is unit-testable offline; the Worker wiring in
