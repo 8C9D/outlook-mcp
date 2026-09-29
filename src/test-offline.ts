@@ -58,7 +58,27 @@ import {
   runHealthCheck,
   type HealthReport,
 } from "./core/health.js";
-import { STATE_HEALTH, STATE_LLM_AUDIT, STATE_LLM_CONFIG, STATE_SUBSCRIPTION } from "./core/kv-keys.js";
+import {
+  STATE_HEALTH,
+  STATE_LLM_AUDIT,
+  STATE_LLM_CONFIG,
+  STATE_SUBSCRIPTION,
+  selfAlertCountKey,
+  selfAlertHeartbeatKey,
+  selfAlertStaleKey,
+} from "./core/kv-keys.js";
+import { HEALTH_CRON, SELF_ALERT_WATCHDOG_CRON, scheduledJobFor } from "./core/schedule.js";
+import {
+  SELF_ALERT_DAILY_CAP,
+  SELF_ALERT_HEARTBEAT_PATH,
+  SELF_ALERT_PATH,
+  handleSelfAlertRequest,
+  runSelfAlertWatchdog,
+  secretsMatch,
+  type SelfAlertDeps,
+  type SelfAlertKv,
+  type SendMailPayload,
+} from "./core/self-alert.js";
 import { z } from "zod";
 import {
   buildLatestFilter,
@@ -906,6 +926,7 @@ await test("o15. boundary: the classifier's transitive imports cannot reach Grap
     path.join(srcRoot, "core", "mail-actions.ts"),
     path.join(srcRoot, "core", "digest-mailbox.ts"),
     path.join(srcRoot, "core", "health.ts"), // health imports graph; the classifier must not
+    path.join(srcRoot, "core", "self-alert.ts"), // the one autonomous send path
   ];
 
   const seen = new Set<string>();
@@ -1472,6 +1493,578 @@ await test("o17. version: package.json and core/version.ts agree", async () => {
   };
   assert(pkg.version === VERSION, `package.json is ${pkg.version}, core/version.ts is ${VERSION}`);
   assert(pkg.scripts["test:offline"], "package.json lost the test:offline entry point");
+});
+
+// ------------------------------------------- self-alert route and watchdog
+
+const SELF_ALERT_TEST_SECRET = "test-secret-".repeat(4); // 48 characters
+const OWNER_ADDRESS = "owner@example.invalid";
+const GOOD_ALERT = {
+  subject: "Position review due",
+  text: "First line.\nSecond line.",
+  source: "research-job",
+};
+
+type MemoryKv = SelfAlertKv & {
+  entries: Map<string, string>;
+  ttls: Map<string, number | undefined>;
+};
+
+/** An OUTLOOK_KV stand-in. list() pages two keys at a time so the cursor loop runs. */
+function memoryKv(): MemoryKv {
+  const entries = new Map<string, string>();
+  const ttls = new Map<string, number | undefined>();
+  return {
+    entries,
+    ttls,
+    async get(key) {
+      return entries.get(key) ?? null;
+    },
+    async put(key, value, options) {
+      entries.set(key, value);
+      ttls.set(key, options?.expirationTtl);
+    },
+    async delete(key) {
+      entries.delete(key);
+      ttls.delete(key);
+    },
+    async list({ prefix, cursor }) {
+      const names = [...entries.keys()].filter((name) => name.startsWith(prefix)).sort();
+      const start = cursor ? Number(cursor) : 0;
+      const keys = names.slice(start, start + 2).map((name) => ({ name }));
+      return start + 2 < names.length
+        ? { keys, list_complete: false, cursor: String(start + 2) }
+        : { keys, list_complete: true };
+    },
+  };
+}
+
+/** Self-alert deps with a recording sendMail and a settable clock. */
+function selfAlertFixture(overrides: Partial<SelfAlertDeps> = {}) {
+  const kv = memoryKv();
+  const sent: SendMailPayload[] = [];
+  let clock = NOW();
+  const deps: SelfAlertDeps = {
+    secret: SELF_ALERT_TEST_SECRET,
+    recipient: OWNER_ADDRESS,
+    kv,
+    sendMail: async (payload) => {
+      sent.push(payload);
+    },
+    now: () => clock,
+    ...overrides,
+  };
+  return {
+    deps,
+    kv,
+    sent,
+    setNow: (when: Date) => {
+      clock = when;
+    },
+  };
+}
+
+function selfAlertRequest(
+  body: unknown,
+  opts: { path?: string; method?: string; auth?: string | null; raw?: string } = {}
+): Request {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const auth = opts.auth === undefined ? `Bearer ${SELF_ALERT_TEST_SECRET}` : opts.auth;
+  if (auth !== null) headers.authorization = auth;
+  const method = opts.method ?? "POST";
+  return new Request(`https://worker.example.invalid${opts.path ?? SELF_ALERT_PATH}`, {
+    method,
+    headers,
+    ...(method === "GET" ? {} : { body: opts.raw ?? JSON.stringify(body) }),
+  });
+}
+
+function heartbeatRequest(body: unknown, auth?: string | null): Request {
+  return selfAlertRequest(body, { path: SELF_ALERT_HEARTBEAT_PATH, auth });
+}
+
+await test("o24. self-alert gate: 404 while off, then 405, 401 on a missing/wrong secret, 413/400 before any send", async () => {
+  // Off: no secret, an empty one, or one too short to be a real secret. Both
+  // routes then look exactly like a path that does not exist.
+  for (const secret of [undefined, "", "   ", "short-secret"]) {
+    const { deps, sent, kv } = selfAlertFixture({ secret });
+    for (const path of [SELF_ALERT_PATH, SELF_ALERT_HEARTBEAT_PATH]) {
+      const body = path === SELF_ALERT_PATH ? GOOD_ALERT : { source: "a", job: "b", max_age_hours: 24 };
+      const res = await handleSelfAlertRequest(selfAlertRequest(body, { path }), deps);
+      assert(res.status === 404, `secret ${JSON.stringify(secret)}: ${path} answered ${res.status}`);
+      assert((await res.text()) === "Not found", "a disabled route does not look like a missing one");
+    }
+    assert(sent.length === 0 && kv.entries.size === 0, "a disabled route sent mail or wrote KV");
+  }
+
+  const { deps, sent, kv } = selfAlertFixture();
+  const get = await handleSelfAlertRequest(selfAlertRequest(null, { method: "GET" }), deps);
+  assert(get.status === 405 && get.headers.get("allow") === "POST", `GET answered ${get.status}`);
+
+  const wrong = [
+    null, // no Authorization header at all
+    "",
+    "Bearer ",
+    `Bearer ${SELF_ALERT_TEST_SECRET}x`,
+    `Bearer ${SELF_ALERT_TEST_SECRET.slice(0, -1)}X`, // same length, last char differs
+    `Basic ${SELF_ALERT_TEST_SECRET}`,
+    SELF_ALERT_TEST_SECRET, // no scheme
+  ];
+  for (const auth of wrong) {
+    for (const request of [
+      selfAlertRequest(GOOD_ALERT, { auth }),
+      heartbeatRequest({ source: "a", job: "b", max_age_hours: 24 }, auth),
+    ]) {
+      const res = await handleSelfAlertRequest(request, deps);
+      assert(res.status === 401, `auth ${JSON.stringify(auth)} answered ${res.status}`);
+      assert((await res.text()) === "Unauthorized", "a 401 carried detail");
+    }
+  }
+  assert(sent.length === 0 && kv.entries.size === 0, "an unauthenticated request sent or wrote");
+
+  assert(await secretsMatch("abc", "abc"), "secretsMatch: equal strings differ");
+  assert(!(await secretsMatch("abc", "abd")), "secretsMatch: one char off matched");
+  assert(!(await secretsMatch("abc", "abcd")), "secretsMatch: a prefix matched");
+  assert(!(await secretsMatch("", "abc")), "secretsMatch: empty matched");
+
+  // Body guards, authenticated: oversize, not JSON, not an object.
+  const oversize = JSON.stringify({ ...GOOD_ALERT, text: "x".repeat(70_000) });
+  const big = await handleSelfAlertRequest(selfAlertRequest(null, { raw: oversize }), deps);
+  assert(big.status === 413, `a 70 KB body answered ${big.status}`);
+  for (const raw of ["subject=hi&text=there", "", "[]", "null", '"text"']) {
+    const res = await handleSelfAlertRequest(selfAlertRequest(null, { raw }), deps);
+    assert(res.status === 400, `body ${JSON.stringify(raw)} answered ${res.status}`);
+  }
+  assert(sent.length === 0, "a malformed body was sent");
+
+  // The right secret (scheme case-insensitive, as RFC 7235 has it) → 202, one send.
+  const ok = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), deps);
+  assert(ok.status === 202, `the right secret answered ${ok.status}`);
+  assert(JSON.stringify(await ok.json()) === '{"ok":true}', "202 body changed shape");
+  const lower = await handleSelfAlertRequest(
+    selfAlertRequest(GOOD_ALERT, { auth: `bearer ${SELF_ALERT_TEST_SECRET}` }),
+    deps
+  );
+  assert(lower.status === 202, `a lowercase scheme answered ${lower.status}`);
+  // (cast: the earlier asserts narrowed sent.length to the literal 0)
+  assert((sent.length as number) === 2, `expected two sends, got ${sent.length}`);
+});
+
+await test("o25. self-alert body: to/cc/bcc/etc. refused, bounds enforced, recipient is always ALLOWED_MS_UPN", async () => {
+  const { deps, sent } = selfAlertFixture();
+  const post = (body: unknown) => handleSelfAlertRequest(selfAlertRequest(body), deps);
+
+  // No field can carry a second address: anything outside the schema is refused.
+  for (const field of [
+    "to",
+    "cc",
+    "bcc",
+    "from",
+    "sender",
+    "replyTo",
+    "reply_to",
+    "toRecipients",
+    "recipient",
+    "attachments",
+  ]) {
+    const res = await post({ ...GOOD_ALERT, [field]: "someone@example.invalid" });
+    assert(res.status === 400, `extra field ${field} answered ${res.status}`);
+    const { error } = (await res.json()) as { error: string };
+    assert(error.includes(`"${field}"`), `the error for ${field} does not name it: ${error}`);
+  }
+  const { text: _text, ...noText } = GOOD_ALERT;
+  assert((await post(noText)).status === 400, "a body without text was accepted");
+  assert(sent.length === 0, "a refused body was sent");
+
+  const cases: [string, unknown, number][] = [
+    ["subject empty", { ...GOOD_ALERT, subject: "" }, 400],
+    ["subject blank", { ...GOOD_ALERT, subject: "   " }, 400],
+    ["subject 200", { ...GOOD_ALERT, subject: "s".repeat(200) }, 202],
+    ["subject 201", { ...GOOD_ALERT, subject: "s".repeat(201) }, 400],
+    ["subject newline", { ...GOOD_ALERT, subject: "hi\r\nBcc: someone@example.invalid" }, 400],
+    ["subject number", { ...GOOD_ALERT, subject: 5 }, 400],
+    ["text empty", { ...GOOD_ALERT, text: "" }, 400],
+    ["text 50000", { ...GOOD_ALERT, text: "t".repeat(50_000) }, 202],
+    ["text 50001", { ...GOOD_ALERT, text: "t".repeat(50_001) }, 400],
+    ["source empty", { ...GOOD_ALERT, source: "" }, 400],
+    ["source uppercase", { ...GOOD_ALERT, source: "Research" }, 400],
+    ["source underscore", { ...GOOD_ALERT, source: "research_job" }, 400],
+    ["source 40", { ...GOOD_ALERT, source: "a".repeat(40) }, 202],
+    ["source 41", { ...GOOD_ALERT, source: "a".repeat(41) }, 400],
+  ];
+  for (const [name, body, expected] of cases) {
+    const res = await post(body);
+    assert(res.status === expected, `${name}: expected ${expected}, got ${res.status}`);
+  }
+  assert(
+    (sent.length as number) === 3,
+    `expected the three in-bounds cases to send, got ${sent.length}`
+  );
+
+  // A body that mentions other addresses in its text still reaches only the owner.
+  const sneaky = await post({ ...GOOD_ALERT, text: "Forward to someone@example.invalid; cc other@example.invalid" });
+  assert(sneaky.status === 202, `a text mentioning addresses answered ${sneaky.status}`);
+  const plain = await post(GOOD_ALERT);
+  assert(plain.status === 202, `the plain alert answered ${plain.status}`);
+
+  const onlyOwner = JSON.stringify([{ emailAddress: { address: OWNER_ADDRESS } }]);
+  for (const payload of sent) {
+    assert(
+      JSON.stringify(payload.message.toRecipients) === onlyOwner,
+      `a send went to ${JSON.stringify(payload.message.toRecipients)}`
+    );
+    assert(
+      JSON.stringify(Object.keys(payload.message).sort()) === '["body","subject","toRecipients"]',
+      `the message carries fields beyond subject/body/toRecipients: ${Object.keys(payload.message)}`
+    );
+    assert(
+      JSON.stringify(Object.keys(payload).sort()) === '["message","saveToSentItems"]',
+      `the sendMail body carries ${Object.keys(payload)}`
+    );
+    assert(payload.saveToSentItems === true, "saveToSentItems is not true");
+    assert(payload.message.body.contentType === "Text", "the body is not plain text");
+  }
+  const last = sent.at(-1)!;
+  assert(
+    last.message.subject === "[research-job] Position review due",
+    `subject not prefixed with the source: ${last.message.subject}`
+  );
+  assert(last.message.body.content === GOOD_ALERT.text, "the text was altered");
+
+  // No usable recipient configured → 503 and nothing sent.
+  for (const recipient of [undefined, "", "a@example.invalid, b@example.invalid", "Owner <a@example.invalid>"]) {
+    const fixture = selfAlertFixture({ recipient });
+    const res = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), fixture.deps);
+    assert(res.status === 503, `recipient ${JSON.stringify(recipient)} answered ${res.status}`);
+    assert(fixture.sent.length === 0, `recipient ${JSON.stringify(recipient)} still sent`);
+  }
+
+  // Graph refuses → 502, logged, and Graph's answer is not echoed.
+  const refusing = selfAlertFixture({
+    sendMail: async () => {
+      throw new GraphError(403, "Forbidden", "/me/sendMail", '{"error":{"message":"GRAPH-DETAIL"}}');
+    },
+  });
+  const failed = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), refusing.deps);
+  const failedText = await failed.text();
+  assert(failed.status === 502, `a Graph refusal answered ${failed.status}`);
+  assert(
+    !failedText.includes("GRAPH-DETAIL") && !failedText.includes("Forbidden"),
+    `the 502 echoes Graph: ${failedText}`
+  );
+});
+
+await test("o26. self-alert cap: 20 per UTC day, the 21st is 429 and unsent, and the count resets at UTC midnight", async () => {
+  const { deps, kv, sent, setNow } = selfAlertFixture();
+  // 19:30 in Toronto, so the reset below is visibly UTC's midnight, not Toronto's.
+  setNow(new Date("2026-08-19T23:30:00Z"));
+  for (let i = 1; i <= SELF_ALERT_DAILY_CAP; i++) {
+    const res = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), deps);
+    assert(res.status === 202, `send ${i} answered ${res.status}`);
+  }
+  assert(SELF_ALERT_DAILY_CAP === 20, `the cap is ${SELF_ALERT_DAILY_CAP}, not 20`);
+
+  const over = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), deps);
+  assert(over.status === 429, `send 21 answered ${over.status}`);
+  assert(over.headers.get("retry-after") === "1800", `retry-after: ${over.headers.get("retry-after")}`);
+  assert(sent.length === SELF_ALERT_DAILY_CAP, `${sent.length} sends went out under a cap of 20`);
+  const counter = selfAlertCountKey("2026-08-19");
+  assert(kv.entries.get(counter) === "20", `counter reads ${kv.entries.get(counter)}`);
+  assert(kv.ttls.get(counter) === 2 * 24 * 3600, `counter TTL is ${kv.ttls.get(counter)}`);
+
+  // Heartbeats send nothing and are not capped.
+  const beat = await handleSelfAlertRequest(
+    heartbeatRequest({ source: "research-job", job: "daily-scan", max_age_hours: 24 }),
+    deps
+  );
+  assert(beat.status === 204, `a heartbeat over the cap answered ${beat.status}`);
+
+  // Five seconds past UTC midnight (still the 19th in Toronto): a fresh day.
+  setNow(new Date("2026-08-20T00:00:05Z"));
+  const next = await handleSelfAlertRequest(selfAlertRequest(GOOD_ALERT), deps);
+  assert(next.status === 202, `the next UTC day answered ${next.status}`);
+  assert(sent.length === SELF_ALERT_DAILY_CAP + 1, "the next day's send did not go out");
+  assert(kv.entries.get(selfAlertCountKey("2026-08-20")) === "1", "the new day's counter is not 1");
+});
+
+await test("o27. heartbeat: stores {at, max_age_hours}, clears the stale flag, sends nothing, validates its body", async () => {
+  const { deps, kv, sent } = selfAlertFixture();
+  const beat = (body: unknown) => handleSelfAlertRequest(heartbeatRequest(body), deps);
+  const flagKey = selfAlertStaleKey("research-job", "daily-scan");
+  await kv.put(flagKey, JSON.stringify({ alerted_at: "earlier", heartbeat_at: "earlier" }));
+
+  const res = await beat({ source: "research-job", job: "daily-scan", max_age_hours: 30 });
+  assert(res.status === 204, `heartbeat answered ${res.status}`);
+  assert((await res.text()) === "", "a 204 carried a body");
+  const stored = kv.entries.get(selfAlertHeartbeatKey("research-job", "daily-scan"));
+  assert(
+    stored === JSON.stringify({ at: NOW().toISOString(), max_age_hours: 30 }),
+    `stored heartbeat: ${stored}`
+  );
+  assert(!kv.entries.has(flagKey), "the stale flag survived a heartbeat");
+  assert(sent.length === 0, "a heartbeat sent mail");
+
+  const good = { source: "research-job", job: "daily-scan", max_age_hours: 24 };
+  const refused: [string, unknown][] = [
+    ["unknown field", { ...good, to: "someone@example.invalid" }],
+    ["missing job", { source: "research-job", max_age_hours: 24 }],
+    ["max_age_hours 0", { ...good, max_age_hours: 0 }],
+    ["max_age_hours 721", { ...good, max_age_hours: 721 }],
+    ["max_age_hours string", { ...good, max_age_hours: "24" }],
+    ["max_age_hours null", { ...good, max_age_hours: null }],
+    ["job with spaces", { ...good, job: "Daily Scan" }],
+    ["job 41", { ...good, job: "j".repeat(41) }],
+    ["source colon", { ...good, source: "a:b" }],
+  ];
+  for (const [name, body] of refused) {
+    const refusedRes = await beat(body);
+    assert(refusedRes.status === 400, `${name}: answered ${refusedRes.status}`);
+  }
+  for (const max of [1, 1.5, 720]) {
+    const accepted = await beat({ ...good, job: "bounds", max_age_hours: max });
+    assert(accepted.status === 204, `max_age_hours ${max} answered ${accepted.status}`);
+  }
+  const heartbeats = [...kv.entries.keys()].filter((key) => key.startsWith("selfalert:hb:"));
+  assert(heartbeats.length === 2, `refused heartbeats were stored: ${heartbeats.join(", ")}`);
+  assert(sent.length === 0, "a heartbeat sent mail");
+});
+
+await test("o28. watchdog: fresh → quiet, stale → one alert, still stale → quiet, heartbeat then stale → alerts again", async () => {
+  const { deps, kv, sent, setNow } = selfAlertFixture();
+  // A function, not sent.length: asserts would narrow a property to a literal.
+  const sentCount = () => sent.length;
+  const T0 = new Date("2026-08-19T12:00:00Z");
+  const at = (hours: number) => new Date(T0.getTime() + hours * 3_600_000);
+  const beat = async (when: Date) => {
+    setNow(when);
+    const res = await handleSelfAlertRequest(
+      heartbeatRequest({ source: "research-job", job: "daily-scan", max_age_hours: 24 }),
+      deps
+    );
+    assert(res.status === 204, `heartbeat answered ${res.status}`);
+  };
+  const sweep = async (when: Date) => {
+    setNow(when);
+    const result = await runSelfAlertWatchdog(deps);
+    assert(result.enabled, "the watchdog reports itself off with the secret set");
+    return result;
+  };
+
+  // Nothing registered yet: the watchdog is inert.
+  const empty = await sweep(T0);
+  assert(empty.watched === 0 && empty.alerted.length === 0 && sentCount() === 0, "an empty KV alerted");
+
+  await beat(T0);
+  const fresh = await sweep(at(23));
+  assert(fresh.watched === 1 && fresh.stale === 0 && sentCount() === 0, `fresh: ${JSON.stringify(fresh)}`);
+  const edge = await sweep(at(24));
+  assert(edge.stale === 0 && sentCount() === 0, "exactly max_age_hours counted as stale");
+
+  const stale = await sweep(at(25));
+  assert(
+    JSON.stringify(stale.alerted) === '["research-job/daily-scan"]' && sentCount() === 1,
+    `stale: ${JSON.stringify(stale)}, sent ${sentCount()}`
+  );
+  const alert = sent[0]!;
+  assert(
+    alert.message.subject === "[self-alert-watchdog] research-job/daily-scan: no heartbeat for 25h",
+    `watchdog subject: ${alert.message.subject}`
+  );
+  assert(
+    JSON.stringify(alert.message.toRecipients) ===
+      JSON.stringify([{ emailAddress: { address: OWNER_ADDRESS } }]),
+    "the watchdog alert went somewhere other than the owner"
+  );
+  assert(alert.message.body.content.includes(`Last heartbeat: ${T0.toISOString()}`), "no last-seen time");
+  assert(
+    alert.message.body.content.includes(selfAlertHeartbeatKey("research-job", "daily-scan")),
+    "the alert does not say how to unregister the job"
+  );
+  assert(kv.entries.has(selfAlertStaleKey("research-job", "daily-scan")), "no stale flag was set");
+
+  const still = await sweep(at(26));
+  assert(still.stale === 1 && still.alerted.length === 0 && sentCount() === 1, "alerted twice in one lapse");
+  const later = await sweep(at(40));
+  assert(later.alerted.length === 0 && sentCount() === 1, "alerted again later in the same lapse");
+
+  await beat(at(41));
+  assert(!kv.entries.has(selfAlertStaleKey("research-job", "daily-scan")), "the heartbeat left the flag");
+  const recovered = await sweep(at(42));
+  assert(recovered.stale === 0 && sentCount() === 1, "a recovered job alerted");
+
+  const relapsed = await sweep(at(41 + 25));
+  assert(relapsed.alerted.length === 1 && sentCount() === 2, "a second lapse did not alert");
+  assert(
+    sent[1]!.message.subject.endsWith("no heartbeat for 25h"),
+    `second alert subject: ${sent[1]!.message.subject}`
+  );
+  const relapsedStill = await sweep(at(41 + 26));
+  assert(relapsedStill.alerted.length === 0 && sentCount() === 2, "the second lapse alerted twice");
+  // Watchdog alerts count against the cap on their own UTC day.
+  assert(kv.entries.get(selfAlertCountKey("2026-08-20")) === "1", "the first alert was not counted");
+  assert(kv.entries.get(selfAlertCountKey("2026-08-22")) === "1", "the second alert was not counted");
+});
+
+await test("o29. watchdog: unregistered jobs ignored, list pages, shared cap, Graph failure retried, off without secret", async () => {
+  const T0 = new Date("2026-08-19T12:00:00Z");
+  const at = (hours: number) => new Date(T0.getTime() + hours * 3_600_000);
+  const register = async (fixture: ReturnType<typeof selfAlertFixture>, job: string, max: number) => {
+    fixture.setNow(T0);
+    const res = await handleSelfAlertRequest(
+      heartbeatRequest({ source: "research-job", job, max_age_hours: max }),
+      fixture.deps
+    );
+    assert(res.status === 204, `registering ${job} answered ${res.status}`);
+  };
+
+  // Four jobs across two list pages; only the two past their own limit alert.
+  // A job that never sent a heartbeat is not watched, even with a flag lying around.
+  const many = selfAlertFixture();
+  await register(many, "a-hourly", 1);
+  await register(many, "b-daily", 48);
+  await register(many, "c-twohour", 2);
+  await register(many, "d-monthly", 720);
+  await many.kv.put(selfAlertStaleKey("research-job", "never-beat"), "{}");
+  many.setNow(at(3));
+  const swept = await runSelfAlertWatchdog(many.deps);
+  assert(swept.enabled && swept.watched === 4 && swept.stale === 2, `swept: ${JSON.stringify(swept)}`);
+  assert(
+    JSON.stringify(swept.alerted) === '["research-job/a-hourly","research-job/c-twohour"]',
+    `alerted: ${JSON.stringify(swept.alerted)}`
+  );
+  assert(
+    !many.sent.some((payload) => payload.message.subject.includes("never-beat")),
+    "an unregistered job was alerted on"
+  );
+
+  // Watchdog alerts share the daily cap; an over-cap alert sets no flag and
+  // goes out on the next hour that has room.
+  const capped = selfAlertFixture();
+  await register(capped, "daily-scan", 1);
+  await capped.kv.put(selfAlertCountKey("2026-08-19"), String(SELF_ALERT_DAILY_CAP));
+  capped.setNow(at(2));
+  const blocked = await runSelfAlertWatchdog(capped.deps);
+  assert(blocked.enabled && blocked.alerted.length === 0, "an alert went out over the cap");
+  assert(blocked.problems.some((p) => p.includes("cap")), `problems: ${JSON.stringify(blocked.problems)}`);
+  assert(capped.sent.length === 0, "an over-cap watchdog alert was sent");
+  assert(!capped.kv.entries.has(selfAlertStaleKey("research-job", "daily-scan")), "flag set without a send");
+  capped.setNow(at(13)); // 01:00 UTC on the 20th: a new cap day
+  const unblocked = await runSelfAlertWatchdog(capped.deps);
+  assert(unblocked.enabled && unblocked.alerted.length === 1, "the capped alert was lost, not retried");
+
+  // Graph failure: no flag, so the next hour tries again.
+  const flaky = selfAlertFixture();
+  await register(flaky, "daily-scan", 1);
+  flaky.deps.sendMail = async () => {
+    throw new Error("Graph answered 503");
+  };
+  flaky.setNow(at(2));
+  const failed = await runSelfAlertWatchdog(flaky.deps);
+  assert(failed.enabled && failed.alerted.length === 0, "a failed send was reported as alerted");
+  assert(failed.problems.some((p) => p.includes("Graph answered 503")), "the failure was not reported");
+  assert(!flaky.kv.entries.has(selfAlertStaleKey("research-job", "daily-scan")), "flag set on a failed send");
+  flaky.deps.sendMail = async (payload) => {
+    flaky.sent.push(payload);
+  };
+  flaky.setNow(at(3));
+  const retried = await runSelfAlertWatchdog(flaky.deps);
+  assert(retried.enabled && retried.alerted.length === 1 && flaky.sent.length === 1, "no retry after failure");
+
+  // Off without the secret, even with a long-stale job on record.
+  const off = selfAlertFixture({ secret: undefined });
+  await off.kv.put(
+    selfAlertHeartbeatKey("research-job", "daily-scan"),
+    JSON.stringify({ at: "2020-01-01T00:00:00.000Z", max_age_hours: 1 })
+  );
+  const offResult = await runSelfAlertWatchdog(off.deps);
+  assert(!offResult.enabled && off.sent.length === 0, "the watchdog ran without its secret");
+});
+
+await test("o30. schedule: the watchdog tick is never the digest or upkeep, and no two crons in wrangler.jsonc collide", async () => {
+  // Every hour of an EDT day and an EST day, including 11:47 and 12:47 UTC,
+  // which fall in Toronto's 07:00 hour.
+  for (const day of ["2026-08-19", "2026-01-19"]) {
+    for (let hour = 0; hour < 24; hour++) {
+      const when = new Date(`${day}T${String(hour).padStart(2, "0")}:47:00Z`);
+      const job = scheduledJobFor(SELF_ALERT_WATCHDOG_CRON, when);
+      assert(job === "self-alert-watchdog", `${when.toISOString()}: the watchdog tick ran ${job}`);
+    }
+  }
+  // The hazard the ordering avoids: by hour alone, 11:47 UTC in EDT is the digest.
+  assert(
+    scheduledJobFor("0 11 * * *", new Date("2026-08-19T11:47:00Z")) === "digest",
+    "the hour-based branch no longer claims Toronto's 07:00 hour"
+  );
+  assert(scheduledJobFor(HEALTH_CRON, new Date("2026-08-19T13:37:00Z")) === "health", "health");
+  assert(
+    scheduledJobFor("17 */6 * * *", new Date("2026-08-19T18:17:00Z")) === "upkeep",
+    "an upkeep tick is no longer upkeep"
+  );
+
+  const raw = await fs.readFile(path.join(PROJECT_ROOT, "wrangler.jsonc"), "utf8");
+  const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, "")) as { triggers?: { crons?: string[] } };
+  const crons = config.triggers?.crons ?? [];
+  assert(crons.includes(HEALTH_CRON), "wrangler.jsonc lost HEALTH_CRON");
+  assert(crons.includes(SELF_ALERT_WATCHDOG_CRON), "wrangler.jsonc lacks SELF_ALERT_WATCHDOG_CRON");
+
+  const range = (size: number) => Array.from({ length: size }, (_, i) => i);
+  const expand = (field: string, size: number): number[] =>
+    field === "*"
+      ? range(size)
+      : field.startsWith("*/")
+        ? range(size).filter((v) => v % Number(field.slice(2)) === 0)
+        : field.split(",").map(Number);
+  const slots = (cron: string): Set<number> => {
+    const [minute, hour, ...days] = cron.trim().split(/\s+/);
+    assert(days.length === 3 && days.every((f) => f === "*"), `${cron}: day fields must be *`);
+    const out = new Set<number>();
+    for (const h of expand(hour!, 24)) {
+      for (const m of expand(minute!, 60)) {
+        assert(Number.isInteger(h) && Number.isInteger(m), `${cron}: unparseable field`);
+        out.add(h * 60 + m);
+      }
+    }
+    return out;
+  };
+  for (let i = 0; i < crons.length; i++) {
+    for (let j = i + 1; j < crons.length; j++) {
+      const a = slots(crons[i]!);
+      const shared = [...slots(crons[j]!)].filter((slot) => a.has(slot));
+      assert(
+        shared.length === 0,
+        `"${crons[i]}" and "${crons[j]}" both fire at minute-of-day ${shared.join(", ")} UTC`
+      );
+    }
+  }
+});
+
+await test("o31. boundary: /me/sendMail is called from exactly one module, the self-alert Worker glue", async () => {
+  const srcRoot = path.join(PROJECT_ROOT, "src");
+  const stripComments = (source: string) =>
+    source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  const callers: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.name.endsWith(".ts") && !entry.name.startsWith("test-")) {
+        if (stripComments(await fs.readFile(full, "utf8")).includes("/sendMail")) {
+          callers.push(path.relative(srcRoot, full));
+        }
+      }
+    }
+  };
+  await walk(srcRoot);
+  assert(
+    JSON.stringify(callers) === JSON.stringify([path.join("worker", "self-alert.ts")]),
+    `/sendMail appears in: ${callers.join(", ") || "(nowhere — the scanner is broken)"}`
+  );
+  // The core module shapes the only message that path sends: one recipient list, no other.
+  const core = stripComments(await fs.readFile(path.join(srcRoot, "core", "self-alert.ts"), "utf8"));
+  for (const field of ["ccRecipients", "bccRecipients", "replyTo", "attachments", '"from"', "sender"]) {
+    assert(!core.includes(field), `core/self-alert.ts mentions ${field}`);
+  }
 });
 
 // ------------------------------------------------------------------ summary

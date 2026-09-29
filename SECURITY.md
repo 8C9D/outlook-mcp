@@ -21,9 +21,17 @@ The full reasoning lives in the README's
   to instruct a model into sending, deleting or forwarding things (prompt
   injection). The design answers structurally, not by prompting the model to be
   careful.
-- **No tool composes-and-sends.** `/me/sendMail` is never called; sending is
+- **No tool composes-and-sends.** No tool calls `/me/sendMail`; sending is
   two-step — the complete message must exist as a reviewable draft before
   `send_draft` can name it.
+- **One opt-in route sends without a draft, and only to the owner.**
+  `POST /self-alert` (and the hourly heartbeat watchdog behind
+  `POST /self-alert/heartbeat`) lets a scheduled job the owner runs elsewhere
+  email the owner. It is off — both routes answer `404` — unless the
+  `SELF_ALERT_SECRET` Worker secret is set; it requires that secret as a bearer
+  token, compared in constant time; the recipient is always `ALLOWED_MS_UPN`,
+  with no recipient, cc, bcc or reply-to field in the request and unknown
+  fields refused; and it stops at 20 mails per UTC day.
 - **Mailbox deletes are soft** (Deleted Items, recoverable). The one
   irreversible operation is `manage_task` delete, which says so in its
   description; per-call approval prompts are the intended backstop for all

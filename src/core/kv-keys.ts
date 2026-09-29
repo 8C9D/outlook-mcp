@@ -8,6 +8,28 @@ export const KV_REFRESH_TOKEN = "ms:refresh_token";
 /** The cached mailbox access token, as {"token","expiresAt"} JSON. */
 export const KV_ACCESS_TOKEN = "ms:access_token";
 
+// The self-alert keys (core/self-alert.js) are Worker-only as well: the route
+// and its watchdog exist only on the hosted server. Sources and jobs match
+// [a-z0-9-], so ":" is a safe separator.
+
+/** Self-alert mails sent on one UTC calendar day — the daily cap's counter. */
+export function selfAlertCountKey(utcDate: string): string {
+  return `selfalert:count:${utcDate}`;
+}
+
+/** Prefix of the heartbeat records; the watchdog enumerates them with KV list. */
+export const SELF_ALERT_HEARTBEAT_PREFIX = "selfalert:hb:";
+
+/** One job's last heartbeat, {at, max_age_hours}. Its existence registers the job. */
+export function selfAlertHeartbeatKey(source: string, job: string): string {
+  return `${SELF_ALERT_HEARTBEAT_PREFIX}${source}:${job}`;
+}
+
+/** Set when the watchdog has alerted on a stale job; the next heartbeat clears it. */
+export function selfAlertStaleKey(source: string, job: string): string {
+  return `selfalert:stale:${source}:${job}`;
+}
+
 // The keys below are also used by the stdio server, where the same names index
 // a local JSON file instead of KV — they are state keys, not KV-only keys.
 

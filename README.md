@@ -15,10 +15,11 @@ connector. All datetimes are America/Toronto unless a caller supplies an explici
 
 **Security model in one paragraph.** Mailbox content is treated as untrusted input (an email can try
 to prompt-inject the model), and the design answers structurally: nothing sends except by naming an
-already-existing, reviewable draft (no tool composes-and-sends); mailbox deletes are soft; inbox rules
-cannot forward; the hosted endpoint accepts exactly one Microsoft identity, interactively only; and
-the single autonomous LLM path (opt-in auto-filing) is fenced off in code so it cannot send, delete or
-reply. No secrets ever enter this repository. The reasoning is in
+already-existing, reviewable draft (no tool composes-and-sends; the one exception, an opt-in
+[self-alert route](#self-alerts-opt-in), can mail only the owner's own address); mailbox deletes are
+soft; inbox rules cannot forward; the hosted endpoint accepts exactly one Microsoft identity,
+interactively only; and the single autonomous LLM path (opt-in auto-filing) is fenced off in code so
+it cannot send, delete or reply. No secrets ever enter this repository. The reasoning is in
 [Security model](#security-model) and [Security model in detail](#security-model-in-detail).
 
 ## What it does
@@ -50,8 +51,13 @@ With send, delete and settings tools available, **mailbox content is untrusted i
 contain text that tries to instruct the model into sending, deleting or forwarding things (prompt
 injection). The design answers that structurally rather than by asking a model to be careful:
 
-- **Sending is two-step and no tool composes-and-sends.** `/me/sendMail` is never called. The complete
+- **Sending is two-step and no tool composes-and-sends.** No tool calls `/me/sendMail`. The complete
   message exists as a reviewable draft before anything can leave ([detail](#two-step-send-by-design)).
+- **One opt-in route sends without a draft, and only to the owner.** `POST /self-alert` lets a
+  scheduled job the owner runs elsewhere email the owner. It is off (`404`) unless the
+  `SELF_ALERT_SECRET` secret is set, requires that secret as a bearer token, always sends to
+  `ALLOWED_MS_UPN` — the request has no recipient field and unknown fields are refused — and stops at
+  20 mails a UTC day ([detail](#self-alerts-opt-in)).
 - **Mailbox deletes are soft.** Messages, events and contacts go to Deleted Items and stay
   recoverable; nothing in the tool surface purges. The single exception — `manage_task` delete — is
   permanent because To Do has no recoverable store, and says so loudly ([detail](#soft-delete-policy)).
@@ -676,9 +682,11 @@ features simply do nothing and say so in the audit log.
 
 ## Two-step send by design
 
-The server can send email, but **no tool composes and sends in one call**, and `/me/sendMail` is never
-used. Sending is always separate tool calls: compose with `create_draft` (and optionally `update_draft`
-and `add_attachment`), then send that exact draft with `send_draft(draft_id)`. This means:
+The server can send email, but **no tool composes and sends in one call**, and no tool uses
+`/me/sendMail` — its one caller is the opt-in [self-alert route](#self-alerts-opt-in), which can reach
+only the owner's own address. Sending is always separate tool calls: compose with `create_draft` (and
+optionally `update_draft` and `add_attachment`), then send that exact draft with
+`send_draft(draft_id)`. This means:
 
 - The complete outgoing message exists as a reviewable draft before anything leaves the account.
 - The calling model must present the draft (subject, recipients) and take a second deliberate action to send.
@@ -760,6 +768,15 @@ can contain text that tries to instruct the model into sending, deleting, or for
   mailbox content — the worst it could do with a stolen secret is add a bogus line to
   `get_mailbox_activity`. The route never echoes stored state and answers `202` either way, so it
   cannot be used to guess the secret.
+- **`/self-alert` is the one autonomous send, and it can reach only the owner.** It lets a scheduled
+  job the owner runs elsewhere email the owner, and it is fenced in code: off — answering `404` like a
+  missing path — unless the optional `SELF_ALERT_SECRET` secret is set (32+ characters); gated on
+  `Authorization: Bearer <SELF_ALERT_SECRET>`, compared in constant time, before the body is read;
+  addressed to `ALLOWED_MS_UPN` and nothing else, since the body (`subject`, `text`, `source`) has no
+  recipient, cc, bcc, from, reply-to or attachment field and any other field is refused with `400`;
+  and capped at 20 mails per UTC day (`429` beyond it, nothing sent). Its heartbeat watchdog sends
+  through the same path under the same cap, and a test asserts `/me/sendMail` appears in exactly one
+  module ([detail](#self-alerts-opt-in)).
 - **The remote endpoint is single-user.** Nothing anonymous can reach `/mcp` or any route that
   touches Graph, and only one Microsoft identity — matched on the Graph `/me` id or UPN captured at
   setup — can complete an authorization. A remote connector runs the same tools with the same
@@ -981,9 +998,27 @@ failing check **also leaves an unsent draft in the inbox** — subject `outlook-
 naming what failed, since when (carried across runs), and the fix: the re-seed procedure
 (`npm run login` + `npm run seed:kv`) for token failures, `wrangler tail` / `get_auto_filing_log` for
 the rest. The draft is created directly in the inbox and **never sent** — a dying server must not be
-able to mail anyone, so `send_draft` remains the only send path in the codebase. `get_health` surfaces
+able to mail anyone, so the health check only ever drafts. `get_health` surfaces
 the latest heartbeat on the hosted server, and on the stdio server runs the checks that mean something
 locally instead of pretending.
+
+### Self-alerts (opt-in)
+
+Two routes let a scheduled job the owner runs elsewhere (a CI workflow, say) reach the owner through
+this mailbox. Both are answered before OAuth, authenticate with `Authorization: Bearer
+<SELF_ALERT_SECRET>`, and answer `404` while that optional secret is unset — the default.
+
+- **`POST /self-alert`** with `{"subject", "text", "source"}` (1–200 characters on one line; 1–50,000;
+  1–40 of `a-z0-9-`) sends a plain-text mail, subject `[<source>] <subject>`, to `ALLOWED_MS_UPN`
+  through Graph `/me/sendMail`, saved to Sent Items, and answers `202`. Any other field, or a broken
+  bound, is `400`; a body over 64 KB is `413`; once 20 have gone out that UTC day it is `429` and
+  nothing is sent; a Graph refusal is `502` (logged, never echoed).
+- **`POST /self-alert/heartbeat`** with `{"source", "job", "max_age_hours"}` (1–720) records that the
+  job ran (`selfalert:hb:<source>:<job>` in `OUTLOOK_KV`) and answers `204`; it sends nothing. That
+  record is the job's registration: a fifth cron, **`47 * * * *`**, lists the records hourly and, for a
+  job silent longer than its `max_age_hours`, sends one self-alert (source `self-alert-watchdog`) per
+  lapse, not one per hour; the job's next heartbeat re-arms it. A job that never sent a heartbeat is
+  not watched; deleting a retired job's key stops the watching.
 
 ### Setting it up from scratch
 

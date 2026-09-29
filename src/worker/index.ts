@@ -3,7 +3,9 @@
 // over MCP Streamable HTTP and gated by OAuth, plus the three things only a
 // hosted server can do — receive Graph change notifications, keep their
 // subscription alive on a schedule, and hand out short-lived authenticated
-// links to attachment bytes it cannot save to disk.
+// links to attachment bytes it cannot save to disk. The opt-in self-alert
+// routes (core/self-alert.js) are answered before OAuthProvider sees the
+// request: they carry their own shared secret, and are 404 unless it is set.
 //
 // OAuthProvider owns the whole authorization-server surface — discovery
 // metadata, dynamic client registration, PKCE, the token endpoint, bearer
@@ -21,24 +23,16 @@ import { mcpHandler } from "./mcp-handler.js";
 import { keepSubscriptionAlive, publicBaseUrl } from "./notifications.js";
 import { draftMorningBrief, reconcileFilingCorrections } from "./llm.js";
 import { runWorkerHealthCheck } from "./health.js";
-import { torontoHourOf } from "../core/auto-filing.js";
+import { handleSelfAlert, isSelfAlertPath, runWorkerSelfAlertWatchdog } from "./self-alert.js";
+import { scheduledJobFor } from "../core/schedule.js";
 import type { Env } from "./env.js";
+
+// The schedule constants (which must match wrangler.jsonc) and the tick →
+// job dispatch live in core/schedule.js, where the offline tier can test them.
+export { DIGEST_HOUR_TORONTO, HEALTH_CRON, SELF_ALERT_WATCHDOG_CRON } from "../core/schedule.js";
 
 /** The only scope this server issues; the mailbox permissions are fixed at consent time. */
 const SCOPES_SUPPORTED = ["outlook"];
-
-/** The hour, America/Toronto, at which the morning brief is drafted. */
-export const DIGEST_HOUR_TORONTO = 7;
-
-/**
- * The daily health-check schedule (must match wrangler.jsonc). 13:37 UTC is
- * 09:37 Toronto in EDT and 08:37 in EST — always morning for the owner, after
- * the digest, and colliding with neither the 6-hourly upkeep ticks (minute 17
- * of hours 5/11/17/23 UTC) nor the digest ticks (11:00 and 12:00 UTC). This
- * one is dispatched on the cron expression rather than the local hour, since
- * unlike the digest it has no wall-clock meaning to preserve across DST.
- */
-export const HEALTH_CRON = "37 13 * * *";
 
 /**
  * Both protected surfaces behind one handler: the MCP endpoint itself, and the
@@ -97,19 +91,29 @@ function providerFor(request: Request, env: Env): OAuthProvider<Env> {
 }
 
 export default {
-  fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
-    providerFor(request, env).fetch(request, env, ctx),
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Shared-secret routes, not OAuth ones: answered before the provider, which
+    // would otherwise hand them to defaultHandler. 404 unless SELF_ALERT_SECRET
+    // is set.
+    if (isSelfAlertPath(new URL(request.url).pathname)) return handleSelfAlert(request, env);
+    return providerFor(request, env).fetch(request, env, ctx);
+  },
 
   /**
-   * Cron triggers (see `triggers.crons` in wrangler.jsonc). Three jobs share
-   * the handler: the daily health check is dispatched on its exact cron
-   * expression, and the remaining ticks are told apart by the hour
-   * America/Toronto is actually on:
+   * Cron triggers (see `triggers.crons` in wrangler.jsonc). Four jobs share
+   * the handler, dispatched by scheduledJobFor (core/schedule.js): the health
+   * check and the self-alert watchdog on their exact cron expressions, first,
+   * and the remaining ticks by the hour America/Toronto is actually on:
    *
-   *  - The health check, daily at 13:37 UTC (see HEALTH_CRON above). Verifies
+   *  - The health check, daily at 13:37 UTC (HEALTH_CRON). Verifies
    *    KV, a forced token rotation, the Graph subscription and the two LLM
    *    error counters; healthy runs write a heartbeat, failing ones also leave
    *    an unsent alert draft in the inbox.
+   *  - The self-alert watchdog, hourly at minute 47 (SELF_ALERT_WATCHDOG_CRON).
+   *    Emails the owner once when a job that registered a heartbeat has gone
+   *    quiet for longer than it asked. Does nothing unless SELF_ALERT_SECRET is
+   *    set. One of its 11:47/12:47 UTC ticks falls in Toronto's 07:00 hour,
+   *    which is why it is dispatched before the hour check below.
    *  - Subscription upkeep, every 6 hours. Mail subscriptions expire after ~2.9
    *    days and Graph drops them silently, so this runs far more often than
    *    that and creates, renews or leaves the subscription alone as needed.
@@ -125,9 +129,9 @@ export default {
    * on the next tick anyway — so everything is logged instead.
    */
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const hour = torontoHourOf(new Date(event.scheduledTime));
+    const job = scheduledJobFor(event.cron, new Date(event.scheduledTime));
 
-    if (event.cron === HEALTH_CRON) {
+    if (job === "health") {
       ctx.waitUntil(
         runWorkerHealthCheck(env).then(
           (report) =>
@@ -142,7 +146,28 @@ export default {
       return;
     }
 
-    if (hour === DIGEST_HOUR_TORONTO) {
+    if (job === "self-alert-watchdog") {
+      ctx.waitUntil(
+        runWorkerSelfAlertWatchdog(env).then(
+          (result) => {
+            if (!result.enabled) return; // off: stay quiet every hour
+            console.log(
+              `Cron ${event.cron}: self-alert watchdog — ${result.watched} watched, ` +
+                `${result.stale} stale, ${result.alerted.length} alerted` +
+                (result.alerted.length ? ` (${result.alerted.join(", ")})` : "") +
+                "."
+            );
+            for (const problem of result.problems) {
+              console.error(`Cron ${event.cron}: self-alert watchdog: ${problem}`);
+            }
+          },
+          (err) => console.error(`Cron ${event.cron}: self-alert watchdog failed: ${String(err)}`)
+        )
+      );
+      return;
+    }
+
+    if (job === "digest") {
       ctx.waitUntil(
         draftMorningBrief(env).then(
           (outcome) => console.log(`Cron ${event.cron}: morning brief — ${outcome.reason}.`),

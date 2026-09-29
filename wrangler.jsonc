@@ -7,7 +7,10 @@
   // node:async_hooks, which nodejs_compat provides on workerd.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // Two jobs, told apart in the scheduled handler by the America/Toronto hour:
+  // The jobs below share one scheduled handler (scheduledJobFor in
+  // src/core/schedule.ts): the health check and the self-alert watchdog are
+  // dispatched on their exact cron expressions, first; the rest are told apart
+  // by the America/Toronto hour:
   //
   //  "17 */6 * * *"  Keeps the Graph change-notification subscription alive.
   //                  Mail subscriptions expire after at most 4230 minutes
@@ -25,15 +28,28 @@
   //                  default deployment these two ticks read one KV key and
   //                  return.
   //
-  //  "37 13 * * *"   The daily health check (HEALTH_CRON in src/worker/index.ts,
+  //  "37 13 * * *"   The daily health check (HEALTH_CRON in src/core/schedule.ts,
   //                  dispatched on the cron expression itself). 13:37 UTC is
   //                  09:37/08:37 America/Toronto across DST — morning for the
   //                  owner, after the digest, and colliding with none of the
   //                  ticks above. Healthy runs write the health:last heartbeat
   //                  to KV; any failing check also leaves an UNSENT alert
-  //                  draft in the inbox (never sent — send_draft, driven by a
-  //                  human, remains the only send path in this server).
-  "triggers": { "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *"] },
+  //                  draft in the inbox (never sent — the health check only
+  //                  ever drafts).
+  //
+  //  "47 * * * *"    The self-alert heartbeat watchdog (SELF_ALERT_WATCHDOG_CRON
+  //                  in src/core/schedule.ts), hourly at a minute no other tick
+  //                  uses. Dispatched on the cron expression, before the hour
+  //                  check: one of its 11:47/12:47 UTC ticks (which, depends
+  //                  on DST) falls in Toronto's 07:00 hour and would otherwise
+  //                  be taken for the digest.
+  //                  Inert unless SELF_ALERT_SECRET is set and a job has sent
+  //                  a heartbeat; a job silent for longer than the
+  //                  max_age_hours it registered gets one self-alert to the
+  //                  owner per lapse, counted against the daily cap.
+  "triggers": {
+    "crons": ["17 */6 * * *", "0 11 * * *", "0 12 * * *", "37 13 * * *", "47 * * * *"]
+  },
   // PUBLIC_BASE_URL — the public origin of this Worker — is deliberately NOT a
   // `vars` entry here: the hostname names the owner's account and this file is
   // public. It lives in the gitignored .env, and `npm run deploy`
@@ -59,6 +75,12 @@
   //                      Both ship DISABLED — see manage_auto_filing and the
   //                      README's cost section. Local `wrangler dev` runs read
   //                      it from the gitignored .dev.vars instead.
+  //   SELF_ALERT_SECRET  OPTIONAL. Bearer secret for POST /self-alert and
+  //                      POST /self-alert/heartbeat (core/self-alert.ts), at
+  //                      least 32 characters — e.g. `openssl rand -hex 32`.
+  //                      Unset, both routes answer 404 and the watchdog cron
+  //                      does nothing. Alerts go only to ALLOWED_MS_UPN, at
+  //                      most 20 per UTC day.
   //
   // ALLOW_DIRECT_AUTHORIZE ("true" enables POST /authorize with a caller-held
   // Microsoft access token) is deliberately NOT set here and NOT a deployed
