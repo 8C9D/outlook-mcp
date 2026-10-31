@@ -575,16 +575,15 @@ model. The brief is never sent, and the digest never deletes anything.
 ### What it costs
 
 The model is `claude-haiku-5-5` ($0.10 per million input tokens, $0.50 per million output), at low
-effort. A classification is a small prompt and a tiny answer. These figures are estimates scaled from
-what Haiku 4.5 measured on this mailbox (783 input and ~50 output tokens), allowing for Haiku 5.5
-counting the same text as about 30% more tokens: **about $0.00015 per message**, and a digest at
-roughly **$0.0007 per day**.
+effort. A classification is a small prompt and a short answer, though thinking counts as output —
+one measured message took **1,067 input and 273 output tokens, about $0.00024**. That is a single
+sample, so treat these as estimates. A digest is roughly **$0.001 per day**.
 
 | If you get | Auto-filing | Digest | Total |
 | --- | --- | --- | --- |
-| 30 messages/day | ~$0.14/month | ~$0.02/month | **~$0.16/month** |
-| 60 messages/day | ~$0.27/month | ~$0.02/month | **~$0.29/month** |
-| the 200/day cap, every day | ~$0.90/month | ~$0.02/month | **~$0.92/month** |
+| 30 messages/day | ~$0.22/month | ~$0.03/month | **~$0.25/month** |
+| 60 messages/day | ~$0.44/month | ~$0.03/month | **~$0.47/month** |
+| the 200/day cap, every day | ~$1.46/month | ~$0.03/month | **~$1.49/month** |
 
 The daily cap is the ceiling, not an estimate: **200 API calls per America/Toronto day by default**,
 counted across both features. Once it is reached everything is skipped and logged until midnight, so a
