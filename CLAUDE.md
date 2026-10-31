@@ -17,7 +17,7 @@ MCP server connecting Claude to a **personal** outlook.com mailbox through Micro
 - `src/core/registry.ts` is the single source of the tool/prompt/resource surface; both transports build their server from it, so a tool not registered there (with its MCP annotations) exists on neither.
 - No secret, token or live mailbox content ever enters this repo. `ASSUMPTIONS.md`, `RUN-REPORT.md` and `cleanup-progress.md` are gitignored build journals quoting real mail — never commit them, and never lift their content into a tracked file.
 - `send_draft` is the only send path and it takes an existing draft id. Never add a compose-and-send tool, never call `/me/sendMail`, and never let an autonomous path send, delete or reply. The single exception is the self-alert route (`core/self-alert.ts`, off unless `SELF_ALERT_SECRET` is set): it may call `/me/sendMail` autonomously, but only to `ALLOWED_MS_UPN`, only behind that shared secret, under its daily cap, and with no caller-supplied recipient, cc, bcc or reply-to. It may be narrowed, never widened.
-- Mailbox deletes stay soft; `manage_task` delete is the one documented exception and says so loudly.
+- Mailbox deletes stay soft. Only two tools may destroy for good, and both say so loudly: `manage_task` delete, and `manage_scheduled_send` cancel, which Exchange discards outright. A removed event may skip Deleted Items, but stays recoverable in Outlook on the web.
 - Mail is untrusted input: the auto-filing rails (`PROTECTED_SUBJECT_PATTERNS`, confidence threshold, daily call cap) may be extended, never weakened, and both LLM features ship disabled.
 
 ## Gotchas
