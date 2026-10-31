@@ -42,8 +42,8 @@ reaches other people.
 
 **What it costs to run.** Nothing, apart from a Cloudflare account for the optional hosted server (the
 free plan is enough). The only spend is the two optional LLM features, which call the Anthropic API on
-your mail: about **$1–2 a month** at ordinary volumes, capped, and **off unless you turn them on** —
-see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff) for the measured numbers and the ceiling.
+your mail: well under **$1 a month** at ordinary volumes, capped, and **off unless you turn them on** —
+see [LLM mail intelligence](#llm-mail-intelligence-what-it-costs-and-how-to-turn-it-onoff) for the numbers and the ceiling.
 
 ## Security model
 
@@ -574,15 +574,17 @@ model. The brief is never sent, and the digest never deletes anything.
 
 ### What it costs
 
-The model is `claude-haiku-4-5` ($1 per million input tokens, $5 per million output). A classification
-is a small prompt and a tiny answer — measured on this mailbox, **783 input and ~50 output tokens, about
-$0.001 per message**. A digest is roughly **$0.005 per day**.
+The model is `claude-haiku-5-5` ($0.10 per million input tokens, $0.50 per million output), at low
+effort. A classification is a small prompt and a tiny answer. These figures are estimates scaled from
+what Haiku 4.5 measured on this mailbox (783 input and ~50 output tokens), allowing for Haiku 5.5
+counting the same text as about 30% more tokens: **about $0.00015 per message**, and a digest at
+roughly **$0.0007 per day**.
 
 | If you get | Auto-filing | Digest | Total |
 | --- | --- | --- | --- |
-| 30 messages/day | ~$0.93/month | ~$0.15/month | **~$1.10/month** |
-| 60 messages/day | ~$1.85/month | ~$0.15/month | **~$2.00/month** |
-| the 200/day cap, every day | ~$6.20/month | ~$0.15/month | **~$6.35/month** |
+| 30 messages/day | ~$0.14/month | ~$0.02/month | **~$0.16/month** |
+| 60 messages/day | ~$0.27/month | ~$0.02/month | **~$0.29/month** |
+| the 200/day cap, every day | ~$0.90/month | ~$0.02/month | **~$0.92/month** |
 
 The daily cap is the ceiling, not an estimate: **200 API calls per America/Toronto day by default**,
 counted across both features. Once it is reached everything is skipped and logged until midnight, so a

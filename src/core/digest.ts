@@ -13,7 +13,7 @@
 // explicit delimiters, the system prompt says so, and the model's only output
 // is prose that goes into a draft — it cannot name a folder, a recipient or an
 // action, because nothing here reads its answer as anything but text.
-import { AnthropicError, callAnthropic, LLM_MODEL } from "./anthropic.js";
+import { AnthropicError, callAnthropic, LLM_MODEL, replyProblem } from "./anthropic.js";
 import {
   AUDIT_CAP,
   appendAudit,
@@ -47,7 +47,7 @@ export const DIGEST_TASK_CAP = 20;
 export const DIGEST_PREVIEW_CHARS = 300;
 
 /** The brief is a few short paragraphs, not an essay. */
-export const DIGEST_MAX_TOKENS = 1200;
+export const DIGEST_MAX_TOKENS = 2048;
 
 export type DigestMail = { subject: string; from: string; receivedDateTime?: string; preview: string };
 export type DigestEvent = { subject: string; start: string; end?: string; location?: string };
@@ -195,6 +195,9 @@ export async function runDailyDigest(context: DigestContext): Promise<DigestOutc
       await recordFeatureError(context.store, "digest", detail, now());
       return log({ drafted: false, reason: detail });
     }
+
+    const problem = replyProblem(reply);
+    if (problem) return log({ drafted: false, reason: `no brief today: ${problem}` });
 
     const brief = reply.text.trim();
     if (!brief) {

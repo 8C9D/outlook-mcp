@@ -113,6 +113,8 @@ import { deleteFolderHandler } from "./tools/delete-folder.js";
 import { manageFolderHandler } from "./tools/manage-folder.js";
 import { manageContactHandler } from "./tools/manage-contact.js";
 import { plusMinutes, toGraphDateTime } from "./tools/create-event.js";
+import { CLASSIFY_MAX_TOKENS } from "./core/classifier.js";
+import { callAnthropic, replyProblem } from "./core/anthropic.js";
 import { fetchCheckingRedirects, refusedUrlReason } from "./tools/file-sources.js";
 import { UPLOAD_CHUNK_SIZE, UPLOAD_FRAGMENT_UNIT } from "./core/drive.js";
 import { refusedRuleActions } from "./core/rules-backup.js";
@@ -2882,6 +2884,65 @@ await test("o52. one request shares one token refresh, and the mail profile is m
   assert(await failing().catch((err) => String(err)) === "Error: refused", "a failure stuck");
   assert(PROFILES.mail!.includes("manage_scheduled_send"), "send_at has no cancel in this profile");
   assert(!PROFILES.mail!.includes("list_folder"), "a OneDrive tool is in the mail profile");
+});
+
+await test("o54. Haiku 5.5: the request shape, thinking blocks, and replies with no answer", async () => {
+  const sent: any[] = [];
+  const answer = (payload: unknown) => async (input: any, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init!.body)));
+    return Response.json(payload);
+  };
+  const real = globalThis.fetch;
+  try {
+    globalThis.fetch = answer({
+      model: "claude-haiku-5-5",
+      stop_reason: "end_turn",
+      usage: { input_tokens: 10, output_tokens: 5 },
+      content: [{ type: "thinking", thinking: "", signature: "s" }, { type: "text", text: "the answer" }],
+    }) as typeof fetch;
+    const reply = await callAnthropic({ apiKey: "k", system: "s", user: "u", maxTokens: CLASSIFY_MAX_TOKENS });
+    assert(reply.text === "the answer", `a thinking block broke parsing: ${reply.text}`);
+    assert(replyProblem(reply) === undefined, "a good reply was flagged");
+    const body = sent[0];
+    assert(body.model === "claude-haiku-5-5" && body.output_config?.effort === "low", JSON.stringify(body));
+    for (const field of ["temperature", "top_p", "top_k", "thinking", "fallbacks"]) {
+      assert(!(field in body), `${field} is rejected or useless on this model`);
+    }
+    assert(body.messages.at(-1).role === "user", "a prefill returns a 400 on this model");
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert(CLASSIFY_MAX_TOKENS >= 1024, "thinking counts toward this cap");
+  const blank = { text: "", model: "m", usage: { input: 1, output: 1 } };
+  assert(replyProblem({ ...blank, stopReason: "refusal" })?.includes("declined"), "a refusal went unnoticed");
+  assert(replyProblem({ ...blank, stopReason: "max_tokens" })?.includes("tokens"), "an empty cut-off went unnoticed");
+  assert(replyProblem({ ...blank, text: "partial", stopReason: "max_tokens" }) === undefined, "partial text was discarded here");
+
+  // A declined message stays where it is, and a declined brief drafts nothing.
+  const store = createMemoryStateStore("remote");
+  await writeLlmConfig(store, { filingEnabled: true, digestEnabled: true });
+  const moves: string[] = [];
+  const declined = async () => ({ ...blank, stopReason: "refusal" });
+  const outcome = await classifyAndFile("m", {
+    store, apiKey: "k", today: TODAY, now: NOW, callModel: declined,
+    mailbox: {
+      readMessage: async () => ({ id: "m", subject: "s", from: "a@b.test", bodyPreview: "p", categories: [] }),
+      listFilingFolders: async () => [{ id: "f", displayName: "F" }],
+      listCategories: async () => [],
+      move: async (id: string) => { moves.push(id); return "n"; },
+      categorize: async () => undefined,
+    } as any,
+  });
+  assert(outcome.action === "none" && moves.length === 0 && outcome.reason.includes("declined"), JSON.stringify(outcome));
+  const brief = await runDailyDigest({
+    store, apiKey: "k", today: TODAY, now: NOW, callModel: declined,
+    mailbox: {
+      ownAddress: async () => "o@example.com", unreadSince: async () => [], eventsOn: async () => [], tasksDueBy: async () => [],
+      createDraft: async () => { throw new Error("a declined brief drafted"); },
+      replaceDraft: async () => null,
+    },
+  });
+  assert(!brief.drafted && brief.reason.includes("declined"), JSON.stringify(brief));
 });
 
 await test("o53. read_message lists inline-only attachments, and manage_contact reads the photo before writing", async () => {

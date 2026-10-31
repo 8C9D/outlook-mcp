@@ -18,13 +18,21 @@ const API_VERSION = "2023-06-01";
 /**
  * The model both features use: the cheapest current Haiku, chosen because
  * classification and a one-paragraph brief are exactly what it is good at and
- * the workload is per-message. Input $1 / output $5 per million tokens.
+ * the workload is per-message. Input $0.10 / output $0.50 per million tokens.
  *
  * Recorded here as the canonical alias rather than a dated snapshot id. Test
  * v9e sends the real classification prompt to this model id, so a rename or a
  * retirement fails the suite rather than surfacing as a runtime error.
  */
-export const LLM_MODEL = "claude-haiku-4-5";
+export const LLM_MODEL = "claude-haiku-5-5";
+
+/**
+ * How hard the model thinks before answering. Haiku 5.5 thinks by default, and
+ * thinking counts toward max_tokens, so this and the callers' caps move
+ * together: both jobs are short and neither repays more. Older Haikus reject
+ * the parameter, so it goes if LLM_MODEL ever moves back.
+ */
+const EFFORT = "low";
 
 /** A non-2xx answer from the Anthropic API. Never carries the API key. */
 export class AnthropicError extends Error {
@@ -85,6 +93,7 @@ export async function callAnthropic(request: AnthropicRequest): Promise<Anthropi
   const body = JSON.stringify({
     model,
     max_tokens: request.maxTokens,
+    output_config: { effort: EFFORT },
     system: request.system,
     messages: [{ role: "user", content: request.user }],
   });
@@ -128,6 +137,19 @@ export async function callAnthropic(request: AnthropicRequest): Promise<Anthropi
     },
     stopReason: payload?.stop_reason ?? null,
   };
+}
+
+/**
+ * Why a successful reply holds no usable answer, or undefined when it does. A
+ * safety decline is an HTTP 200 with no text, and thinking can use up the token
+ * cap before any text is written; left alone, both read as a malformed answer.
+ */
+export function replyProblem(reply: AnthropicReply): string | undefined {
+  if (reply.stopReason === "refusal") return "the model declined this message";
+  if (reply.stopReason === "max_tokens" && !reply.text.trim()) {
+    return "the model ran out of tokens before answering";
+  }
+  return undefined;
 }
 
 /** Anthropic's error message, trimmed to something safe to store in an audit log. */

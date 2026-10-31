@@ -27,7 +27,7 @@
 // reason, so a prompt-injection attempt is visible in get_auto_filing_log
 // rather than silent.
 // ---------------------------------------------------------------------------
-import { AnthropicError, callAnthropic, LLM_MODEL } from "./anthropic.js";
+import { AnthropicError, callAnthropic, LLM_MODEL, replyProblem } from "./anthropic.js";
 import {
   appendAudit,
   auditSubject,
@@ -98,7 +98,7 @@ export const BODY_CHAR_LIMIT = 2000;
 export const SUBJECT_CHAR_LIMIT = 300;
 
 /** The model needs a few dozen tokens for the JSON; this is a hard ceiling. */
-export const CLASSIFY_MAX_TOKENS = 300;
+export const CLASSIFY_MAX_TOKENS = 1024;
 
 /** The sentinel the model returns when nothing fits. Always in the allowlist. */
 export const NO_FOLDER = "(none)";
@@ -265,7 +265,6 @@ export async function classifyAndFile(
       return log({ action: "none", reason: detail }, { subject, model: LLM_MODEL });
     }
 
-    const decision = parseDecision(reply.text, folders, categories, config.threshold);
     const audit: Partial<AuditEntry> = {
       subject,
       ...(sender ? { sender } : {}),
@@ -273,6 +272,10 @@ export async function classifyAndFile(
       usage: reply.usage,
       source: "llm",
     };
+    const problem = replyProblem(reply);
+    if (problem) return log({ action: "none", reason: `no action: ${problem}` }, audit);
+
+    const decision = parseDecision(reply.text, folders, categories, config.threshold);
 
     if (!decision.ok) {
       return log({ action: "none", reason: decision.reason, confidence: decision.confidence }, audit);

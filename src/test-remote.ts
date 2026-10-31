@@ -1327,7 +1327,7 @@ await testAuthed("r25. end-to-end: auto-filing classifies a notified message, th
         (decision.folder ? ` → ${decision.folder}` : "") +
         ` (confidence ${decision.confidence ?? "n/a"}, model ${decision.model}): ${decision.reason}`
     );
-    assert(decision.model?.startsWith("claude-haiku-4-5"), `unexpected model: ${decision.model}`);
+    assert(decision.model?.startsWith("claude-haiku-5-5"), `unexpected model: ${decision.model}`);
     assert(
       (decision.usage?.output ?? 0) > 0,
       `the audit entry records no token usage: ${JSON.stringify(decision)}`
