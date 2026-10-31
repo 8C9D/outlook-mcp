@@ -106,9 +106,12 @@ export function handleNotifications(
  * heals itself the moment the connector is used rather than waiting for the
  * next scheduled run.
  */
-export async function keepSubscriptionAlive(env: Env): Promise<EnsureResult> {
+export async function keepSubscriptionAlive(
+  env: Env,
+  options: { verify?: boolean } = {}
+): Promise<EnsureResult> {
   const result = await runWithTokenProvider(mailboxTokenProvider(env), () =>
-    ensureMailSubscription(kvStateStore(env), notificationUrl(env))
+    ensureMailSubscription(kvStateStore(env), notificationUrl(env), options)
   );
   if (result.action !== "kept") {
     console.log(`Mail subscription ${result.action}: ${result.detail}`);

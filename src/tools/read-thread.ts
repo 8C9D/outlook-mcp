@@ -4,7 +4,7 @@ import {
   TZ_PREFER,
   ToolResult,
   escapeODataString,
-  fetchPaged,
+  fetchPagedWithInfo,
   formatLocal,
   formatSender,
   runTool,
@@ -33,6 +33,9 @@ export const readThreadDescription =
   "Read an email conversation (thread) oldest-to-newest as plain text, given a conversation id from search_mail. Each message shows sender, datetime (America/Toronto), and body text with quoted-reply tails trimmed. Long bodies are truncated at 2000 characters.";
 
 const BODY_LIMIT = 2000;
+
+/** How far an unordered read goes to find a long thread's newest messages. */
+const THREAD_SCAN_CAP = 200;
 
 /**
  * Trim quoted-reply tails at well-known delimiters. Conservative: only trims on
@@ -72,29 +75,26 @@ export async function readThreadHandler(
     };
     const base = `/me/messages?$filter=${filter}&$select=${select}&$top=${Math.min(max_messages, 50)}`;
 
-    let messages: any[];
-    let sortedByGraph = false;
+    // Newest first from Graph, so a cap costs the oldest messages, not the ones
+    // the reader came for. The answer is put back in reading order below.
+    let page: { items: any[]; truncated: boolean };
     try {
-      messages = await fetchPaged(
-        `${base}&$orderby=receivedDateTime`,
-        max_messages,
-        headers
-      );
-      sortedByGraph = true;
+      page = await fetchPagedWithInfo(`${base}&$orderby=receivedDateTime%20desc`, max_messages, headers);
     } catch (err) {
-      // Graph often rejects $filter+$orderby on messages (InefficientFilter);
-      // fall back to unordered fetch and sort locally.
+      // Graph often rejects $filter+$orderby on messages (InefficientFilter).
+      // Unordered, a cap would keep an arbitrary subset, so read far enough to
+      // find the newest and sort locally.
       if (err instanceof GraphError && /InefficientFilter/i.test(err.body)) {
-        messages = await fetchPaged(base, max_messages, headers);
+        page = await fetchPagedWithInfo(base, Math.max(max_messages, THREAD_SCAN_CAP), headers);
       } else {
         throw err;
       }
     }
-    if (!sortedByGraph) {
-      messages.sort((a, b) =>
-        String(a.receivedDateTime ?? "").localeCompare(String(b.receivedDateTime ?? ""))
-      );
-    }
+    const newestFirst = [...page.items].sort((a, b) =>
+      String(b.receivedDateTime ?? "").localeCompare(String(a.receivedDateTime ?? ""))
+    );
+    const messages = newestFirst.slice(0, max_messages).reverse();
+    const omitted = page.truncated || newestFirst.length > max_messages;
 
     if (messages.length === 0) {
       return textResult(`No messages found for conversation id ${conversation_id}.`);
@@ -112,8 +112,10 @@ export async function readThreadHandler(
         (body || "(empty body)")
       );
     });
-    return textResult(
-      `Thread: ${subject} (${messages.length} message(s), oldest first)\n\n` + rendered.join("\n\n")
-    );
+    const scope = omitted
+      ? `newest ${messages.length} message(s), oldest of those first; earlier messages are NOT shown` +
+        (max_messages < 100 ? " — raise max_messages to read further back" : "")
+      : `${messages.length} message(s), oldest first`;
+    return textResult(`Thread: ${subject} (${scope})\n\n` + rendered.join("\n\n"));
   });
 }

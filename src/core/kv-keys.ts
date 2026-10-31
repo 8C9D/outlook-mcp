@@ -53,6 +53,9 @@ export const STATE_LLM_AUDIT = "llm:audit";
 /** The Toronto date of the last morning brief that was drafted (idempotency). */
 export const STATE_DIGEST_LAST = "llm:digest:last";
 
+/** The id of the morning brief draft last created or rewritten by the digest. */
+export const STATE_DIGEST_DRAFT = "llm:digest:draft";
+
 /** Sender→folder filing preferences learned from the user's corrections. */
 export const STATE_LLM_PREFS = "llm:prefs";
 

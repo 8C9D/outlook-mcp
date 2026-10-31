@@ -9,7 +9,7 @@
 // previous one, so the new value MUST be written back or the connector locks
 // itself out on the following call.
 import { KV_ACCESS_TOKEN, KV_REFRESH_TOKEN } from "../core/kv-keys.js";
-import { AuthRequiredError } from "../core/token.js";
+import { AuthRequiredError, sharingInFlight } from "../core/token.js";
 import type { Env } from "./env.js";
 
 export const TOKEN_ENDPOINT = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
@@ -118,7 +118,7 @@ export async function getMailboxAccessToken(env: Env): Promise<string> {
 
 /** Build the TokenProvider the tool layer consumes for one Worker request. */
 export function mailboxTokenProvider(env: Env): () => Promise<string> {
-  return () => getMailboxAccessToken(env);
+  return sharingInFlight(() => getMailboxAccessToken(env));
 }
 
 export type GraphIdentity = {

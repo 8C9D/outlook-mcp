@@ -63,7 +63,9 @@ export async function classifyNotified(env: Env, entries: ActivityEntry[]): Prom
         apiKey: env.ANTHROPIC_API_KEY!,
         today,
       });
-      console.log(`Auto-filing ${messageId}: ${outcome.action} — ${outcome.reason}`);
+      // Not the reason: it can quote the model, and so the mail, and these logs
+      // leave the mailbox. get_auto_filing_log has it.
+      console.log(`Auto-filing ${messageId}: ${outcome.action}`);
     }
   });
 }

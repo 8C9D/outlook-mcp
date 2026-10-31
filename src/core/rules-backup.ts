@@ -9,6 +9,9 @@
 //  - Forwarding stays out: a backup carrying forward/redirect actions is
 //    detected here (forwardingRuleNames) and refused by the tool, consistent
 //    with manage_rules never offering those actions in the first place.
+//  - Deletes stay soft: rule actions pass an allowlist (refusedRuleActions), so
+//    a backup cannot install Graph's permanentDelete, or anything Graph adds
+//    later, through a differently spelled key.
 
 /** The format marker written into every export and required on import. */
 export const RULES_BACKUP_FORMAT = "outlook-mcp-rules/1";
@@ -113,6 +116,34 @@ export function forwardingRuleNames(rules: PortableRule[]): string[] {
       );
     })
     .map((rule) => rule.displayName);
+}
+
+/** The actions a restored rule may carry: everything Graph offers but forwarding and purging. */
+const IMPORTABLE_RULE_ACTIONS = new Set([
+  "assignCategories",
+  "copyToFolder",
+  "delete",
+  "markAsRead",
+  "markImportance",
+  "moveToFolder",
+  "stopProcessingRules",
+]);
+
+/** Actions Graph reports even when inert, which are harmless while they stay inert. */
+const REFUSED_WHEN_SET = new Set(["forwardTo", "forwardAsAttachmentTo", "redirectTo", "permanentDelete"]);
+
+/** `"rule": action` for every action a backup may not carry. Must be empty to import. */
+export function refusedRuleActions(rules: PortableRule[]): string[] {
+  const refused: string[] = [];
+  for (const rule of rules) {
+    for (const [action, value] of Object.entries(rule.actions ?? {})) {
+      if (IMPORTABLE_RULE_ACTIONS.has(action)) continue;
+      const inert = !value || (Array.isArray(value) && value.length === 0);
+      if (inert && REFUSED_WHEN_SET.has(action)) continue;
+      refused.push(`${JSON.stringify(rule.displayName)}: ${action}`);
+    }
+  }
+  return refused;
 }
 
 /** True when a rule's conditions match at least one thing (Graph predicate shape). */

@@ -4,7 +4,7 @@ import {
   TZ_PREFER,
   ToolResult,
   errorResult,
-  fetchPaged,
+  fetchPagedWithInfo,
   formatLocal,
   formatSender,
   runTool,
@@ -81,6 +81,10 @@ export const searchMailOutputSchema = {
   mode: z.enum(["search", "latest"]).optional().describe("How the results were produced."),
   scope: z.string().optional().describe('The folder searched, or "all folders".'),
   query: z.string().optional(),
+  possiblyIncomplete: z
+    .boolean()
+    .optional()
+    .describe("True when filters were applied to only the most relevant matches, so others may exist."),
   filters: z
     .looseObject({
       date_from: z.string().optional(),
@@ -294,10 +298,16 @@ export async function searchMailHandler(
       fetchCap = filtersActive ? Math.min(100, max_results * 3) : max_results;
       path = `${base}?$search=${encodeURIComponent(kql)}&$select=${select}&$top=${Math.min(fetchCap, 25)}`;
     }
-    const fetched = await fetchPaged(path, fetchCap, { Prefer: TZ_PREFER });
+    const { items: fetched, truncated } = await fetchPagedWithInfo(path, fetchCap, { Prefer: TZ_PREFER });
     // Belt and braces in latest mode; the real boundary enforcement in search
     // mode (KQL dates are coarse and their timezone unspecified).
     const messages = fetched.filter((m) => matchesFilters(m, filters)).slice(0, max_results);
+    // Search mode filters after fetching, so only the best matches were tested.
+    const possiblyIncomplete =
+      query !== undefined && filtersActive && truncated && messages.length < max_results;
+    const incompleteNote = possiblyIncomplete
+      ? ` Only the ${fetched.length} most relevant matches were checked against these filters, so others may exist; narrow the query or drop a filter.`
+      : "";
 
     const filterNote = [
       date_from ? `from ${date_from}` : undefined,
@@ -314,6 +324,7 @@ export async function searchMailHandler(
       mode: query === undefined ? "latest" : "search",
       scope,
       ...(query !== undefined ? { query } : {}),
+      ...(possiblyIncomplete ? { possiblyIncomplete } : {}),
       ...(filtersActive
         ? {
             filters: {
@@ -331,7 +342,7 @@ export async function searchMailHandler(
       return structuredResult(
         query === undefined
           ? `No messages in ${scope}${suffix}.`
-          : `No messages matching ${JSON.stringify(query)} in ${scope}${suffix}.`,
+          : `No messages matching ${JSON.stringify(query)} in ${scope}${suffix}.${incompleteNote}`,
         { ...structuredBase, count: 0, messages: [] }
       );
     }

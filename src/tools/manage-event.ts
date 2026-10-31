@@ -99,7 +99,7 @@ export const manageEventSchema = {
 const manageEventArgs = z.object(manageEventSchema);
 
 export const manageEventDescription =
-  "Update, cancel, respond to, or forward a calendar event, including one occurrence of a repeating event or a whole series. update covers times, subject, location, body, reminder, show_as (free/busy status), private, categories, the repeat rule — and the attendee list (replaced wholesale; changes email the people affected). respond accepts/declines/tentatives an invitation, optionally proposing a new time (proposed_start/proposed_end with tentative or decline). forward emails the event to forward_to. CAUTION — visible to other people: on events with attendees, updates and cancellations send notification emails to every attendee, responses notify the organizer, and forward emails the event to new people. Editing or cancelling an entire series notifies every attendee about all of its occurrences (and a changed repeat rule re-issues the whole series); editing one occurrence notifies them about that date only. Before calling, state the event's subject, date, whether you are touching one occurrence or the series, and what will change. cancel picks the right operation automatically: organizer with attendees → cancellation notices; organizer without attendees → the event is removed (to Deleted Items); attendee → decline.";
+  "Update, cancel, respond to, or forward a calendar event, including one occurrence of a repeating event or a whole series. update covers times, subject, location, body, reminder, show_as (free/busy status), private, categories, the repeat rule — and the attendee list (replaced wholesale; changes email the people affected). respond accepts/declines/tentatives an invitation, optionally proposing a new time (proposed_start/proposed_end with tentative or decline). forward emails the event to forward_to. CAUTION — visible to other people: on events with attendees, updates and cancellations send notification emails to every attendee, responses notify the organizer, and forward emails the event to new people. Editing or cancelling an entire series notifies every attendee about all of its occurrences (and a changed repeat rule re-issues the whole series); editing one occurrence notifies them about that date only. Before calling, state the event's subject, date, whether you are touching one occurrence or the series, and what will change. cancel picks the right operation automatically: organizer with attendees → cancellation notices; organizer without attendees → the event is deleted outright (Graph DELETE; it may not show in Deleted Items); attendee → decline.";
 
 const EVENT_SELECT =
   "subject,start,end,isAllDay,isOrganizer,attendees,organizer,type,seriesMasterId,recurrence,isReminderOn,reminderMinutesBeforeStart";
@@ -274,7 +274,7 @@ export async function manageEventHandler(
         if (event.isOrganizer) {
           await callGraphServer(base, { method: "DELETE" });
           return textResult(
-            `Event ${label} removed${scopeSuffix} (moved to Deleted Items). No attendees — no notifications sent.`
+            `Event ${label} removed${scopeSuffix} (Graph DELETE: it may not appear in Deleted Items; Outlook on the web can recover it for a limited time). No attendees — no notifications sent.`
           );
         }
         // Attendee "cancelling" = declining the invitation.

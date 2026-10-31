@@ -59,6 +59,8 @@ export type EnsureResult = {
 type GraphCall = (path: string, init?: RequestInit) => Promise<any>;
 
 export type EnsureOptions = {
+  /** Check a record that looks healthy against Graph, costing one call. */
+  verify?: boolean;
   /** Injectable clock and transport so the harness can test every branch. */
   now?: Date;
   graph?: GraphCall;
@@ -179,7 +181,15 @@ export async function ensureMailSubscription(
   const existing = await readJson<SubscriptionRecord>(store, STATE_SUBSCRIPTION);
   const decision = renewalDecision(existing, notificationUrl, now);
 
-  if (decision === "keep") {
+  // KV only knows what this server last did, and Graph can drop a subscription
+  // on its own. A caller with time to spare asks Graph, and a record Graph no
+  // longer holds falls through to be replaced.
+  const verifiedGone =
+    decision === "keep" &&
+    options.verify === true &&
+    !(await listLiveSubscriptions(graph, notificationUrl, now)).some((sub) => sub.id === existing!.id);
+
+  if (decision === "keep" && !verifiedGone) {
     return {
       action: "kept",
       record: existing!,

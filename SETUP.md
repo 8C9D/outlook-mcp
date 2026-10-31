@@ -159,9 +159,8 @@ printf 'PUBLIC_BASE_URL=%s\n' "https://<worker-name>.<your-subdomain>.workers.de
 Microsoft is told to deliver notifications to `PUBLIC_BASE_URL + /notifications`, so it must match
 exactly.
 
-Then set the same URL, path included, as `resourceMetadata.resource` in `src/worker/index.ts`
-(`https://…/mcp`). RFC 9728 discovery requires it to match the URL a client is given, character for
-character.
+The Worker also derives the RFC 9728 resource from it (`PUBLIC_BASE_URL + /mcp`), and discovery
+requires that to match the URL a client is given, character for character.
 
 ```bash
 npm run deploy    # prints the workers.dev URL
@@ -189,6 +188,10 @@ Notes that matter:
   it.
 - `ANTHROPIC_API_KEY` is optional and only powers the two LLM features, which **ship disabled**. See
   the README's cost section before setting it.
+- Set `CONNECT_SECRET`. It is optional, but without it a phished owner can hand over a grant (README,
+  *Who can connect a client*). Keep it in your password manager; you paste it when connecting a client:
+  `openssl rand -hex 32 | npx wrangler secret put CONNECT_SECRET`. `npm run test:remote` then needs
+  the same value in `MCP_REMOTE_CONNECT_SECRET`.
 - Run `npm run test:remote` headlessly (`MCP_REMOTE_HEADLESS=1`) and the checks that need a bearer are
   reported as SKIP; run it in a terminal and it asks you to complete a device-code sign-in.
 

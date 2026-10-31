@@ -86,6 +86,13 @@
   //                      does nothing. Alerts go only to ALLOWED_MS_UPN, at
   //                      most 20 per UTC day.
   //
+  //   CONNECT_SECRET     OPTIONAL. Asked for in the browser before a client can
+  //                      start a sign-in, at least 32 characters. Unset, a phished
+  //                      owner can still hand over a grant; see
+  //                      src/core/connect-guard.ts. Set it.
+  //   ALLOWED_REDIRECT_HOSTS  OPTIONAL. Comma-separated hosts a client may redirect
+  //                      to, beyond claude.ai, claude.com and loopback.
+  //
   // ALLOW_DIRECT_AUTHORIZE ("true" enables POST /authorize with a caller-held
   // Microsoft access token) is deliberately NOT set here and NOT a deployed
   // secret: production only authorizes through the interactive device-code

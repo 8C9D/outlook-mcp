@@ -1,6 +1,15 @@
 import { z } from "zod";
 import { callGraphServer } from "../core/graph.js";
-import { TIMEZONE, ToolInputError, ToolResult, errorResult, runTool, textResult } from "./common.js";
+import {
+  TIMEZONE,
+  ToolInputError,
+  ToolResult,
+  errorResult,
+  runTool,
+  textResult,
+  torontoInstantUtc,
+  torontoWallClock,
+} from "./common.js";
 import { addDays } from "./list-events.js";
 import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
 import { resolveCategoryNames } from "./manage-categories.js";
@@ -211,7 +220,12 @@ const OFFSET_RE = /(Z|[+-]\d{2}:?\d{2})$/;
 
 export type GraphDateTime = { dateTime: string; timeZone: string };
 
-/** Normalize an input datetime: naive strings stay Toronto wall-clock; offset strings become UTC. */
+/**
+ * Normalize an input datetime to Toronto wall clock. An offset string is
+ * converted rather than kept in UTC, so all-day and repeat-rule logic sees the
+ * date the user meant, and a series keeps its local time across DST. The one
+ * exception is the repeated hour at fall-back, which only UTC can state exactly.
+ */
 export function toGraphDateTime(value: string): GraphDateTime | undefined {
   if (NAIVE_RE.test(value)) {
     const dateTime = value.includes("T") ? value : `${value}T00:00:00`;
@@ -220,15 +234,19 @@ export function toGraphDateTime(value: string): GraphDateTime | undefined {
   if (OFFSET_RE.test(value)) {
     const d = new Date(value);
     if (Number.isNaN(d.getTime())) return undefined;
-    return { dateTime: d.toISOString().replace(/\.\d{3}Z$/, ""), timeZone: "UTC" };
+    const wall = torontoWallClock(d);
+    const utc = d.toISOString().replace(/\.\d{3}Z$/, "");
+    return torontoInstantUtc(wall) === `${utc}Z`
+      ? { dateTime: wall, timeZone: TIMEZONE }
+      : { dateTime: utc, timeZone: "UTC" };
   }
   return undefined;
 }
 
-function plusMinutes(g: GraphDateTime, minutes: number): GraphDateTime {
-  const d = new Date(`${g.dateTime}Z`);
-  d.setUTCMinutes(d.getUTCMinutes() + minutes);
-  return { dateTime: d.toISOString().replace(/\.\d{3}Z$/, ""), timeZone: g.timeZone };
+/** Elapsed time, through the real instant: an hour after 01:30 can be 03:30. */
+export function plusMinutes(g: GraphDateTime, minutes: number): GraphDateTime {
+  const start = g.timeZone === "UTC" ? `${g.dateTime}Z` : torontoInstantUtc(g.dateTime)!;
+  return toGraphDateTime(new Date(Date.parse(start) + minutes * 60_000).toISOString())!;
 }
 
 export async function createEventHandler(

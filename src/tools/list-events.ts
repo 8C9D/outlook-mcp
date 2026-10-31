@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { TIMEZONE, TZ_PREFER, ToolResult, fetchPaged, runTool, structuredResult } from "./common.js";
+import { TIMEZONE, TZ_PREFER, ToolResult, fetchPagedWithInfo, runTool, structuredResult, torontoInstantUtc } from "./common.js";
 import { calendarBasePath, resolveCalendar } from "./list-calendars.js";
 
 export const listEventsSchema = {
@@ -45,6 +45,7 @@ export const listEventsOutputSchema = {
   timezone: z.string().optional(),
   calendar: z.string().optional(),
   query: z.string().optional().describe("The subject/location filter, when one was given."),
+  truncated: z.boolean().optional().describe("True when the window held more events than were read."),
   count: z.number().optional(),
   days: z
     .array(
@@ -98,12 +99,14 @@ export async function listEventsHandler(
     const endDate = addDays(startDate, parsed.days);
     const target = await resolveCalendar(parsed.calendar);
     const where = target ? ` in ${target.name}` : "";
-    // Naive datetime bounds are interpreted in the Prefer: outlook.timezone zone.
+    // Explicit UTC instants: calendarView reads a bound without an offset as UTC
+    // whatever Prefer says (verified live), which put evening events on the
+    // wrong day. Prefer only shapes the times in the answer.
     const path =
-      `${calendarBasePath(target)}/calendarView?startDateTime=${encodeURIComponent(`${startDate}T00:00:00`)}` +
-      `&endDateTime=${encodeURIComponent(`${endDate}T00:00:00`)}` +
+      `${calendarBasePath(target)}/calendarView?startDateTime=${encodeURIComponent(torontoInstantUtc(`${startDate}T00:00:00`)!)}` +
+      `&endDateTime=${encodeURIComponent(torontoInstantUtc(`${endDate}T00:00:00`)!)}` +
       `&$select=id,subject,start,end,location,isAllDay,organizer,type&$orderby=start/dateTime&$top=50`;
-    const fetched = await fetchPaged(path, EVENT_CAP, { Prefer: TZ_PREFER });
+    const { items: fetched, truncated } = await fetchPagedWithInfo(path, EVENT_CAP, { Prefer: TZ_PREFER });
     // The query filter is client-side: calendarView accepts no $search, and its
     // $filter support is patchy, so matching here keeps behavior predictable.
     const needle = parsed.query?.toLowerCase();
@@ -117,17 +120,22 @@ export async function listEventsHandler(
 
     const lastDay = addDays(startDate, parsed.days - 1);
     const matching = needle ? ` matching ${JSON.stringify(parsed.query)}` : "";
+    const capNote = truncated
+      ? ` Only the first ${EVENT_CAP} events in this window were read, so later ones are missing; narrow it with days or start_date.`
+      : "";
     const structuredBase = {
       startDate,
       endDate: lastDay,
       timezone: TIMEZONE,
+      ...(truncated ? { truncated } : {}),
       ...(target ? { calendar: target.name } : {}),
       ...(parsed.query !== undefined ? { query: parsed.query } : {}),
     };
     if (events.length === 0) {
       return structuredResult(
         `No events${matching} in this window (${startDate} to ${lastDay})${where}.` +
-          (needle ? " Try a wider window (days, start_date) or a shorter query." : ""),
+          (needle ? " Try a wider window (days, start_date) or a shorter query." : "") +
+          capNote,
         {
           ...structuredBase,
           count: 0,
@@ -160,7 +168,8 @@ export async function listEventsHandler(
       });
     }
     return structuredResult(
-      `Events ${startDate} to ${lastDay}${matching}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
+      `Events ${startDate} to ${lastDay}${matching}${where} (${TIMEZONE}):\n\n${sections.join("\n\n")}` +
+        (capNote ? `\n\n${capNote.trim()}` : ""),
       { ...structuredBase, count: events.length, days: structuredDays }
     );
   });

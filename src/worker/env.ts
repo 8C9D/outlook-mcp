@@ -47,4 +47,11 @@ export interface Env {
    * only to ALLOWED_MS_UPN. Never logged, never returned, never written to KV.
    */
   SELF_ALERT_SECRET?: string;
+  /**
+   * Opt-in: asked for in the browser before a sign-in starts, at least 32
+   * characters. See core/connect-guard.js for the attack it closes.
+   */
+  CONNECT_SECRET?: string;
+  /** Comma-separated hosts a client's redirect may use, beyond Claude and loopback. */
+  ALLOWED_REDIRECT_HOSTS?: string;
 }

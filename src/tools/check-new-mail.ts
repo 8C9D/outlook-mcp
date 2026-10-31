@@ -37,7 +37,7 @@ export const checkNewMailSchema = {
 const checkNewMailArgs = z.object(checkNewMailSchema);
 
 export const checkNewMailDescription =
-  "Report what has changed in a mail folder since the last time this tool was called, using a Microsoft Graph delta query. The first call (or one with reset) only establishes the starting position and lists nothing; every later call returns just the messages added, changed or removed since — no re-reading of the whole folder. Use this for \"anything new?\" follow-ups instead of re-listing the inbox with search_mail. The position advances on every successful call, so each change is reported exactly once.";
+  "Report what has changed in a mail folder since the last time this tool was called, using a Microsoft Graph delta query. The first call (or one with reset) only establishes the starting position and lists nothing; every later call returns just the messages added, changed or removed since — no re-reading of the whole folder. Use this for \"anything new?\" follow-ups instead of re-listing the inbox with search_mail. The position advances on every successful call, so each change is reported exactly once; when more changed than max_results, the rest are held and come back on the next call.";
 
 /** Delta pages are small by default; the Prefer header must ride every request. */
 const DELTA_PAGE_PREFER = "odata.maxpagesize=500";
@@ -46,7 +46,12 @@ const DELTA_SELECT = "id,subject,from,receivedDateTime,isRead";
 /** Hard stop on a first-time enumeration of a very large folder. */
 const MAX_PAGES = 200;
 
-type StoredDelta = { deltaLink: string; updatedAt: string; folder: string };
+/** How many unreported changes are held for later calls. */
+const PENDING_CAP = 500;
+
+type PendingChange = { id: string; subject?: string; from?: unknown; receivedDateTime?: string; isRead?: boolean };
+
+type StoredDelta = { deltaLink: string; updatedAt: string; folder: string; pending?: PendingChange[] };
 
 type DeltaDrain = { items: any[]; deltaLink: string; pages: number; truncated: boolean };
 
@@ -105,23 +110,40 @@ export async function checkNewMailHandler(
     }
 
     const changes = await drainDelta(stored.deltaLink);
+    const removed = changes.items.filter(isRemoved);
+    const removedIds = new Set(removed.map((item) => item.id));
+
+    // Held changes first, so the oldest are reported first. A message that
+    // changed again is one change, and one that has since gone is none.
+    const merged = new Map<string, any>();
+    for (const item of [...(stored.pending ?? []), ...changes.items.filter((i) => !isRemoved(i))]) {
+      if (!removedIds.has(item.id)) merged.set(item.id, { ...merged.get(item.id), ...item });
+    }
+    const present = [...merged.values()];
+    const shown = present.slice(0, max_results);
+    const held = present.slice(max_results, max_results + PENDING_CAP);
+    const dropped = present.length - shown.length - held.length;
+
     await writeJson(store, key, {
       deltaLink: changes.deltaLink,
       updatedAt: new Date().toISOString(),
       folder,
+      ...(held.length
+        ? {
+            pending: held.map(({ id, subject, from, receivedDateTime, isRead }) => ({
+              id, subject, from, receivedDateTime, isRead,
+            })),
+          }
+        : {}),
     } satisfies StoredDelta);
 
     const since = formatLocal(stored.updatedAt);
-    if (changes.items.length === 0) {
+    if (present.length === 0 && removed.length === 0) {
       return textResult(`No changes in ${folder} since ${since}.`);
     }
 
-    const removed = changes.items.filter(isRemoved);
-    const present = changes.items.filter((item) => !isRemoved(item));
-
     // A delta entry for an edited message carries only the properties that
     // changed, so anything without a subject is looked up to stay readable.
-    const shown = present.slice(0, max_results);
     for (const item of shown) {
       if (item.subject !== undefined || !item.id) continue;
       try {
@@ -147,7 +169,8 @@ export async function checkNewMailHandler(
     const header =
       `${present.length} new or changed message(s) in ${folder} since ${since}` +
       (removed.length ? `, ${removed.length} removed` : "") +
-      (present.length > shown.length ? ` (showing ${shown.length})` : "") +
+      (held.length ? ` (showing ${shown.length}; call again for the other ${held.length})` : "") +
+      (dropped > 0 ? ` (${dropped} more beyond what is held were NOT kept; use search_mail for them)` : "") +
       ":";
     return textResult(`${header}\n\n${lines.join("\n\n")}`);
   });

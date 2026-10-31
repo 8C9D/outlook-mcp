@@ -21,6 +21,14 @@ import {
 } from "./ms-token.js";
 import type { GrantProps } from "./mcp-handler.js";
 import { NOTIFICATIONS_PATH, handleNotifications } from "./notifications.js";
+import { kvStateStore } from "./state-kv.js";
+import { secretsMatch } from "../core/self-alert.js";
+import {
+  CONNECT_SECRET_MIN_LENGTH,
+  redirectAllowed,
+  redirectHost,
+  spendAnonymousWrite,
+} from "../core/connect-guard.js";
 import { VERSION } from "../core/version.js";
 
 /** Pending device-code authorizations, keyed by an unguessable flow id. */
@@ -77,17 +85,14 @@ function errorPage(title: string, detail: string, status: number): Response {
   );
 }
 
-/** Redirect an OAuth error back to the client, or render it when we cannot. */
+/**
+ * Redirect an OAuth error back to the client, or render it when we cannot. The
+ * library sets redirectTo only once it has validated the redirect URI, so an
+ * unregistered one is shown here rather than followed.
+ */
 function authorizationErrorResponse(err: AuthorizationError): Response {
-  if (!err.redirectUri) {
-    return errorPage("Authorization request rejected", `${err.code}: ${err.description}`, 400);
-  }
-  const target = new URL(err.redirectUri);
-  target.searchParams.set("error", err.code);
-  target.searchParams.set("error_description", err.description);
-  if (err.state) target.searchParams.set("state", err.state);
-  if (err.issuer) target.searchParams.set("iss", err.issuer);
-  return Response.redirect(target.toString(), 302);
+  if (err.redirectTo) return Response.redirect(err.redirectTo, 302);
+  return errorPage("Authorization request rejected", `${err.code}: ${err.description}`, 400);
 }
 
 async function startDeviceCode(env: Env): Promise<{
@@ -179,6 +184,27 @@ async function completeForIdentity(
   return { ok: true, redirectTo };
 }
 
+/** Asks for CONNECT_SECRET, posting back to the same authorization request. */
+function connectSecretPage(
+  request: Request,
+  clientName: string,
+  destination: string,
+  wrong: boolean
+): Response {
+  const action = `/authorize/begin${new URL(request.url).search}`;
+  const body = `
+<h1>Connect ${escapeHtml(clientName)} to your Outlook</h1>
+<p>${escapeHtml(clientName)}, at ${escapeHtml(destination)}, is asking for access to this mailbox.
+<strong>Only continue if you started this yourself.</strong></p>
+${wrong ? '<p class="err">That is not the secret.</p>' : ""}
+<form method="post" action="${escapeHtml(action)}">
+<p><label>Connection secret<br>
+<input type="password" name="connect_secret" autocomplete="off" autofocus required></label></p>
+<p><button type="submit">Continue to sign-in</button></p>
+</form>`;
+  return html(page("Connect to Outlook", body), wrong ? 403 : 200);
+}
+
 async function handleAuthorizeStart(request: Request, env: Env): Promise<Response> {
   let authRequest: AuthRequest;
   try {
@@ -190,6 +216,36 @@ async function handleAuthorizeStart(request: Request, env: Env): Promise<Respons
 
   const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId);
   const clientName = client?.clientName ?? authRequest.clientId;
+  const destination = redirectHost(authRequest.redirectUri);
+
+  if (!redirectAllowed(authRequest.redirectUri, env.ALLOWED_REDIRECT_HOSTS)) {
+    return errorPage(
+      "Authorization request rejected",
+      `This mailbox does not connect to ${destination}. If you did not start this yourself, ` +
+        "someone may be trying to get access to it.",
+      400
+    );
+  }
+
+  const secret = env.CONNECT_SECRET;
+  if (secret) {
+    if (secret.length < CONNECT_SECRET_MIN_LENGTH) {
+      return errorPage(
+        "Connecting is switched off",
+        `CONNECT_SECRET must be at least ${CONNECT_SECRET_MIN_LENGTH} characters.`,
+        503
+      );
+    }
+    const form = request.method === "POST" ? await request.formData().catch(() => null) : null;
+    const presented = form?.get("connect_secret");
+    if (typeof presented !== "string" || !(await secretsMatch(presented, secret))) {
+      return connectSecretPage(request, clientName, destination, form !== null);
+    }
+  }
+
+  if (!(await spendAnonymousWrite(kvStateStore(env), new Date()))) {
+    return errorPage("Too many attempts today", "Sign-ins are paused until 00:00 UTC.", 429);
+  }
 
   const device = await startDeviceCode(env);
   const flowId = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
@@ -205,8 +261,11 @@ async function handleAuthorizeStart(request: Request, env: Env): Promise<Respons
 and enter this code:</p>
 <p><code id="code">${escapeHtml(device.user_code)}</code></p>
 <p class="muted" id="status">Waiting for you to finish signing in…</p>
-<p class="muted">This grants ${escapeHtml(clientName)} access to your mail, calendar, contacts and
-tasks. Only this mailbox's own account can complete this step. The code expires in 15 minutes.</p>
+<p class="muted">This grants ${escapeHtml(clientName)}, at ${escapeHtml(destination)}, access to your
+mail, calendar, contacts and tasks. Only this mailbox's own account can complete this step. The code
+expires in 15 minutes.</p>
+<p><strong>Only continue if you started this yourself.</strong> If someone sent you this page or a
+code, close it: finishing would give them your mailbox.</p>
 <script>
 const flow = ${JSON.stringify(flowId)};
 const status = document.getElementById("status");
@@ -274,6 +333,10 @@ async function handleAuthorizeDirect(request: Request, env: Env): Promise<Respon
     throw err;
   }
 
+  if (!redirectAllowed(authRequest.redirectUri, env.ALLOWED_REDIRECT_HOSTS)) {
+    return json({ status: "failed", detail: "That redirect host is not allowed." }, 400);
+  }
+
   const form = await request.formData().catch(() => null);
   const msAccessToken = form?.get("ms_access_token");
   if (typeof msAccessToken !== "string" || msAccessToken.length === 0) {
@@ -308,6 +371,9 @@ export const defaultHandler = {
         return handleAuthorizeDirect(request, env);
       }
       return new Response("Method not allowed", { status: 405 });
+    }
+    if (url.pathname === "/authorize/begin" && request.method === "POST") {
+      return handleAuthorizeStart(request, env);
     }
     if (url.pathname === "/authorize/poll" && request.method === "GET") {
       return handleAuthorizePoll(request, env);

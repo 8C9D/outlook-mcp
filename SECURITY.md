@@ -33,7 +33,8 @@ The full reasoning lives in the README's
   constant time; the recipient is always `ALLOWED_MS_UPN`,
   with no recipient, cc, bcc or reply-to field in the request and unknown
   fields refused; and it stops at 20 mails per UTC day.
-- **Mailbox deletes are soft** (Deleted Items, recoverable). The one
+- **Mailbox deletes are soft** (recoverable from Deleted Items, or from Outlook
+  on the web for a removed event). The one
   irreversible operation is `manage_task` delete, which says so in its
   description; per-call approval prompts are the intended backstop for all
   destructive tools.
@@ -44,13 +45,21 @@ The full reasoning lives in the README's
   reaches `/mcp`; only one Microsoft identity (matched on the Graph `/me` id or
   UPN captured at setup) can complete authorization, and the non-interactive
   `POST /authorize` path is refused in production.
-- **`/notifications` is the one public route, and it is write-only and
-  content-free.** Deliveries must carry the subscription's random
-  `clientState`; forged deliveries are discarded, the route never echoes stored
-  state, and it answers `202` either way.
+- **Connecting a client is guarded twice.** The Microsoft sign-in proves who the
+  owner is, not who started the connection, so on its own it can be phished.
+  Authorization codes go only to Claude or to loopback, and the opt-in
+  `CONNECT_SECRET` is asked for before any sign-in starts, which is what stops
+  an attacker relaying a code from their own browser. Without that secret, the
+  relay is limited only by the owner reading the warning on the page.
+- **Anonymous routes reach no mailbox content.** `/notifications`, `/oauth/register`,
+  `/oauth/token`, `/authorize` and its `begin` and `poll` steps are open. Deliveries
+  to `/notifications` must carry the subscription's random `clientState`; forged
+  deliveries are discarded, and it answers `202` either way. Registering a client
+  and starting a sign-in share a small daily allowance, because KV writes are
+  capped and a mailbox token that cannot be saved is lost.
 - **The autonomous LLM path (auto-filing) cannot send, delete or reply —
   structurally.** The classifier imports no Graph transport and reaches only a
-  five-method read/move/categorize interface with Deleted Items and Junk Email
+  read/move/categorize interface with Deleted Items and Junk Email
   removed from its folder allowlist; a test walks the import graph and fails if
   that ever stops being true. Both LLM features ship disabled.
 - **No secrets in the repo.** Tokens live in the local MSAL cache

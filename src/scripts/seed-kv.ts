@@ -13,6 +13,7 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { PROJECT_ROOT } from "../project-root.js";
 import { TOKEN_CACHE_PATH, installMsalTokenProvider } from "../auth.js";
+import { migrateTokenCache } from "../token-cache-format.js";
 import { callGraphServer } from "../core/graph.js";
 import { KV_ACCESS_TOKEN, KV_REFRESH_TOKEN } from "../core/kv-keys.js";
 
@@ -54,7 +55,9 @@ async function readRefreshToken(): Promise<string> {
   } catch {
     throw new Error(`No token cache at ${TOKEN_CACHE_PATH}. Run \`npm run login\` first.`);
   }
-  const cache = JSON.parse(raw) as { RefreshToken?: Record<string, { secret?: string }> };
+  const cache = JSON.parse(migrateTokenCache(raw)) as {
+    RefreshToken?: Record<string, { secret?: string }>;
+  };
   const entries = Object.values(cache.RefreshToken ?? {});
   const secret = entries[0]?.secret;
   if (!secret) {

@@ -16,3 +16,6 @@ recover_deletions.py
 # from the owner's account.
 ASSUMPTIONS.md
 RUN-REPORT.md
+# Private notes (resume context, interview talking points) that quote the
+# deployed hostname and the build journals above.
+docs/

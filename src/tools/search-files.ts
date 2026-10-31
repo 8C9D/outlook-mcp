@@ -5,7 +5,7 @@ import {
   itemDisplayPath,
   matchesTypeFilter,
 } from "../core/drive.js";
-import { ToolResult, fetchPaged, formatLocal, runTool, structuredResult } from "./common.js";
+import { ToolResult, fetchPagedWithInfo, formatLocal, runTool, structuredResult } from "./common.js";
 import { formatSize } from "./read-message.js";
 
 export const searchFilesSchema = {
@@ -37,6 +37,7 @@ const searchFilesArgs = z.object(searchFilesSchema);
 export const searchFilesOutputSchema = {
   query: z.string().optional(),
   count: z.number().optional().describe("Results returned (after the type filter)."),
+  possiblyIncomplete: z.boolean().optional().describe("True when the type filter only saw part of the results."),
   files: z
     .array(
       z.looseObject({
@@ -68,7 +69,7 @@ export async function searchFilesHandler(
     // The q value is embedded inside quotes in the URL path; encode it fully
     // and escape single quotes the OData way so a quote cannot break the call.
     const q = encodeURIComponent(query.replace(/'/g, "''"));
-    const hits = await fetchPaged(
+    const { items: hits, truncated } = await fetchPagedWithInfo(
       `/me/drive/root/search(q='${q}')?$select=${DRIVE_ITEM_SELECT}&$top=50`,
       SEARCH_FETCH_CAP
     );
@@ -77,12 +78,17 @@ export async function searchFilesHandler(
     const files = matched.map(describeDriveItem);
 
     const filterNote = type ? ` (type: ${type})` : "";
+    const possiblyIncomplete = truncated && type !== undefined && matched.length < max_results;
+    const incompleteNote = possiblyIncomplete
+      ? ` Only the first ${hits.length} results were checked for this type, so others may exist.`
+      : "";
     if (matched.length === 0) {
       return structuredResult(
         `No OneDrive items match ${JSON.stringify(query)}${filterNote}. ` +
           "Note the search index can lag a few minutes behind new or renamed files — " +
-          "list_folder sees them immediately.",
-        { query, count: 0, files: [] }
+          "list_folder sees them immediately." +
+          incompleteNote,
+        { query, count: 0, files: [], ...(possiblyIncomplete ? { possiblyIncomplete } : {}) }
       );
     }
 
@@ -98,9 +104,9 @@ export async function searchFilesHandler(
       );
     });
     return structuredResult(
-      `OneDrive search ${JSON.stringify(query)}${filterNote}: ${matched.length} result(s)\n\n` +
+      `OneDrive search ${JSON.stringify(query)}${filterNote}: ${matched.length} result(s)${incompleteNote}\n\n` +
         lines.join("\n"),
-      { query, count: files.length, files }
+      { query, count: files.length, files, ...(possiblyIncomplete ? { possiblyIncomplete } : {}) }
     );
   });
 }

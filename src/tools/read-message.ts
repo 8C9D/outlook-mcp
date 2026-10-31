@@ -171,7 +171,9 @@ export async function readMessageHandler(
     if (body.length > BODY_LIMIT) body = `${body.slice(0, BODY_LIMIT)}\n[truncated]`;
 
     let attachmentSection = "";
-    if (include_attachments_list && msg.hasAttachments) {
+    // Not gated on hasAttachments, which Graph reports false for a message
+    // whose only attachments are inline (a pasted screenshot).
+    if (include_attachments_list) {
       const atts = await callGraphServer(
         `/me/messages/${encodeURIComponent(message_id)}/attachments?$select=id,name,contentType,size,isInline`
       );
@@ -181,9 +183,7 @@ export async function readMessageHandler(
       );
       attachmentSection = lines.length
         ? `\n\nAttachments (${lines.length}):\n${lines.join("\n")}`
-        : "";
-    } else if (include_attachments_list) {
-      attachmentSection = "\n\nAttachments: none";
+        : "\n\nAttachments: none";
     }
 
     return textResult(

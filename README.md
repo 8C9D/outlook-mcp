@@ -58,8 +58,9 @@ injection). The design answers that structurally rather than by asking a model t
   `SELF_ALERT_SECRET` secret is set, requires that secret as a bearer token, always sends to
   `ALLOWED_MS_UPN` — the request has no recipient field and unknown fields are refused — and stops at
   20 mails a UTC day ([detail](#self-alerts-opt-in)).
-- **Mailbox deletes are soft.** Messages, events and contacts go to Deleted Items and stay
-  recoverable; nothing in the tool surface purges. The single exception — `manage_task` delete — is
+- **Mailbox deletes are soft.** Messages and contacts go to Deleted Items; a removed event may skip
+  that folder but stays recoverable from Outlook on the web for a limited time. Nothing in the tool
+  surface purges. The single exception — `manage_task` delete — is
   permanent because To Do has no recoverable store, and says so loudly ([detail](#soft-delete-policy)).
 - **Inbox rules cannot forward.** Rules act on all future mail with no per-message approval, so their
   action list is restricted to move, mark read and soft delete ([detail](#inbox-rules-manage_rules)).
@@ -166,7 +167,7 @@ into forty readings of the same word:
 | `export_message` | — | — | — | — |
 | `get_attachment` | — | — | — | — |
 | `create_draft` | — | — | — | — |
-| `update_draft` | — | — | **yes** | — |
+| `update_draft` | — | **yes** | **yes** | — |
 | `send_draft` | — | **yes** | — | **yes** |
 | `manage_scheduled_send` | — | **yes** | — | — |
 | `manage_message` | — | **yes** | — | — |
@@ -180,10 +181,10 @@ into forty readings of the same word:
 | `create_event` | — | — | — | **yes** |
 | `manage_event` | — | **yes** | — | **yes** |
 | `search_contacts` | **yes** | — | **yes** | — |
-| `manage_contact` | — | **yes** | — | — |
+| `manage_contact` | — | **yes** | — | **yes** |
 | `auto_reply` | — | — | **yes** | **yes** |
 | `mailbox_settings` | — | — | **yes** | — |
-| `manage_senders` | — | — | **yes** | — |
+| `manage_senders` | — | **yes** | — | — |
 | `add_attachment` | — | — | — | **yes** |
 | `manage_rules` | — | **yes** | — | — |
 | `manage_categories` | — | **yes** | — | — |
@@ -380,7 +381,9 @@ attachment operation a route that works on both.
 
 - `file_path` — a local absolute path. On the hosted server this fails with an explanation and a
   pointer to the other two sources, rather than pretending to read a filesystem it does not have.
-- `url` — an `https` link (only `https`; plaintext and `file:` URLs are refused). The server
+- `url` — a public `https` link. Plaintext, `file:` and literal local or private addresses are refused,
+  on every redirect as well as the first URL (a hostname that resolves to a private address is not
+  detected). The server
   downloads it itself, so the bytes never travel through the model. The body is read chunk by chunk
   and abandoned as soon as it passes 25 MB, so a server that lies about `Content-Length` cannot make
   the Worker buffer gigabytes. The response's own `Content-Type` names the attachment's type; the last
@@ -517,7 +520,8 @@ Two different mechanisms answer "has anything arrived?", and they are deliberate
 Graph delta queries give a folder a *position*: ask once to establish it, and every later request
 returns only what has changed since. The first call (or one with `reset: true`) walks the folder to
 record that position and reports nothing; after that each call returns just the new, changed and
-removed messages and advances the position, so **a change is reported exactly once**.
+removed messages and advances the position, so **a change is reported exactly once**. If more changed
+than `max_results`, the rest are held and come back on the next call, up to 500.
 
 The position is a `deltaLink` URL kept in a small state store: Workers KV in remote mode, and a
 gitignored `0600` file (`.mcp-state.json`) next to the token cache locally. Deleting it costs nothing
@@ -560,10 +564,13 @@ pushes there, and the digest off its cron trigger. The stdio server says so rath
 belongs in, and moves it there if the model is confident. It never creates a folder, never invents a
 category, and never touches anything but that one message.
 
-**The morning digest.** At 07:00 America/Toronto, the Worker assembles overnight unread mail, the day's
-calendar and tasks due within three days, asks for one compact brief, and leaves it as a **draft**
-titled `Morning brief — <date>` addressed to you. It is never sent; you read it in Drafts and delete it,
-or send it to yourself if you want it in your inbox.
+**The morning digest.** At 07:00 America/Toronto, the Worker assembles overnight unread mail, how many
+messages the auto-filer moved out of the inbox overnight (by folder, read from its own audit log), the
+day's calendar and tasks due within three days, asks for one compact brief, and leaves it as a **draft**
+titled `Morning brief — <date>` addressed to you. Each day's brief rewrites the previous one in place,
+but only while that draft is exactly as the digest left it; if you edited, scheduled, moved, sent or
+renamed it, it is yours, and a new draft is created instead. Sign-in codes and resets never reach the
+model. The brief is never sent, and the digest never deletes anything.
 
 ### What it costs
 
@@ -729,8 +736,11 @@ hosted servers each keep their own signature.
 
 ## Soft-delete policy
 
-Every *mailbox* delete in the tool surface (messages, events, contacts) is a **soft delete**: items move
-to Deleted Items and stay recoverable, and no tool permanently purges them. OneDrive deletes follow the
+Every *mailbox* delete in the tool surface (messages, events, contacts) is a **soft delete**, and no
+tool permanently purges anything. Messages are moved to Deleted Items, never sent through Graph's
+DELETE, which on a personal account lands them in Recoverable Items where the user cannot see them.
+Contacts land in Deleted Items. An event removed with Graph DELETE may not appear there, but Outlook
+on the web can recover it for a limited time. OneDrive deletes follow the
 same rule: `manage_file` delete moves the item into the **OneDrive recycle bin** (never Graph's
 `permanentDelete`), and its description says so. The one exception is
 `manage_task` delete: Microsoft To Do has no recoverable deleted-items store, so removing a task is
@@ -908,6 +918,15 @@ result must match the `ALLOWED_MS_USER_ID` (Graph `/me` `id`) or `ALLOWED_MS_UPN
 else is refused with `403`, and no grant is issued. The check lives in one place
 (`isAllowedIdentity` in `src/worker/ms-token.ts`) and every authorization path runs through it.
 
+**Who can connect a client.** The Microsoft sign-in proves who the owner is, not who started the
+connection or where the grant ends up, so on its own it can be phished: an attacker opens `/authorize`,
+passes the owner the code, and receives the grant. Authorization codes therefore go only to
+`claude.ai`, `claude.com` and loopback (`ALLOWED_REDIRECT_HOSTS` adds more), and the sign-in page says
+where the grant is going. **Set `CONNECT_SECRET`** to close the relay as well: the page then asks for
+it before any sign-in starts, so a code cannot be obtained to pass on. Registering a client and
+starting a sign-in share an allowance of 40 KV writes a day, because anyone can call them and the
+account's quota also has to cover saving the rotated mailbox token.
+
 Identity is proved with Microsoft's **device-code flow**, not a redirect-based auth code flow: the
 Entra app registration is a public native client with no web redirect URI, and device code needs
 none, so nothing about the registration had to change. `/authorize` shows a code to enter at
@@ -1034,8 +1053,8 @@ Three things about it are worth repeating here, because getting them wrong fails
   overwrite the Worker's rotated token with an older one.
 - **Do not** set `ALLOW_DIRECT_AUTHORIZE` on the deployed Worker. Leaving it unset is what keeps the
   non-interactive authorize path disabled in production.
-- If `resourceMetadata.resource` in `src/worker/index.ts` does not exactly match the URL pasted into
-  the client (path included), RFC 9728 discovery fails; update it if the Worker is ever renamed.
+- If `PUBLIC_BASE_URL + /mcp` does not exactly match the URL pasted into the client (path included),
+  RFC 9728 discovery fails; update `PUBLIC_BASE_URL` in `.env` and redeploy if the Worker is ever renamed.
 
 ### Adding it to claude.ai as a custom connector
 

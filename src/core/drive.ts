@@ -23,7 +23,9 @@ export const LIST_FOLDER_CAP = 500;
 /** Simple-upload limit: Graph accepts single PUTs up to 4 MB; above, a session. */
 export const DRIVE_SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
 
-const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024; // multiple of 320 KiB, as Graph requires
+/** Graph requires every fragment but the last to be a multiple of 320 KiB. */
+export const UPLOAD_FRAGMENT_UNIT = 320 * 1024;
+export const UPLOAD_CHUNK_SIZE = 16 * UPLOAD_FRAGMENT_UNIT; // 5 MiB
 
 /** Fields every drive read selects; enough to describe an item fully. */
 export const DRIVE_ITEM_SELECT =
@@ -39,13 +41,13 @@ export type DrivePathResult = { ok: true; path: string } | { ok: false; message:
  * refused — a drive path names a location, it does not navigate.
  */
 export function normalizeDrivePath(raw: string): DrivePathResult {
-  const segments = raw.replace(/\\/g, "/").split("/").filter((s) => s.trim() !== "");
+  const segments = raw.replace(/\\/g, "/").split("/").map((s) => s.trim()).filter((s) => s !== "");
   for (const segment of segments) {
     if (segment === "." || segment === "..") {
       return { ok: false, message: `Path segments "." and ".." are not allowed (got: ${raw}).` };
     }
   }
-  return { ok: true, path: segments.map((s) => s.trim()).join("/") };
+  return { ok: true, path: segments.join("/") };
 }
 
 /** The folder part of a normalized path ("" for a root-level name). */

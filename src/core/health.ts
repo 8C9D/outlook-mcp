@@ -90,8 +90,9 @@ const FIX_POINTERS: Record<HealthCheckName, string> = {
     "Re-seed the mailbox credential: locally run `npm run login` (interactive sign-in), " +
     "then `npm run seed:kv` to put the fresh refresh token back into KV.",
   subscription:
-    "The inbox subscription normally heals itself — the 6-hourly upkeep cron and every " +
-    "authenticated MCP request re-create it. If it stays down, watch " +
+    "The inbox subscription normally heals itself: the 6-hourly upkeep cron checks it against " +
+    "Graph and re-creates it, and any MCP request replaces one past its stored expiry. If it " +
+    "stays down, watch " +
     "`npx wrangler tail outlook-mcp` while sending yourself a message, and check that " +
     "PUBLIC_BASE_URL still matches the deployed hostname.",
   filing_errors:
@@ -177,11 +178,19 @@ export async function runHealthCheck(deps: HealthDeps): Promise<HealthReport> {
 
   // 2. One forced refresh-token rotation, through the same machinery every
   // Graph call uses. If this breaks, the connector locks out within the hour.
+  // Not if storage just failed: a rotated token that cannot be saved is lost,
+  // and the check would cause the outage it exists to report.
   checks.push(
-    await runCheck("token_refresh", async () => {
-      await deps.refreshToken();
-      return "a forced refresh-token rotation succeeded and the new token is stored";
-    })
+    checks[0]!.ok
+      ? await runCheck("token_refresh", async () => {
+          await deps.refreshToken();
+          return "a forced refresh-token rotation succeeded and the new token is stored";
+        })
+      : {
+          name: "token_refresh",
+          ok: false,
+          detail: "not attempted: storage failed, and a rotated token could not have been saved",
+        }
   );
 
   // 3. The subscription named by the KV record must be alive in Graph with a

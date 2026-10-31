@@ -534,7 +534,15 @@ await testAuthed("r6. an interactive device-code sign-in completes authorization
   // GET /authorize starts a real device-code flow and renders the user code;
   // pull the code, the verification URL and the flow id out of the page and
   // ask the human running this suite to complete the sign-in.
-  const pageResponse = await fetch(authorizeUrl(challenge, state));
+  // A deployment with CONNECT_SECRET set asks for it first; the suite then
+  // needs it as MCP_REMOTE_CONNECT_SECRET.
+  const connectSecret = process.env.MCP_REMOTE_CONNECT_SECRET;
+  const pageResponse = connectSecret
+    ? await fetch(authorizeUrl(challenge, state).replace("/authorize?", "/authorize/begin?"), {
+        method: "POST",
+        body: new URLSearchParams({ connect_secret: connectSecret }),
+      })
+    : await fetch(authorizeUrl(challenge, state));
   const pageBody = await pageResponse.text();
   assert(pageResponse.ok, `GET /authorize failed: HTTP ${pageResponse.status} ${pageBody.slice(0, 300)}`);
   const userCode = pageBody.match(/<code id="code">([^<]+)<\/code>/)?.[1];

@@ -7,7 +7,7 @@ MCP server connecting Claude to a **personal** outlook.com mailbox through Micro
 
 - `npm run doctor` — first thing to run when anything is broken; `-- --env-only` needs no credentials.
 - `npm run test:offline` — no Graph, no KV, no secrets. The only tier CI runs.
-- `npm run test:tools` — hits the **real mailbox**, creating then sweeping `[MCP TEST]` artifacts.
+- `npm run test:tools` — hits the **real mailbox**, creating then sweeping `[MCP TEST]` artifacts. `MCP_TEST_SKIP='^g\.'` leaves out the auto-reply test, whose reply a real sender could receive mid-run.
 - `npm run test:remote` — hits the deployed Worker; needs an interactive device-code sign-in or reports the authenticated tests as SKIP. `MCP_REMOTE_URL` retargets it at another deployment.
 - `npm run seed:kv` — lifts the refresh token from the local token cache (`~/.config/outlook-mcp/token-cache.json`) into KV. Re-run **only** after `npm run login`, never routinely.
 - `./run-school.sh [server|login|verify|doctor]` — the second instance (work/school M365 account, its own client id, authority, cache and scopes). Its exports beat `.env`; the personal instance is untouched.

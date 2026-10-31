@@ -25,11 +25,14 @@ import { draftMorningBrief, reconcileFilingCorrections } from "./llm.js";
 import { runWorkerHealthCheck } from "./health.js";
 import { handleSelfAlert, isSelfAlertPath, runWorkerSelfAlertWatchdog } from "./self-alert.js";
 import { runJobsInOrder, scheduledJobsFor, type ScheduledJob } from "../core/schedule.js";
+import { spendAnonymousWrite } from "../core/connect-guard.js";
 import type { Env } from "./env.js";
+import { kvStateStore } from "./state-kv.js";
 
 // The schedule constants (which must match wrangler.jsonc) and the tick →
 // jobs dispatch live in core/schedule.js, where the offline tier can test them.
-export { DIGEST_HOUR_TORONTO, HEALTH_CRON, UPKEEP_CRON } from "../core/schedule.js";
+// They are not re-exported here: workerd reads every named export of this
+// module as a handler, and a plain value stops `wrangler dev` from booting.
 
 /** The only scope this server issues; the mailbox permissions are fixed at consent time. */
 const SCOPES_SUPPORTED = ["outlook"];
@@ -78,10 +81,10 @@ function providerFor(request: Request, env: Env): OAuthProvider<Env> {
     clientRegistrationEndpoint: "/oauth/register",
 
     scopesSupported: SCOPES_SUPPORTED,
+    requiredScopes: SCOPES_SUPPORTED,
 
     resourceMetadata: {
       resource: `${origin}/mcp`,
-      scopes_supported: SCOPES_SUPPORTED,
       bearer_methods_supported: ["header"],
       resource_name: "Outlook MCP",
     },
@@ -135,29 +138,40 @@ async function runScheduledJob(job: ScheduledJob, cron: string, env: Env): Promi
       return;
 
     case "upkeep":
-      // The auto-filer's feedback loop also reconciles on every accepted
-      // notification delivery; this tick covers quiet stretches. No-op while
-      // filing is disabled. It runs alongside the subscription upkeep, as it
-      // always has; the job settles once both have.
-      await Promise.all([
-        keepSubscriptionAlive(env).then(
-          (result) => console.log(`Cron ${cron}: mail subscription ${result.action}.`),
-          (err) => console.error(`Cron ${cron}: subscription upkeep failed: ${String(err)}`)
-        ),
-        reconcileFilingCorrections(env).catch((err) =>
-          console.error(`Cron ${cron}: correction reconcile failed: ${String(err)}`)
-        ),
-      ]);
+      // This tick is the one with time to ask Graph whether the subscription
+      // really is alive. The auto-filer's feedback loop also reconciles on every
+      // accepted notification delivery; this covers quiet stretches, and is a
+      // no-op while filing is disabled. One after the other, so the two cannot
+      // spend the same refresh token.
+      await keepSubscriptionAlive(env, { verify: true }).then(
+        (result) => console.log(`Cron ${cron}: mail subscription ${result.action}.`),
+        (err) => console.error(`Cron ${cron}: subscription upkeep failed: ${String(err)}`)
+      );
+      await reconcileFilingCorrections(env).catch((err) =>
+        console.error(`Cron ${cron}: correction reconcile failed: ${String(err)}`)
+      );
       return;
   }
 }
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const { pathname } = new URL(request.url);
     // Shared-secret routes, not OAuth ones: answered before the provider, which
     // would otherwise hand them to defaultHandler. 404 unless SELF_ALERT_SECRET
     // is set.
-    if (isSelfAlertPath(new URL(request.url).pathname)) return handleSelfAlert(request, env);
+    if (isSelfAlertPath(pathname)) return handleSelfAlert(request, env);
+    // Registration is open to anyone and writes to KV (see core/connect-guard.js).
+    if (
+      pathname === "/oauth/register" &&
+      request.method === "POST" &&
+      !(await spendAnonymousWrite(kvStateStore(env), new Date()))
+    ) {
+      return Response.json(
+        { error: "temporarily_unavailable", error_description: "Too many registrations today." },
+        { status: 429 }
+      );
+    }
     return providerFor(request, env).fetch(request, env, ctx);
   },
 
@@ -190,21 +204,21 @@ export default {
    *    owner once when a job that registered a heartbeat has gone quiet for
    *    longer than it asked. Does nothing unless SELF_ALERT_SECRET is set.
    *
-   * A tick's jobs run in order under one ctx.waitUntil (runJobsInOrder): the
-   * watchdog starts only once the upkeep or digest has settled, succeeded or
+   * A tick's jobs run in order (runJobsInOrder), awaited here rather than under
+   * ctx.waitUntil so they get a cron event's full time, not the short grace
+   * after a handler returns: the watchdog starts only once the upkeep or digest
+   * has settled, succeeded or
    * failed, so the two never refresh the rotating mailbox token at the same
    * time, and a failure in the first never stops the second. A failure must not
    * throw out of the scheduled handler — it would be retried on the next tick
    * anyway — so everything is logged instead.
    */
-  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env): Promise<void> {
     const jobs = scheduledJobsFor(event.cron, new Date(event.scheduledTime));
-    ctx.waitUntil(
-      runJobsInOrder(
-        jobs,
-        (job) => runScheduledJob(job, event.cron, env),
-        (job, err) => console.error(`Cron ${event.cron}: ${job} failed: ${String(err)}`)
-      )
+    await runJobsInOrder(
+      jobs,
+      (job) => runScheduledJob(job, event.cron, env),
+      (job, err) => console.error(`Cron ${event.cron}: ${job} failed: ${String(err)}`)
     );
   },
 } satisfies ExportedHandler<Env>;

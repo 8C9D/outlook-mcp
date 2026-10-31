@@ -92,6 +92,11 @@ async function locateFiledMessage(
   return null;
 }
 
+/** Identifies one audit entry across two reads of the ring. */
+function auditKey(entry: AuditEntry): string {
+  return `${entry.at}|${entry.messageId ?? ""}`;
+}
+
 /** True when this audit entry is a filing move the reconciler still watches. */
 function isOpenMove(entry: AuditEntry, now: Date): boolean {
   return (
@@ -125,81 +130,95 @@ export async function reconcileCorrections(context: ReconcileContext): Promise<R
     const corrections: AuditEntry[] = [];
 
     for (const entry of candidates) {
-      const message = await locateFiledMessage(context.mailbox, entry);
-      outcome.checked++;
+      try {
+        const message = await locateFiledMessage(context.mailbox, entry);
+        outcome.checked++;
 
-      if (!message) {
-        // Deleted (or its folder was) — nothing to learn from a delete.
-        entry.reconciled = "gone";
-        mutated = true;
-        continue;
-      }
-      if (message.parentFolderId === entry.folderId) {
-        // Still where the filer put it. Old enough → settled; else keep watching.
-        if (now.getTime() - Date.parse(entry.at) >= CONFIRM_AFTER_MS) {
-          entry.reconciled = "confirmed";
+        if (!message) {
+          // Deleted (or its folder was) — nothing to learn from a delete.
+          entry.reconciled = "gone";
           mutated = true;
+          continue;
         }
-        continue;
-      }
+        if (message.parentFolderId === entry.folderId) {
+          // Still where the filer put it. Old enough → settled; else keep watching.
+          if (now.getTime() - Date.parse(entry.at) >= CONFIRM_AFTER_MS) {
+            entry.reconciled = "confirmed";
+            mutated = true;
+          }
+          continue;
+        }
 
-      // The message moved. Where to, and is that a correction worth learning?
-      const target = message.parentFolderId
-        ? await context.mailbox.getFolder(message.parentFolderId)
-        : null;
-      const sender = entry.sender ?? extractAddress(message.from) ?? undefined;
-      if (!target || !sender) {
-        entry.reconciled = "gone";
+        // The message moved. Where to, and is that a correction worth learning?
+        const target = message.parentFolderId
+          ? await context.mailbox.getFolder(message.parentFolderId)
+          : null;
+        const sender = entry.sender ?? extractAddress(message.from) ?? undefined;
+        if (!target || !sender) {
+          entry.reconciled = "gone";
+          mutated = true;
+          continue;
+        }
+        if (
+          isNeverFileFolder(target.displayName) ||
+          isProtectedSubject(entry.subject ?? message.subject, context.skipPatterns ?? [])
+        ) {
+          // Deleted Items / Junk / Sent and friends are not filing choices, and a
+          // protected (OTP-and-friends) subject may never teach a preference —
+          // the compiled-in + configured skip list outranks the feedback loop.
+          entry.reconciled = "ignored";
+          mutated = true;
+          continue;
+        }
+
+        const preference = await upsertPreferenceFromCorrection(
+          context.store,
+          sender,
+          { id: target.id, name: target.displayName },
+          now
+        );
+        entry.reconciled = "corrected";
         mutated = true;
-        continue;
-      }
-      if (
-        isNeverFileFolder(target.displayName) ||
-        isProtectedSubject(entry.subject ?? message.subject, context.skipPatterns ?? [])
-      ) {
-        // Deleted Items / Junk / Sent and friends are not filing choices, and a
-        // protected (OTP-and-friends) subject may never teach a preference —
-        // the compiled-in + configured skip list outranks the feedback loop.
-        entry.reconciled = "ignored";
-        mutated = true;
-        continue;
-      }
+        outcome.corrections++;
 
-      const preference = await upsertPreferenceFromCorrection(
-        context.store,
-        sender,
-        { id: target.id, name: target.displayName },
-        now
-      );
-      entry.reconciled = "corrected";
-      mutated = true;
-      outcome.corrections++;
-
-      const leaveAlone = target.displayName.trim().toLowerCase() === "inbox";
-      corrections.push({
-        at: now.toISOString(),
-        feature: "filing",
-        action: "correction",
-        messageId: message.id,
-        subject: entry.subject,
-        sender,
-        folder: target.displayName,
-        folderId: target.id,
-        reason:
-          `you moved this out of ${entry.folder ?? "the filed folder"} to ${target.displayName}; ` +
-          (leaveAlone
-            ? `mail from ${sender} will now be left in the Inbox`
-            : `mail from ${sender} will now be filed to ${target.displayName} without a model call`) +
-          ` (correction ${preference.corrections})`,
-      });
+        const leaveAlone = target.displayName.trim().toLowerCase() === "inbox";
+        corrections.push({
+          at: now.toISOString(),
+          feature: "filing",
+          action: "correction",
+          messageId: message.id,
+          subject: entry.subject,
+          sender,
+          folder: target.displayName,
+          folderId: target.id,
+          reason:
+            `you moved this out of ${entry.folder ?? "the filed folder"} to ${target.displayName}; ` +
+            (leaveAlone
+              ? `mail from ${sender} will now be left in the Inbox`
+              : `mail from ${sender} will now be filed to ${target.displayName} without a model call`) +
+            ` (correction ${preference.corrections})`,
+        });
+      } catch {
+        // A failed read says nothing about the message: leave it open for the next
+        // pass. Only a real 404 reaches the "gone" branches above.
+      }
     }
 
     if (mutated || corrections.length > 0) {
-      // One write: the corrections newest-first on top of the mutated ring.
+      // One write: the corrections newest-first on top of the ring as it stands
+      // NOW. The reads above take a while, and a ring read before them would
+      // erase every decision the filer logged meanwhile.
+      const settled = new Map(
+        candidates.filter((entry) => entry.reconciled).map((entry) => [auditKey(entry), entry.reconciled])
+      );
+      const latest = (await readAuditLog(context.store)).map((entry) => {
+        const reconciled = settled.get(auditKey(entry));
+        return reconciled ? { ...entry, reconciled } : entry;
+      });
       await writeJson(
         context.store,
         STATE_LLM_AUDIT,
-        [...corrections.reverse(), ...audit].slice(0, AUDIT_CAP)
+        [...corrections.reverse(), ...latest].slice(0, AUDIT_CAP)
       );
     }
   } catch {

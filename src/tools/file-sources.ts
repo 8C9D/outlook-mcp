@@ -114,6 +114,65 @@ export async function prepareFileSource(
   };
 }
 
+/** How many redirects one download may follow. */
+const MAX_REDIRECTS = 5;
+
+/** A literal local or private address. DNS names that resolve to one are not detected. */
+function isPrivateHost(rawHost: string): boolean {
+  const host = rawHost.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || /\.(localhost|local|internal)$/.test(host)) return true;
+  const ipv4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(host);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    return (
+      a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+  return host.includes(":") && (host === "::" || host === "::1" || /^(f[cd]|fe[89ab]|::ffff:)/.test(host));
+}
+
+/** Why this URL may not be fetched, or undefined when it may. */
+export function refusedUrlReason(url: URL): string | undefined {
+  if (url.protocol !== "https:") {
+    return `url must be https:// (got ${url.protocol}//). Plaintext and local-file URLs are refused.`;
+  }
+  if (isPrivateHost(url.hostname)) {
+    return `${url.hostname} is a local or private address, which url sources refuse.`;
+  }
+  return undefined;
+}
+
+/**
+ * fetch, following redirects by hand: redirect "follow" would apply the https
+ * and private-address rules to the first URL only, so any public page could
+ * bounce the download to plaintext or to this machine.
+ */
+export async function fetchCheckingRedirects(start: URL): Promise<Response> {
+  let current = start;
+  for (let hop = 0; ; hop++) {
+    const response = await fetch(current, { redirect: "manual" });
+    const location = response.headers.get("location");
+    if (response.status < 300 || response.status >= 400 || !location) return response;
+    if (hop >= MAX_REDIRECTS) {
+      throw new SourceReadError(`Gave up on ${start.href} after ${MAX_REDIRECTS} redirects.`);
+    }
+    await response.body?.cancel();
+    let next: URL;
+    try {
+      next = new URL(location, current);
+    } catch {
+      throw new SourceReadError(`${current.href} redirects to an invalid URL.`);
+    }
+    const refused = refusedUrlReason(next);
+    if (refused) throw new SourceReadError(`${current.href} redirects to ${next.href}: ${refused}`);
+    current = next;
+  }
+}
+
 /**
  * Download the URL, refusing anything over the cap. The body is read chunk by
  * chunk and abandoned the moment it grows too large, so a server that lies
@@ -129,19 +188,15 @@ export async function prepareUrlSource(
   } catch {
     return { ok: false, message: `Not a valid URL: ${rawUrl}` };
   }
-  if (url.protocol !== "https:") {
-    return {
-      ok: false,
-      message: `url must be https:// (got ${url.protocol}//). Plaintext and local-file URLs are refused.`,
-    };
-  }
+  const refused = refusedUrlReason(url);
+  if (refused) return { ok: false, message: refused };
 
   return {
     ok: true,
     source: {
       name: overrideName ?? nameFromUrl(url),
       read: async () => {
-        const response = await fetch(url, { redirect: "follow" });
+        const response = await fetchCheckingRedirects(url);
         if (!response.ok) {
           throw new SourceReadError(
             `Could not download ${url.href}: HTTP ${response.status} ${response.statusText}`

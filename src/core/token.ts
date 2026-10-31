@@ -38,6 +38,19 @@ export function runWithTokenProvider<T>(provider: TokenProvider, fn: () => T): T
   return storage.run(provider, fn);
 }
 
+/**
+ * A provider whose concurrent callers share one call, so parallel Graph reads
+ * cannot each spend the same refresh token. Scoped to one provider instance: on
+ * Workers that means one request, since a request may not await another's promise.
+ */
+export function sharingInFlight(provider: TokenProvider): TokenProvider {
+  let inFlight: Promise<string> | undefined;
+  return () =>
+    (inFlight ??= provider().finally(() => {
+      inFlight = undefined;
+    }));
+}
+
 /** Token for a server-mode Graph call. Never prompts. */
 export function getAccessTokenSilent(): Promise<string> {
   const provider = storage.getStore() ?? defaultProvider;

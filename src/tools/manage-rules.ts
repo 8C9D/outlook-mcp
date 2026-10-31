@@ -6,6 +6,7 @@ import {
   buildRulesBackup,
   diffRules,
   forwardingRuleNames,
+  refusedRuleActions,
   hasAnyCondition,
   normalizeForDiff,
   parseRulesBackup,
@@ -400,6 +401,16 @@ export async function manageRulesHandler(
             "forward/redirect actions, which this server deliberately never creates (a standing " +
             "silent forward is an exfiltration primitive). Remove those entries from the backup " +
             "JSON to import the rest."
+        );
+      }
+      // Anything else outside the actions this server stands behind, above all
+      // permanentDelete: mailbox deletes stay soft however a rule gets here.
+      const refusedActions = refusedRuleActions(parsed.backup.rules);
+      if (refusedActions.length > 0) {
+        return errorResult(
+          `Import refused: ${refusedActions.join(", ")} — this server does not restore that action. ` +
+            "Mailbox deletes stay soft, so permanentDelete is never accepted. Remove those entries " +
+            "from the backup JSON to import the rest."
         );
       }
 

@@ -12,6 +12,10 @@ name: CI
 
 on:
   push:
+  # Weekly, so a new advisory surfaces even with no push; advisories are the
+  # only input here that changes on its own.
+  schedule:
+    - cron: "23 9 * * 1"
 
 jobs:
   offline:
@@ -24,4 +28,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run build
       - run: npm run test:offline
+      # What ships to the Worker and the stdio server, not dev tooling.
+      - run: npm audit --omit=dev --audit-level=high

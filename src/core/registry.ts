@@ -294,7 +294,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: updateDraftSchema,
     // Replace semantics on every field it touches, so the same call twice
     // leaves the same draft.
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     handler: updateDraftHandler,
   },
   {
@@ -384,7 +384,7 @@ export const TOOLS: ToolDefinition[] = [
     name: "manage_contact",
     description: manageContactDescription,
     inputSchema: manageContactSchema,
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     handler: manageContactHandler,
   },
   {
@@ -431,7 +431,7 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: manageSendersSchema,
     // Blocking is undone by unblocking, and blocking an already-blocked
     // sender is the same state; the junk list never leaves the mailbox.
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     handler: manageSendersHandler,
   },
   {
@@ -605,10 +605,10 @@ export const TOOL_PROFILES: Record<string, readonly string[]> = {
     "read_thread",
     "manage_message",
     "list_folders",
-    "list_folder",
     "create_draft",
     "update_draft",
     "send_draft",
+    "manage_scheduled_send",
     "get_attachment",
     "export_message",
     "manage_rules",

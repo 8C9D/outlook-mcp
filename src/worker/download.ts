@@ -6,6 +6,7 @@
 // is answered with 401 + WWW-Authenticate, never with an attachment. The grant
 // check below is the same defence in depth mcp-handler.ts applies: a link is
 // only ever useful to the one identity this server belongs to.
+import { Buffer } from "node:buffer";
 import { DOWNLOAD_ROUTE_PREFIX, readDownload } from "../core/downloads.js";
 import type { Env } from "./env.js";
 import type { GrantProps } from "./mcp-handler.js";
@@ -43,7 +44,9 @@ export const downloadHandler = {
       return plain(404, "This download link has expired or was never issued. Call get_attachment again.");
     }
 
-    const bytes = Uint8Array.from(atob(record.base64), (c) => c.charCodeAt(0));
+    // Native, unlike a per-byte atob loop, which spends the Free plan's 10 ms of
+    // CPU on an attachment of a few hundred kilobytes.
+    const bytes = new Uint8Array(Buffer.from(record.base64, "base64"));
     return new Response(request.method === "HEAD" ? null : bytes, {
       headers: {
         "content-type": record.contentType || "application/octet-stream",

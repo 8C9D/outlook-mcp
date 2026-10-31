@@ -136,33 +136,53 @@ export async function manageContactHandler(
         : {}),
     });
 
-    /** PUT the photo bytes onto a contact; returns a line for the answer. */
-    const applyPhoto = async (contactId: string): Promise<string> => {
+    /** The photo's bytes. Read before any write, so a bad source changes nothing. */
+    const loadPhoto = async () => {
+      if (!photo_url && !photo_base64) return undefined;
       const prepared = photo_url
         ? await prepareUrlSource(photo_url, "photo")
         : prepareBase64Source(photo_base64!, "photo");
       if (!prepared.ok) throw new Error(prepared.message);
-      const { buffer, contentType } = await prepared.source.read();
-      if (buffer.length > PHOTO_MAX) {
-        throw new Error(`The photo is ${(buffer.length / 1024 / 1024).toFixed(1)} MB — Outlook caps contact photos at 4 MB.`);
+      const photo = await prepared.source.read();
+      if (photo.buffer.length > PHOTO_MAX) {
+        throw new Error(`The photo is ${(photo.buffer.length / 1024 / 1024).toFixed(1)} MB — Outlook caps contact photos at 4 MB.`);
       }
+      return photo;
+    };
+
+    /** PUT the photo onto a contact. Never throws: the contact is already saved by then. */
+    const applyPhoto = async (
+      contactId: string,
+      photo: Awaited<ReturnType<typeof loadPhoto>>
+    ): Promise<string> => {
+      if (!photo) return "";
+      const { buffer, contentType } = photo;
+      try {
+        await putPhoto(contactId, buffer, contentType);
+      } catch (err) {
+        return `\nPhoto: NOT set, though the rest was saved — ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
+      }
+      return `\nPhoto: set (${(buffer.length / 1024).toFixed(0)} KB)`;
+    };
+
+    const putPhoto = async (contactId: string, buffer: Uint8Array, contentType?: string) => {
       await callGraphServer(`/me/contacts/${encodeURIComponent(contactId)}/photo/$value`, {
         method: "PUT",
         headers: { "Content-Type": contentType ?? "image/jpeg" },
         body: new Uint8Array(buffer),
       });
-      return `Photo: set (${(buffer.length / 1024).toFixed(0)} KB)`;
     };
 
     switch (action) {
       case "create": {
         if (!args.given_name) return errorResult('Action "create" requires given_name.');
+        const photo = await loadPhoto();
         const created = await callGraphServer(`/me/contacts?$select=${SELECT}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(await fieldPatch()),
         });
-        const photoLine = photo_url || photo_base64 ? `\n${await applyPhoto(created.id)}` : "";
+        const photoLine = await applyPhoto(created.id, photo);
         return textResult(`Contact created.\n${formatContact(created)}${photoLine}`);
       }
       case "update": {
@@ -173,6 +193,7 @@ export async function manageContactHandler(
             "Nothing to update — provide at least one contact field (or a photo source)."
           );
         }
+        const photo = await loadPhoto();
         const updated = Object.keys(patch).length
           ? await callGraphServer(`/me/contacts/${encodeURIComponent(contact_id)}`, {
               method: "PATCH",
@@ -180,7 +201,7 @@ export async function manageContactHandler(
               body: JSON.stringify(patch),
             })
           : await callGraphServer(`/me/contacts/${encodeURIComponent(contact_id)}?$select=${SELECT}`);
-        const photoLine = photo_url || photo_base64 ? `\n${await applyPhoto(contact_id)}` : "";
+        const photoLine = await applyPhoto(contact_id, photo);
         const changed = [
           ...Object.keys(patch),
           ...(photo_url || photo_base64 ? ["photo"] : []),

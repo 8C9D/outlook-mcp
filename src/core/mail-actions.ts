@@ -10,7 +10,7 @@
 // Two tests hold that line: an import-graph assertion over core/classifier.js,
 // and a source scan of this file for mutating Graph verbs that do not belong.
 // Keep this module small enough that both stay easy to read.
-import { callGraphServer } from "./graph.js";
+import { GraphError, callGraphServer } from "./graph.js";
 import { isNeverFileFolder } from "./auto-filing.js";
 import type { ClassifierMailbox, FilingFolder, MailFacts } from "./classifier.js";
 
@@ -18,10 +18,20 @@ import type { ClassifierMailbox, FilingFolder, MailFacts } from "./classifier.js
 const FOLDER_CAP = 60;
 
 const MESSAGE_SELECT =
-  "id,subject,from,receivedDateTime,bodyPreview,categories,parentFolderId,conversationId";
+  "id,subject,from,receivedDateTime,bodyPreview,categories,parentFolderId,conversationId,isDraft";
 
 /** How many messages of one conversation the reconciler will ever look at. */
 const CONVERSATION_CAP = 25;
+
+/** A read that may find nothing. Only a 404 means that; anything else is a real failure. */
+async function nullIfMissing<T>(read: Promise<T>): Promise<T | null> {
+  try {
+    return await read;
+  } catch (err) {
+    if (err instanceof GraphError && err.status === 404) return null;
+    throw err;
+  }
+}
 
 function toMailFacts(message: any): MailFacts {
   const address = message?.from?.emailAddress;
@@ -39,6 +49,7 @@ function toMailFacts(message: any): MailFacts {
     categories: Array.isArray(message.categories) ? message.categories.map(String) : [],
     parentFolderId: message.parentFolderId ?? undefined,
     conversationId: message.conversationId ?? undefined,
+    isDraft: message.isDraft === true,
   };
 }
 
@@ -52,9 +63,10 @@ export function graphClassifierMailbox(): ClassifierMailbox {
       const folders: FilingFolder[] = [];
       for (const folder of top) {
         if (!folder?.id || !folder?.displayName) continue;
-        if (!isNeverFileFolder(folder.displayName)) {
-          folders.push({ id: folder.id, displayName: folder.displayName });
-        }
+        // Its whole subtree, too: a folder deleted with delete_folder sits under
+        // Deleted Items, and filing into it would be a delete by another name.
+        if (isNeverFileFolder(folder.displayName)) continue;
+        folders.push({ id: folder.id, displayName: folder.displayName });
         if (folders.length >= FOLDER_CAP) break;
         if (folder.childFolderCount > 0) {
           const children = await collect(
@@ -80,9 +92,9 @@ export function graphClassifierMailbox(): ClassifierMailbox {
     },
 
     async readMessage(messageId) {
-      const message = await callGraphServer(
-        `/me/messages/${encodeURIComponent(messageId)}?$select=${MESSAGE_SELECT}`
-      ).catch(() => null);
+      const message = await nullIfMissing(
+        callGraphServer(`/me/messages/${encodeURIComponent(messageId)}?$select=${MESSAGE_SELECT}`)
+      );
       if (!message?.id) return null;
       return toMailFacts(message);
     },
@@ -91,20 +103,30 @@ export function graphClassifierMailbox(): ClassifierMailbox {
       // A read: how the correction reconciler re-finds a filed message after
       // the user's own move minted it a new id (conversation ids are stable).
       const escaped = conversationId.replace(/'/g, "''");
-      const data = await callGraphServer(
-        `/me/messages?$filter=${encodeURIComponent(`conversationId eq '${escaped}'`)}` +
-          `&$select=${MESSAGE_SELECT}&$top=${CONVERSATION_CAP}`
-      ).catch(() => null);
+      const data = await nullIfMissing(
+        callGraphServer(
+          `/me/messages?$filter=${encodeURIComponent(`conversationId eq '${escaped}'`)}` +
+            `&$select=${MESSAGE_SELECT}&$top=${CONVERSATION_CAP}`
+        )
+      );
       return ((data?.value ?? []) as any[]).filter((m) => m?.id).map(toMailFacts);
     },
 
     async getFolder(folderId) {
       // A read: the correction reconciler uses it to name the folder a message
       // ended up in, and the preference fast path to re-validate its target.
-      const folder = await callGraphServer(
-        `/me/mailFolders/${encodeURIComponent(folderId)}?$select=id,displayName`
-      ).catch(() => null);
+      const folder = await nullIfMissing(
+        callGraphServer(`/me/mailFolders/${encodeURIComponent(folderId)}?$select=id,displayName,parentFolderId`)
+      );
       if (!folder?.id || !folder?.displayName) return null;
+      // A deleted folder keeps its id, so a stored target can quietly end up
+      // inside Deleted Items. To this path that folder no longer exists.
+      if (folder.parentFolderId) {
+        const parent = await nullIfMissing(
+          callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.parentFolderId)}?$select=displayName`)
+        );
+        if (parent?.displayName && isNeverFileFolder(parent.displayName)) return null;
+      }
       return { id: String(folder.id), displayName: String(folder.displayName) };
     },
 

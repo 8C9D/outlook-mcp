@@ -9,6 +9,7 @@ import {
   type TokenCacheContext,
 } from "@azure/msal-node";
 import { PROJECT_ROOT } from "./project-root.js";
+import { migrateTokenCache } from "./token-cache-format.js";
 import { AuthRequiredError, setDefaultTokenProvider } from "./core/token.js";
 
 export { AuthRequiredError };
@@ -81,7 +82,7 @@ function requireClientId(): string {
 const cachePlugin: ICachePlugin = {
   async beforeCacheAccess(context: TokenCacheContext): Promise<void> {
     try {
-      context.tokenCache.deserialize(await fs.readFile(TOKEN_CACHE_PATH, "utf8"));
+      context.tokenCache.deserialize(migrateTokenCache(await fs.readFile(TOKEN_CACHE_PATH, "utf8")));
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }

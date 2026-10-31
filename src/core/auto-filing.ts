@@ -7,6 +7,7 @@
 // BOTH FEATURES SHIP DISABLED. Nothing here turns itself on; the owner enables
 // them with manage_auto_filing after reading what they cost.
 import {
+  STATE_DIGEST_DRAFT,
   STATE_DIGEST_LAST,
   STATE_LLM_AUDIT,
   STATE_LLM_CONFIG,
@@ -47,9 +48,38 @@ export const PROTECTED_SUBJECT_PATTERNS = [
   "verification code",
   "your code is",
   "two-factor",
+  "two factor",
+  "two-step",
+  "2-step",
   "2fa",
+  "multi-factor",
   "reset your password",
+  "password reset",
+  "reset password",
+  "one-time code",
+  "one time code",
+  "one-time password",
+  "one time password",
+  "login code",
+  "log in code",
+  "sign-in code",
+  "sign in code",
+  "authentication code",
+  "access code",
+  "magic link",
 ];
+
+/**
+ * Wordings a substring cannot state safely: "otp" inside "hotpot", or a bare
+ * number beside "code", as in "123456 is your Instagram code".
+ */
+const PROTECTED_SUBJECT_SHAPES: { name: string; shape: RegExp }[] = [
+  { name: "otp", shape: /\b(otp|mfa)\b/ },
+  { name: "numeric code", shape: /\b\d{4,8}\b.{0,40}\bcode\b|\bcode\b.{0,20}\b\d{4,8}\b/ },
+];
+
+/** What a protected subject becomes in the audit log: the subject may BE the code. */
+export const PROTECTED_AUDIT_SUBJECT = "(protected subject)";
 
 /**
  * Folders the classifier may never move mail into, whatever the model says.
@@ -146,13 +176,35 @@ function clampDailyCap(value: unknown): number {
  * sign-in codes.
  */
 export function isProtectedSubject(subject: string | undefined, extraPatterns: string[] = []): string | null {
-  const haystack = (subject ?? "").toLowerCase();
+  // NFKC and collapsed whitespace, so a no-break space or full-width letters
+  // do not slip past a plain substring.
+  const haystack = (subject ?? "").normalize("NFKC").replace(/\s+/g, " ").toLowerCase();
   if (!haystack) return null;
   for (const pattern of [...PROTECTED_SUBJECT_PATTERNS, ...extraPatterns]) {
     const needle = pattern.trim().toLowerCase();
     if (needle && haystack.includes(needle)) return pattern;
   }
-  return null;
+  return PROTECTED_SUBJECT_SHAPES.find(({ shape }) => shape.test(haystack))?.name ?? null;
+}
+
+/**
+ * The same test over a whole message's text: a code in the preview of an
+ * innocently titled mail is just as secret, and must not leave the mailbox.
+ */
+export function isProtectedMail(
+  subject: string | undefined,
+  preview: string | undefined,
+  extraPatterns: string[] = []
+): string | null {
+  return isProtectedSubject(subject, extraPatterns) ?? isProtectedSubject(preview, extraPatterns);
+}
+
+/**
+ * Untrusted text with anything shaped like a prompt marker defused, so a mail
+ * body cannot close the block it was put in and speak from outside it.
+ */
+export function neutralizeMarkers(text: string): string {
+  return text.replace(/<{3,}|>{3,}/g, "…");
 }
 
 /** True when this folder is one the classifier may never file into. */
@@ -380,7 +432,9 @@ export function isStandingPreference(pref: FilingPreference): boolean {
  */
 export function extractAddress(from: string | undefined): string | null {
   if (!from) return null;
-  const angled = /<([^<>\s]+@[^<>\s]+)>/.exec(from);
+  // The LAST one: the real address is always appended after the display name,
+  // which the sender controls and can make look like "<boss@bank.com>".
+  const angled = [...from.matchAll(/<([^<>\s]+@[^<>\s]+)>/g)].at(-1);
   const bare = angled?.[1] ?? (/^[^\s<>]+@[^\s<>]+$/.test(from.trim()) ? from.trim() : null);
   return bare ? bare.toLowerCase() : null;
 }
@@ -454,4 +508,20 @@ export async function readLastDigestDate(store: StateStore): Promise<string | nu
 
 export async function writeLastDigestDate(store: StateStore, torontoDate: string): Promise<void> {
   await store.put(STATE_DIGEST_LAST, torontoDate);
+}
+
+/**
+ * A draft the digest wrote, as it left it. Graph's changeKey moves on any later
+ * change to the item, which is how the digest tells its own draft from one the
+ * owner has since edited or scheduled.
+ */
+export type DigestDraft = { id: string; changeKey: string };
+
+/** The draft the digest itself last created or rewrote, or null. */
+export async function readLastDigestDraft(store: StateStore): Promise<DigestDraft | null> {
+  return readJson<DigestDraft>(store, STATE_DIGEST_DRAFT);
+}
+
+export async function writeLastDigestDraft(store: StateStore, draft: DigestDraft): Promise<void> {
+  await writeJson(store, STATE_DIGEST_DRAFT, draft);
 }

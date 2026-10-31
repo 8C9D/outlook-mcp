@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { GraphError, callGraphServer } from "../core/graph.js";
 import { ToolResult, errorResult, isNotFound, runTool, textResult } from "./common.js";
-import { WELL_KNOWN_FOLDERS } from "./delete-folder.js";
+import { WELL_KNOWN_FOLDERS, wellKnownIdsFrom } from "./delete-folder.js";
 
 export const manageFolderSchema = {
   action: z
@@ -49,12 +49,7 @@ export async function fetchWellKnownFolderIds(): Promise<Set<string>> {
       })),
     }),
   });
-  return new Set(
-    (batch?.responses ?? [])
-      .filter((r: any) => r.status >= 200 && r.status < 300)
-      .map((r: any) => r.body?.id)
-      .filter((id: unknown): id is string => typeof id === "string")
-  );
+  return wellKnownIdsFrom(batch);
 }
 
 export async function manageFolderHandler(
@@ -133,6 +128,17 @@ export async function manageFolderHandler(
       }
       if (destination.id === folder.id) {
         return errorResult("A folder cannot be moved into itself.");
+      }
+      // Moving into either of these is a delete, and delete_folder is where the
+      // guards on deleting a folder live.
+      for (const name of ["deleteditems", "junkemail"]) {
+        const special = await callGraphServer(`/me/mailFolders/${name}?$select=id`);
+        if (special?.id === destination.id) {
+          return errorResult(
+            `Moving a folder into "${destination.displayName}" would delete it. Use delete_folder, ` +
+              "which checks what the folder holds first."
+          );
+        }
       }
       destinationLabel = `"${destination.displayName ?? destination_folder}"`;
       destinationId = destination.id;

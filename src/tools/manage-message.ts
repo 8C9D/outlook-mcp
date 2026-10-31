@@ -43,7 +43,7 @@ export const manageMessageDescription =
   "Act on up to 20 email messages: move, archive, delete (soft — moves to Deleted Items), mark read/unread, flag/unflag, or categorize. categorize REPLACES each message's categories with the list you pass (it does not append), so read the current categories first if you mean to add one; an empty list clears them. Returns a per-message success/failure list; moved messages get a NEW message id (reported in the output). Before calling with delete or move, state to the user exactly which messages (subjects/senders) will be affected. Deletion is never permanent from this tool — messages remain recoverable in Deleted Items.";
 
 /** One Graph JSON-batch request item for a single message id. */
-function batchRequest(
+export function batchRequest(
   itemId: string,
   messageId: string,
   action: string,
@@ -70,7 +70,16 @@ function batchRequest(
         body: { destinationId: "archive" },
       };
     case "delete":
-      return { id: itemId, method: "DELETE", url: base };
+      // A move, never Graph's DELETE: verified live on this personal account,
+      // DELETE puts the message in Recoverable Items, not the Deleted Items
+      // folder the user sees, so "soft delete" would be a lie.
+      return {
+        id: itemId,
+        method: "POST",
+        url: `${base}/move`,
+        headers: json,
+        body: { destinationId: "deleteditems" },
+      };
     case "mark_read":
       return { id: itemId, method: "PATCH", url: base, headers: json, body: { isRead: true } };
     case "mark_unread":
@@ -111,7 +120,7 @@ function describeSuccess(
     case "archive":
       return `archived${newId ? ` (new id: ${newId})` : ""}`;
     case "delete":
-      return "deleted (moved to Deleted Items)";
+      return `deleted (moved to Deleted Items${newId ? `, new id: ${newId}` : ""})`;
     case "mark_read":
       return "marked read";
     case "mark_unread":

@@ -1,6 +1,31 @@
 import { z } from "zod";
-import { callGraphServer } from "../core/graph.js";
+import { GraphError, callGraphServer } from "../core/graph.js";
 import { ToolResult, errorResult, fetchPaged, isNotFound, runTool, textResult } from "./common.js";
+
+/**
+ * The ids a well-known-folder $batch resolved. A 404 means the mailbox has no
+ * such folder, but a throttled or failed item says nothing, and treating that
+ * as "not well-known" would open the guard this feeds. So those are asked again
+ * one at a time, and a failure there refuses the whole operation.
+ */
+export async function wellKnownIdsFrom(batch: any): Promise<Set<string>> {
+  const answers = new Map<string, any>((batch?.responses ?? []).map((r: any) => [String(r.id), r]));
+  const ids = new Set<string>();
+  for (const name of WELL_KNOWN_FOLDERS) {
+    const answer = answers.get(name);
+    if (answer?.status === 404) continue;
+    let id = answer?.status >= 200 && answer?.status < 300 ? answer.body?.id : undefined;
+    if (id === undefined) {
+      try {
+        id = (await callGraphServer(`/me/mailFolders/${name}?$select=id`))?.id;
+      } catch (err) {
+        if (!isNotFound(err)) throw err;
+      }
+    }
+    if (typeof id === "string") ids.add(id);
+  }
+  return ids;
+}
 
 export const deleteFolderSchema = {
   folder: z
@@ -144,12 +169,7 @@ export async function deleteFolderHandler(
         })),
       }),
     });
-    const wellKnownIds = new Set(
-      (batch?.responses ?? [])
-        .filter((r: any) => r.status >= 200 && r.status < 300)
-        .map((r: any) => r.body?.id)
-        .filter((id: unknown): id is string => typeof id === "string")
-    );
+    const wellKnownIds = await wellKnownIdsFrom(batch);
 
     const facts: FolderFacts = {
       displayName: String(folder.displayName ?? folderInput),
@@ -182,11 +202,28 @@ export async function deleteFolderHandler(
     }
 
     // The soft delete itself: move the folder under Deleted Items.
-    await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/move`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ destinationId: "deleteditems" }),
-    });
+    try {
+      await callGraphServer(`/me/mailFolders/${encodeURIComponent(folder.id)}/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destinationId: "deleteditems" }),
+      });
+    } catch (err) {
+      const emptied = movedOut > 0 ? ` Its ${movedOut} message(s) are already in Deleted Items.` : "";
+      if (err instanceof GraphError && /ErrorFolderExists/i.test(err.body)) {
+        return errorResult(
+          `Deleted Items already has a folder named "${facts.displayName}", so this one was not ` +
+            `moved. Rename one of them first.${emptied}`
+        );
+      }
+      if (movedOut > 0) {
+        return errorResult(
+          `The folder "${facts.displayName}" could not be moved: ` +
+            `${err instanceof Error ? err.message.split("\n")[0] : String(err)}.${emptied}`
+        );
+      }
+      throw err;
+    }
 
     return textResult(
       [

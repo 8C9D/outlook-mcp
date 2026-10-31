@@ -142,7 +142,15 @@ const FILER_SHIELD = "verification code probe";
 type Outcome = { name: string; passed: boolean; skipped?: boolean; detail?: string };
 const outcomes: Outcome[] = [];
 
+/**
+ * MCP_TEST_SKIP is a regex over test names. `^g\\.` leaves out the auto-reply
+ * test, the one test here that other people could see: while it runs, a real
+ * message arriving would get its `[MCP TEST]` reply.
+ */
+const skipPattern = process.env.MCP_TEST_SKIP ? new RegExp(process.env.MCP_TEST_SKIP) : undefined;
+
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
+  if (skipPattern?.test(name)) return skip(name, "matches MCP_TEST_SKIP");
   try {
     await fn();
     outcomes.push({ name, passed: true });
@@ -3715,7 +3723,7 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   get_attachment: [false, false, false, false],
   export_message: [false, false, false, false],
   create_draft: [false, false, false, false],
-  update_draft: [false, false, true, false],
+  update_draft: [false, true, true, false],
   send_draft: [false, true, false, true],
   // cancel discards the waiting message outright (verified live: no Deleted
   // Items copy) — destructive, and not repeatable.
@@ -3729,12 +3737,12 @@ const EXPECTED_ANNOTATIONS: Record<string, [boolean, boolean, boolean, boolean]>
   create_event: [false, false, false, true],
   manage_event: [false, true, false, true],
   search_contacts: [true, false, true, false],
-  manage_contact: [false, true, false, false],
+  manage_contact: [false, true, false, true],
   auto_reply: [false, false, true, true],
   mailbox_settings: [false, false, true, false],
   add_attachment: [false, false, false, true],
   manage_rules: [false, true, false, false],
-  manage_senders: [false, false, true, false],
+  manage_senders: [false, true, false, false],
   create_folder: [false, false, false, false],
   // Soft (a MOVE into Deleted Items, never Graph's permanent DELETE), but soft
   // deletes still count as destructive.

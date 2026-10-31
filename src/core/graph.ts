@@ -52,7 +52,8 @@ async function graphFetch(
     // Honor Retry-After once, then fail readably if still throttled.
     const retryAfter = Number(response.headers.get("Retry-After") ?? "2");
     const waitSeconds = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) : 2;
-    console.error(`Graph throttled (429) on ${path}; retrying once after ${waitSeconds}s.`);
+    // The path only: a query string can carry the words someone searched for.
+    console.error(`Graph throttled (429) on ${path.split("?")[0]}; retrying once after ${waitSeconds}s.`);
     await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
     response = await doFetch();
     if (response.status === 429) {

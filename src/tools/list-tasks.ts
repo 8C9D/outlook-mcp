@@ -5,7 +5,7 @@ import {
   TZ_PREFER,
   ToolInputError,
   ToolResult,
-  fetchPaged,
+  fetchPagedWithInfo,
   runTool,
   structuredResult,
 } from "./common.js";
@@ -70,6 +70,7 @@ export const listTasksOutputSchema = {
   scope: z.string().optional(),
   timezone: z.string().optional(),
   count: z.number().optional(),
+  truncated: z.boolean().optional().describe("True when the list held more tasks than were read."),
   tasks: z.array(structuredTask).optional(),
 };
 
@@ -129,7 +130,7 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
 
     const filter = include_completed ? "" : `&$filter=${encodeURIComponent("status ne 'completed'")}`;
     // checklistItems come back only when asked for, so the default listing stays small.
-    const tasks = await fetchPaged(
+    const { items: tasks, truncated } = await fetchPagedWithInfo(
       `/me/todo/lists/${encodeURIComponent(list.id)}/tasks?$top=100${filter}&$expand=checklistItems`,
       TASK_CAP,
       { Prefer: TZ_PREFER }
@@ -216,9 +217,17 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
     ]
       .filter(Boolean)
       .join(", ");
-    const structuredBase = { list: list.displayName, scope, timezone: TIMEZONE };
+    const structuredBase = {
+      list: list.displayName,
+      scope,
+      timezone: TIMEZONE,
+      ...(truncated ? { truncated } : {}),
+    };
+    const capNote = truncated
+      ? ` Only the first ${TASK_CAP} tasks in this list were read, so others may match.`
+      : "";
     if (shown === 0) {
-      return structuredResult(`No tasks in "${list.displayName}" (${scope}).`, {
+      return structuredResult(`No tasks in "${list.displayName}" (${scope}).${capNote}`, {
         ...structuredBase,
         count: 0,
         tasks: [],
@@ -237,7 +246,7 @@ export async function listTasksHandler(input: z.input<typeof listTasksArgs>): Pr
       sections.push(`${label} (${groups[key].length}):\n${groups[key].join("\n")}`);
     }
     return structuredResult(
-      `${shown} task(s) in "${list.displayName}" — ${scope} (${TIMEZONE}):\n\n${sections.join("\n\n")}`,
+      `${shown} task(s) in "${list.displayName}" — ${scope} (${TIMEZONE}):${capNote}\n\n${sections.join("\n\n")}`,
       { ...structuredBase, count: shown, tasks: structuredTasks }
     );
   });

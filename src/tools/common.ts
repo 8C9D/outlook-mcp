@@ -84,12 +84,16 @@ export function isNotFound(err: unknown): boolean {
   );
 }
 
-/** GET a Graph collection, following @odata.nextLink until `cap` items are collected. */
-export async function fetchPaged(
+/**
+ * GET a Graph collection, following @odata.nextLink until `cap` items are
+ * collected. `truncated` says Graph held more, so a caller can avoid presenting
+ * a capped page as the whole answer.
+ */
+export async function fetchPagedWithInfo(
   firstPath: string,
   cap: number,
   headers?: Record<string, string>
-): Promise<any[]> {
+): Promise<{ items: any[]; truncated: boolean }> {
   const items: any[] = [];
   let next: string | undefined = firstPath;
   while (next && items.length < cap) {
@@ -97,7 +101,16 @@ export async function fetchPaged(
     items.push(...(page?.value ?? []));
     next = page?.["@odata.nextLink"];
   }
-  return items.slice(0, cap);
+  return { items: items.slice(0, cap), truncated: items.length > cap || next !== undefined };
+}
+
+/** fetchPaged for callers whose cap can never matter. */
+export async function fetchPaged(
+  firstPath: string,
+  cap: number,
+  headers?: Record<string, string>
+): Promise<any[]> {
+  return (await fetchPagedWithInfo(firstPath, cap, headers)).items;
 }
 
 /** Format any Graph datetime (offset or naive) as a local America/Toronto string. */
@@ -121,6 +134,22 @@ export function formatLocal(dateTime: string | undefined): string {
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
+/** The wall-clock rendering of an instant in America/Toronto, to the second. */
+export function torontoWallClock(when: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(when);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+}
+
 /**
  * The UTC instant a naive America/Toronto wall-clock datetime means, as an ISO
  * string. Toronto is UTC-4 or UTC-5; trying both offsets and checking which one
@@ -133,19 +162,7 @@ export function torontoInstantUtc(naive: string): string | undefined {
   for (const offset of ["-04:00", "-05:00"]) {
     const candidate = new Date(`${wall}${offset}`);
     if (Number.isNaN(candidate.getTime())) return undefined;
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: TIMEZONE,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-    }).formatToParts(candidate);
-    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
-    const rendered = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
-    if (rendered === wall) return candidate.toISOString().replace(/\.\d{3}Z$/, "Z");
+    if (torontoWallClock(candidate) === wall) return candidate.toISOString().replace(/\.\d{3}Z$/, "Z");
   }
   // A wall clock inside the spring-forward gap: take the EDT reading.
   return new Date(`${wall}-04:00`).toISOString().replace(/\.\d{3}Z$/, "Z");

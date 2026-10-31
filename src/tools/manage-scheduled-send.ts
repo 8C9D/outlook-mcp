@@ -13,7 +13,7 @@ import { callGraphServer } from "../core/graph.js";
 import {
   ToolResult,
   errorResult,
-  fetchPaged,
+  fetchPagedWithInfo,
   formatLocal,
   runTool,
   textResult,
@@ -37,6 +37,9 @@ const manageScheduledSendArgs = z.object(manageScheduledSendSchema);
 
 export const manageScheduledSendDescription =
   "List or cancel scheduled sends (mail parked by send_draft with send_at, waiting in Drafts for its send time). CAUTION on cancel: verified live, deleting a scheduled message discards it COMPLETELY — the send is stopped, but no copy lands in Deleted Items and the content cannot be recovered, so state the message's subject, recipients and scheduled time to the user and get agreement first; to keep the text, read it with read_message and re-create the draft before cancelling. list is read-only.";
+
+/** How many drafts one listing checks for a deferred send time. */
+const DRAFT_SCAN_CAP = 1000;
 
 const EXPAND = `singleValueExtendedProperties($filter=id eq '${DEFERRED_SEND_PROPERTY}')`;
 
@@ -71,23 +74,28 @@ export async function manageScheduledSendHandler(
       // Drafts is small; expand the property on each and keep the ones that
       // carry it. (A $filter on the property would also need the $expand
       // anyway, and client-side matching keeps the query simple.)
-      const drafts = await fetchPaged(
+      const { items: drafts, truncated } = await fetchPagedWithInfo(
         `/me/mailFolders/drafts/messages?$select=id,subject,toRecipients&$expand=${encodeURIComponent(EXPAND)}&$top=50`,
-        200
+        DRAFT_SCAN_CAP
       );
+      const capNote = truncated
+        ? ` Only the first ${DRAFT_SCAN_CAP} drafts were checked, so a scheduled send could be among the rest.`
+        : "";
       const scheduled = drafts
         .map((m) => ({ message: m, deferredUtc: deferredTimeOf(m) }))
         .filter((entry): entry is { message: any; deferredUtc: string } => !!entry.deferredUtc)
         .sort((a, b) => a.deferredUtc.localeCompare(b.deferredUtc));
       if (scheduled.length === 0) {
         return textResult(
-          "No scheduled sends are waiting. (send_draft with send_at creates one; it waits in Drafts until its time.)"
+          "No scheduled sends are waiting. (send_draft with send_at creates one; it waits in Drafts until its time.)" +
+            capNote
         );
       }
       return textResult(
         `${scheduled.length} scheduled send(s) waiting in Drafts:\n\n` +
           scheduled.map((entry) => describeScheduled(entry.message, entry.deferredUtc)).join("\n\n") +
-          "\n\nEach sends by itself at its time; cancel stops one (discarding the message — see the tool description)."
+          "\n\nEach sends by itself at its time; cancel stops one (discarding the message — see the tool description)." +
+          capNote
       );
     }
 
